@@ -16,7 +16,21 @@ pub struct Paths {
 
 impl Paths {
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self> {
-        private_directory(root.as_ref())?;
+        crate::migration::check_root_available(root.as_ref())?;
+        let root = if root.as_ref().is_symlink() {
+            fs::canonicalize(root)?
+        } else {
+            root.as_ref().to_path_buf()
+        };
+        if (root.join("profiles").exists() || root.join("session-roots").exists())
+            && !crate::migration::is_store(&root)
+        {
+            return Err(AppError::new(
+                "migration_required",
+                "Legacy Ontography data must be archived through ontography migrate before this directory is used.",
+            ));
+        }
+        private_directory(&root)?;
         let root = fs::canonicalize(root)?;
         for name in ["definitions", "runs", "logs", "client", "workspace-cache"] {
             private_directory(&root.join(name))?;
@@ -61,7 +75,7 @@ pub fn default_data_dir() -> Result<PathBuf> {
     }
     let home = std::env::var_os("HOME")
         .ok_or_else(|| AppError::new("configuration", "set --data-dir or ONTOGRAPHY_DATA_DIR"))?;
-    Ok(PathBuf::from(home).join(".local/share/ontography"))
+    crate::migration::default_root(Path::new(&home))
 }
 
 fn private_directory(path: &Path) -> Result<()> {

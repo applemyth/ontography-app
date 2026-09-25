@@ -13,6 +13,9 @@ pub struct Request {
     pub client_id: String,
     pub request_id: String,
     pub operation: String,
+    /// Durable application session; omitted only for explicitly global administration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_server_id: Option<String>,
     #[serde(default = "empty_object")]

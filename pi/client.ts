@@ -26,6 +26,7 @@ export interface Hello {
 export interface Receipt {
   client_id: string;
   request_id: string;
+  app_session_id?: string;
   server_id?: string;
   operation: string;
 }
@@ -65,6 +66,7 @@ interface Pending {
 export interface ClientOptions {
   socketPath: string;
   clientId?: string;
+  appSessionId?: string;
   timeoutMs?: number;
   maxFrameBytes?: number;
   expectedAppBuild?: string;
@@ -107,6 +109,7 @@ export function parseHello(value: unknown): Hello {
 /** Owns a connection, never the server or graph runs. No request is automatically replayed. */
 export class BridgeClient {
   readonly clientId: string;
+  readonly appSessionId: string | undefined;
   private readonly options: ClientOptions & Required<Pick<ClientOptions, "clientId" | "timeoutMs" | "maxFrameBytes">>;
   private socket: Socket | undefined;
   private connecting: Promise<Hello> | undefined;
@@ -115,6 +118,7 @@ export class BridgeClient {
 
   constructor(options: ClientOptions) {
     this.clientId = options.clientId ?? randomUUID();
+    this.appSessionId = options.appSessionId;
     this.options = { ...options, clientId: this.clientId, timeoutMs: options.timeoutMs ?? 30_000, maxFrameBytes: options.maxFrameBytes ?? 4_194_304 };
   }
 
@@ -198,12 +202,15 @@ export class BridgeClient {
   private send(operation: string, args: Arguments, mutating: boolean, options: { signal?: AbortSignal; requestId?: string } = {}): Promise<CallResult> {
     const socket = this.socket;
     if (socket === undefined || socket.destroyed) return Promise.reject(new BridgeError("disconnected", "No live server connection."));
-    const receipt: Receipt = { client_id: this.clientId, request_id: options.requestId ?? randomUUID(), operation, ...(this.serverId === undefined ? {} : { server_id: this.serverId }) };
+    const receipt: Receipt = { client_id: this.clientId, request_id: options.requestId ?? randomUUID(), operation,
+      ...(this.appSessionId === undefined ? {} : { app_session_id: this.appSessionId }),
+      ...(this.serverId === undefined ? {} : { server_id: this.serverId }) };
     if (this.pending.has(receipt.request_id)) return Promise.reject(new BridgeError("duplicate_request", "A request with this ID is already pending.", undefined, receipt));
     try { validateIntegers(args); }
     catch (error) { return Promise.reject(error); }
     const frame = `${JSON.stringify({
       version: PROTOCOL_VERSION, client_id: this.clientId, request_id: receipt.request_id, operation, args,
+      ...(this.appSessionId === undefined ? {} : { app_session_id: this.appSessionId }),
       ...(operation === "system.hello" ? {} : { expected_server_id: this.serverId }),
     })}\n`;
     if (Buffer.byteLength(frame) > this.options.maxFrameBytes) return Promise.reject(new BridgeError("request_too_large", "Request exceeds the frame limit; use bounded content operations.", undefined, receipt));

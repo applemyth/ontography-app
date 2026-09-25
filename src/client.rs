@@ -13,6 +13,7 @@ pub struct Client {
     socket: PathBuf,
     client_id: String,
     server_id: String,
+    app_session_id: Option<String>,
 }
 
 impl Client {
@@ -21,6 +22,7 @@ impl Client {
             socket: socket.as_ref().into(),
             client_id: uuid::Uuid::new_v4().to_string(),
             server_id: String::new(),
+            app_session_id: None,
         };
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -66,6 +68,13 @@ impl Client {
         &self.socket
     }
 
+    pub fn for_session(&self, session_id: &str) -> Self {
+        Self {
+            app_session_id: Some(session_id.into()),
+            ..self.clone()
+        }
+    }
+
     pub async fn call(&self, operation: &str, args: Value) -> Result<Value> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.request(operation, args, request_id)
@@ -84,6 +93,7 @@ impl Client {
             client_id: self.client_id.clone(),
             request_id: request_id.clone(),
             operation: operation.into(),
+            app_session_id: self.app_session_id.clone(),
             expected_server_id: if self.server_id.is_empty() {
                 None
             } else {

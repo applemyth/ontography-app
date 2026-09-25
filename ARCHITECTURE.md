@@ -4,7 +4,7 @@ The app builds on `../ontography-core`. These are the eight agreed pieces to imp
 
 - [ ] **1. Codex node definition**
 
-   An Ontography node whose app implementation owns a tmux session containing a Codex session. Core supplies the node's identity and workflow rules. The node's identity persists across tmux or Codex restarts.
+   An Ontography node whose app implementation hosts a Codex session in a server-owned terminal using `portable-pty`. Core supplies the node's identity and workflow rules. The node's identity persists across terminal or Codex restarts. A graph change admits the node; the app supervisor provisions its execution. A pane displays that execution, and opening or closing the pane preserves graph topology. This replaces the earlier proposed tmux backend; implementation is pending.
 
 - [ ] **2. Workspace package**
 
@@ -32,36 +32,60 @@ The app builds on `../ontography-core`. These are the eight agreed pieces to imp
 
 - [x] **8. Graph TUI and native management harness**
 
-   This part consists of three pieces:
+   The management layer and persistent session foundation are implemented. Final verification and rollout are tracked separately in [VERIFICATION.md](docs/VERIFICATION.md).
 
    | Piece | Responsibility |
    | --- | --- |
-   | CLI + Pi harness | The `ontography` command connects to or starts the local server, then launches the management conversation with Ontography instructions and tools. |
-   | Ontography tools | Expose core's supported graph and runtime capabilities. A detached Rust server retains core objects across client connections. The connection, handle ownership, tool arguments, results, and errors are implementation responsibilities within this integration. |
-   | Graph TUI | Rust UI using Ratatui; visualize core state and issue actions through the existing server bindings. Pi remains the management harness. |
+   | CLI + Pi harness | Select or create an Ontography session, resume its graph, and attach to its server-owned native Pi terminal. |
+   | Ontography tools | Expose supported core APIs through session-scoped requests. The server owns accepted operations and retained core resources independently of clients. |
+   | Graph TUI | `/graph` opens the owning session's run in the Rust Ratatui renderer; closing it returns to the same manager process. `--ui` opens this view first. |
 
-   Implemented scope: CLI/Pi integration, tools exposing the existing core, and Rust graph visualization. Our concrete Codex node, message/union package, and corresponding edge definitions are still future work in items 1–7. Their registration and management hooks follow those implementations.
+   Native Pi owns its conversations and model execution. Ontography owns conversation membership/selection, app tool preferences, graph binding, process supervision, and terminal attachment. Core owns graph/workflow semantics, packages, contracts, authority, and durable graph history.
 
-   The graph UI is implemented in Rust. Default management uses Pi's existing interactive client. `ontography --ui` drives Pi through its RPC mode and renders the graph and conversation in Ratatui. The Pi extension supplies tool bindings; graph rendering belongs to the Rust client. A native Ratatui widget supports core cycles, self loops, and parallel edges; the [renderer decision](src/ui/README.md#renderer-decision) records the dependency evaluation.
+   The initial implementation's separate Rust/Pi RPC conversation UI remains in source for its earlier tests; it is no longer the CLI's `--ui` path. Current graph display reuses the existing Ratatui graph widget, which supports cycles, self loops, and parallel edges. The [renderer decision](src/ui/README.md#renderer-decision) records that evaluation.
 
-   Core already establishes the graph/runtime API. The management tools bind that API to Pi, supplying serialization and retained-handle access. Graph authoring is one capability group within that interface. The core capability groups are:
+   Core capability groups already bound to management tools:
 
-   | Core capability | Operations to expose |
+   | Core capability | Operations |
    | --- | --- |
-   | Graph definition and admission | Build and validate nodes, edges, contracts, authority rules, and rewrite grammars. |
-   | Run lifecycle | Create/open persistent sessions; start, suspend, resume, and terminally close runs; control available hosted executables. |
-   | Graph rewriting | Prepare a rewrite, inspect its resulting graph and package retirements, and commit a current plan. |
-   | Workflow operations | Submit activations and emissions; transfer outbound packages through permitted edges. |
-   | Content, packages, and workspaces | Import/read/retain content, compose and resolve packages, check out and capture workspaces, diff and merge. |
-   | Invocation and context | Issue scoped invocations, prepare granted context, and record exposure and delivery evidence. |
-   | Inspection and observation | Inspect topology, pending work, package history, invocations, executions, and revision notifications. |
+   | Definitions/admission | Validate schemas, graphs, contracts, authority rules, and rewrite grammars; save/import/export reusable declarations. |
+   | Run lifecycle | Create/open, inspect, suspend, resume, and terminally close runs; manage registered executable implementations. |
+   | Graph rewriting | Prepare, inspect, commit, and discard configured productions. |
+   | Workflow | Submit activations/emissions and transfer packages through permitted edges. |
+   | Content/packages/workspaces | Import/read/retain, compose/resolve, checkout/capture, diff/merge, transfer through iroh. |
+   | Invocation/context | Issue scoped invocations, prepare grants, enforce budgets, and record observed exposure/delivery evidence. |
+   | Inspection | Inspect topology, frontier, package history, executions, and revision notifications. |
 
-   Current integration work supplies tool schemas and descriptions, request/result conversion, and retention of core's live run/session objects. Core already supplies definition/configuration and registration primitives. Concrete app definitions are planned integration points; placeholder implementations are unnecessary. Once the node implementations exist, management tools can expose their tmux/Codex lifecycle, direct message delivery, workspace binding, and process reconciliation after rewrites. Management has graph/run scope; node MCP interfaces have node/invocation scope.
+   Concrete worker definitions remain items 1–7. The production executable registry has no Codex worker. A logical graph node currently does not create an agent process or terminal.
 
-   Creating a graph produces a reusable definition. Starting it creates a run, which may be idle until work is submitted. A rewrite changes that run's current graph while preserving history, under its configured grammar. Schema, contracts, and rewrite grammar are fixed when the runtime is constructed. Core commits graph and live package state together; the app reconciles processes separately. A live rewrite does not automatically overwrite the saved definition.
+## Session foundation
 
-Current design focus: the Pi management agent and its Ontography tools. Core already implements live-run ownership and lifecycle, through `RunningApplication` or its lower-level runtime, session, and execution objects. The detached Rust server keeps those objects accessible across tool calls and management clients. Core owns workflow/content persistence; Pi owns the management conversation.
+```text
+Rust server
+└── Ontography session
+    ├── Pi manager state: conversations, active selection, tool preferences
+    ├── Server-owned Pi process, PTY, and terminal state
+    └── One graph run/runtime after initialization
+```
 
-Confirmed lifecycle: graph/node execution continues when Pi exits; a later `ontography` invocation reconnects. Pi's active management turn has client lifetime. Explicit run suspension preserves resumability; run closure is terminal. Explicit server stop gracefully suspends its resources and preserves durable runs. Server-crash recovery reconstructs committed state and requires explicit resumption initially.
+A new session can start Pi before the graph exists. The first scoped start operation persists a reserved run identity and resolved definition, constructs core storage, and binds that run. Retries recover the same initialization. Existing runs are adopted explicitly; no Pi ownership is inferred from cwd or old transcripts.
 
-The detailed sequence, API coverage, integration boundaries, and verification gates are in [PLAN.md](PLAN.md). Item 8 passed its implementation gates; [verification results](docs/VERIFICATION.md) record automated coverage, live Pi/terminal checks, and the limits of these results.
+The last selected app session is the default attachment target. Pi `/new`, `/resume`, `/fork`, `/clone`, and `/tree` preserve its graph. One controlling client owns the manager terminal's input/dimensions. Ctrl-B, then D detaches while manager and graph continue. Pi exit ends the manager process but retains session/graph state. Session suspension stops the manager and suspends graph resources; closure is terminal. Server restart loads records; attachment explicitly resumes the selected graph and native history.
+
+`portable-pty` hosts processes; `vt100` maintains terminal state; the Rust client renders the terminal or the bound graph. The manager terminal is implemented. Worker terminal provisioning, views, package delivery, and execution reconciliation remain subsequent work.
+
+The [session guide](docs/SESSIONS.md) documents commands and storage. [SESSION_DESIGN.md](docs/SESSION_DESIGN.md) records ownership and recovery details. [CORE_BINDINGS.md](docs/CORE_BINDINGS.md) maps the existing core API. [PLAN.md](PLAN.md) is the original item-8 implementation plan.
+
+## Follow-up status
+
+Checkboxes indicate implementation, not completion of final release gates.
+
+- [x] **Per-user app-home support.** Default storage is `~/.ontography/`, with existing explicit/environment/XDG overrides. A journaled migration archives legacy home contents, moves the stopped previous store, and leaves an alias at its old path. It preserves existing run identities; storage migration does not replace a core build or grammar.
+- [x] **Live home migration and final rollout verification.** Automated gates and native Pi/terminal checks passed. The legacy home was archived, the current store moved to `~/.ontography`, and all three prior runs preserved and resumed. [VERIFICATION.md](docs/VERIFICATION.md) records the evidence.
+- [x] **Graph display inside the Pi interaction.** `/graph` and `--ui` use the same server-owned native Pi manager and the session's bound run; there is no second management conversation.
+- [x] **Unified Ontography session.** Durable manager state, graph initialization/adoption, conversation ownership, selection, lifecycle commands, and scoped dispatch are implemented. App-session fork/archive/delete remain deferred.
+- [x] **Rust manager terminal backend.** Server-owned PTY, terminal parsing, attachment snapshots, input/resize ownership, detach/reconnect, and manager supervision are implemented. This replaces the proposed tmux backend.
+- [ ] **Concrete worker layer.** Implement items 1–7, then connect admitted graph nodes to supervised executions and node terminal views. Worker package delivery remains a governed core/harness operation.
+- [ ] **Default app rewrite grammar.** Define versioned productions alongside the concrete node/edge/package definitions. Cover supported add/remove/connect/disconnect/rewire operations with core validation. Existing runtimes keep their original grammar; editing a saved declaration does not retrofit an empty-grammar run.
+
+A definition is reusable configuration; starting it creates a run. Rewriting changes that run's current graph and preserves its history under the configured grammar. Core commits graph/package state; the future worker supervisor reconciles external processes separately and exposes partial failures. Opening or closing a terminal view has no graph-topology effect.

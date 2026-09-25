@@ -3,6 +3,8 @@
 mod frontier;
 pub mod graph;
 pub mod pi_rpc;
+mod session_graph;
+pub use session_graph::run as run_graph_view;
 
 use crate::{client::Client, error::AppError};
 use crossterm::{

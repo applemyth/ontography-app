@@ -165,6 +165,7 @@ async fn lost_response_is_recoverable_and_request_identity_prevents_duplicate_mu
     let fixture = Fixture::new();
     let client = fixture.start().await;
     let request = Request {
+        app_session_id: None,
         version: protocol::VERSION,
         client_id: uuid::Uuid::new_v4().to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -322,6 +323,7 @@ async fn completing_one_request_does_not_drop_the_partial_frame_of_the_next() {
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let first = Request {
+        app_session_id: None,
         version: protocol::VERSION,
         client_id: uuid::Uuid::new_v4().to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -386,6 +388,7 @@ async fn status_and_receipt_bypass_a_long_wait_on_the_same_connection() {
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let wait = Request {
+        app_session_id: None,
         version: protocol::VERSION,
         client_id: client.client_id().into(),
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -454,6 +457,7 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
     let client = fixture.start().await;
     let run_id = create_run(&client, fixture.directory.path()).await;
     let committed = Request {
+        app_session_id: None,
         version: protocol::VERSION,
         client_id: client.client_id().into(),
         request_id: uuid::Uuid::new_v4().to_string(),

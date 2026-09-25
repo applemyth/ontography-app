@@ -11,8 +11,42 @@ const ASSETS: &[(&str, &str)] = &[
     ("index.ts", include_str!("../pi/index.ts")),
     ("client.ts", include_str!("../pi/client.ts")),
     ("tools.ts", include_str!("../pi/tools.ts")),
+    ("session.ts", include_str!("../pi/session.ts")),
+    ("autocomplete.ts", include_str!("../pi/autocomplete.ts")),
+    ("terminal.ts", include_str!("../pi/terminal.ts")),
     ("instructions.md", include_str!("../pi/instructions.md")),
 ];
+
+/// Pi owns conversation contents; Ontography selects their storage and active identity.
+/// Global Pi credentials/settings continue to use the user's existing Pi home.
+pub struct PiSessionLaunch {
+    pub session_id: String,
+    pub conversations_dir: PathBuf,
+    pub conversation_id: String,
+    pub conversation_path: Option<PathBuf>,
+}
+
+/// Build native Pi's command for a server-owned PTY. The caller retains the child
+/// and decides whether an absent history is a new conversation or a recovery error.
+pub async fn pi_session_command(
+    paths: &Paths,
+    project: &Path,
+    executable: &Path,
+    session: &PiSessionLaunch,
+) -> Result<Command> {
+    let mut command = pi_command(paths, project, executable, false).await?;
+    command
+        .env("ONTOGRAPHY_SESSION_ID", &session.session_id)
+        .env("ONTOGRAPHY_TERMINAL", "1")
+        .arg("--session-dir")
+        .arg(&session.conversations_dir);
+    if let Some(path) = &session.conversation_path {
+        command.arg("--session").arg(path);
+    } else {
+        command.arg("--session-id").arg(&session.conversation_id);
+    }
+    Ok(command)
+}
 
 pub async fn ensure_server(paths: &Paths) -> Result<Client> {
     match Client::connect(&paths.socket).await {

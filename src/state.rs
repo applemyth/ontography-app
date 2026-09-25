@@ -416,6 +416,22 @@ pub struct Service {
     pub runs: Mutex<BTreeMap<String, Arc<Mutex<ManagedRun>>>>,
     pub registry: Arc<crate::registry::ImplementationRegistry>,
     pub recovery_errors: BTreeMap<String, AppError>,
+    pub sessions: crate::sessions::Sessions,
+}
+
+/// A crash may leave only the reserved directory. Nonempty unknown stores are never overwritten.
+fn create_reserved_directory(directory: &std::path::Path) -> Result<()> {
+    match std::fs::create_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && directory.is_dir()
+                && std::fs::read_dir(directory)?.next().is_none() =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl Service {
@@ -465,12 +481,14 @@ impl Service {
                 }
             }
         }
+        let sessions = crate::sessions::Sessions::open(&paths)?;
         Ok(Self {
             paths,
             server_id: uuid::Uuid::new_v4().to_string(),
             runs: Mutex::new(runs),
             registry,
             recovery_errors,
+            sessions,
         })
     }
 
@@ -484,6 +502,17 @@ impl Service {
     }
 
     pub async fn start(&self, declaration: GraphDeclaration, project: PathBuf) -> Result<Value> {
+        self.start_reserved(&uuid::Uuid::new_v4().to_string(), declaration, project)
+            .await
+    }
+
+    /// Reconcile a durably reserved identity without creating another run on retry.
+    pub async fn start_reserved(
+        &self,
+        id: &str,
+        declaration: GraphDeclaration,
+        project: PathBuf,
+    ) -> Result<Value> {
         let compiled = declaration.compile().map_err(AppError::core)?;
         self.registry
             .validate_bindings(&declaration.execution_bindings, &compiled.kernel)?;
@@ -492,12 +521,38 @@ impl Service {
         if !project.is_dir() {
             return Err(AppError::invalid("project must be a directory"));
         }
-        let id = uuid::Uuid::new_v4().to_string();
-        let directory = self.paths.run(&id)?;
-        std::fs::create_dir(&directory)?;
+        if let Some(run) = self.runs.lock().await.get(id).cloned() {
+            let mut run = run.lock().await;
+            if run.manifest.declaration_revision != declaration_revision
+                || run.manifest.project != project
+            {
+                return Err(AppError::new(
+                    "initialization_conflict",
+                    "reserved run identity has different initialization data",
+                ));
+            }
+            if run.live.is_none()
+                && !run.directory.join("core").exists()
+                && run.manifest.status == "creating"
+            {
+                let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+                let session = runtime
+                    .create_persistent(run.directory.join("core"))
+                    .map_err(AppError::core)?;
+                run.live = Some(LiveRun::new(runtime, session));
+                run.manifest.status = "active".into();
+                run.save()?;
+                run.launch_bindings().await?;
+            } else if run.live.is_none() {
+                run.resume().await?;
+            }
+            return run.inspect(100).await;
+        }
+        let directory = self.paths.run(id)?;
+        create_reserved_directory(&directory)?;
         let manifest = RunManifest {
             version: 1,
-            run_id: id.clone(),
+            run_id: id.into(),
             core_version: ontography::VERSION.into(),
             core_build: crate::CORE_BUILD.into(),
             declaration: declaration.into(),
@@ -518,7 +573,7 @@ impl Service {
             live: None,
             registry: self.registry.clone(),
         }));
-        self.runs.lock().await.insert(id.clone(), run.clone());
+        self.runs.lock().await.insert(id.into(), run.clone());
         let mut run = run.lock().await;
         let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
         let session = runtime
@@ -548,18 +603,69 @@ impl Service {
         project: PathBuf,
         input: ontography::Payload,
     ) -> Result<Value> {
+        self.start_application_reserved(
+            &uuid::Uuid::new_v4().to_string(),
+            declaration,
+            project,
+            input,
+        )
+        .await
+    }
+
+    pub async fn start_application_reserved(
+        &self,
+        id: &str,
+        declaration: crate::application::ApplicationDeclaration,
+        project: PathBuf,
+        input: ontography::Payload,
+    ) -> Result<Value> {
         let project = std::fs::canonicalize(project)?;
         if !project.is_dir() {
             return Err(AppError::invalid("project must be a directory"));
         }
         let compiled = declaration.compile(&self.registry, &project)?;
         let declaration_revision = declaration.fingerprint()?;
-        let id = uuid::Uuid::new_v4().to_string();
-        let directory = self.paths.run(&id)?;
-        std::fs::create_dir(&directory)?;
+        if let Some(run) = self.runs.lock().await.get(id).cloned() {
+            let mut run = run.lock().await;
+            if run.manifest.declaration_revision != declaration_revision
+                || run.manifest.project != project
+            {
+                return Err(AppError::new(
+                    "initialization_conflict",
+                    "reserved application identity has different initialization data",
+                ));
+            }
+            let application_runs = run.directory.join("application/runs");
+            let has_core_run =
+                application_runs.exists() && std::fs::read_dir(&application_runs)?.next().is_some();
+            if run.live.is_none() && run.manifest.status == "creating" && !has_core_run {
+                let application = compiled
+                    .application
+                    .start_in(run.directory.join("application"), input)
+                    .await
+                    .map_err(|error| {
+                        AppError::new("application_start_failed", error.to_string())
+                    })?;
+                run.manifest.core_path = application
+                    .run_path()
+                    .expect("persistent application has a path")
+                    .strip_prefix(&run.directory)
+                    .map_err(AppError::core)?
+                    .to_path_buf();
+                run.live = Some(LiveRun::from_application(application));
+                run.manifest.status = "active".into();
+                run.save()?;
+            } else if run.live.is_none() {
+                // Existing applications resume without replaying their initial input.
+                run.resume().await?;
+            }
+            return run.inspect(100).await;
+        }
+        let directory = self.paths.run(id)?;
+        create_reserved_directory(&directory)?;
         let manifest = RunManifest {
             version: 1,
-            run_id: id.clone(),
+            run_id: id.into(),
             core_version: ontography::VERSION.into(),
             core_build: crate::CORE_BUILD.into(),
             declaration: RunDefinition::Application(declaration),
@@ -580,7 +686,7 @@ impl Service {
             live: None,
             registry: self.registry.clone(),
         }));
-        self.runs.lock().await.insert(id.clone(), run.clone());
+        self.runs.lock().await.insert(id.into(), run.clone());
         let mut run = run.lock().await;
         let application = compiled
             .application

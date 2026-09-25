@@ -48,6 +48,9 @@ fn main() {
             "pi/index.ts",
             "pi/client.ts",
             "pi/tools.ts",
+            "pi/session.ts",
+            "pi/autocomplete.ts",
+            "pi/terminal.ts",
             "pi/instructions.md",
         ],
     );

@@ -6,9 +6,7 @@ Required tools:
 
 - Rust 1.91 or newer, Cargo, and the platform's native compiler tools.
 - Node.js 22.19 or newer.
-- Pi **0.85.1**, the version against which this extension is checked.
-
-Check existing installations:
+- Pi **0.85.1**, the version against which the extension is checked.
 
 ```sh
 rustc --version
@@ -16,15 +14,13 @@ node --version
 pi --version
 ```
 
-If Pi is missing, install the supported version using your normal Node package setup:
+If needed, install Pi using your normal Node package setup:
 
 ```sh
 npm install --global @earendil-works/pi-coding-agent@0.85.1
 ```
 
-The application never installs or upgrades Pi during ordinary launch. An existing incompatible Pi installation produces a version error; select a compatible executable with `--pi /absolute/path/to/pi`.
-
-Build or install the Rust command from this repository:
+Ontography does not install or upgrade Pi during launch. Select a compatible executable with `--pi /absolute/path/to/pi`; that choice is used when starting a manager process. An already running manager is reused.
 
 ```sh
 cargo build --locked
@@ -33,77 +29,98 @@ cargo build --locked
 cargo install --path . --locked
 ```
 
-The binary includes the Pi extension and management instructions. At launch it materializes versioned assets under the selected data directory; a deployed binary does not require this source checkout or an adjacent `node_modules` directory to load its extension. Building from this checkout still requires the sibling core source.
+The binary embeds the Pi extension and management instructions, materializing versioned assets in the data directory. Running an installed binary does not require the source checkout or adjacent `node_modules`. Building still requires the sibling core source.
 
-## Open the management interface
+## Start a session
 
 ```sh
 ontography
-ontography --project /absolute/path/to/project
-ontography --data-dir /absolute/path/to/ontography-data --project /absolute/path/to/project
+ontography --project /absolute/path/to/project session new work
+ontography --data-dir /absolute/path/to/test-data session new experiment
 ```
 
-`ontography` connects to the server for the selected data directory, starting it when needed, then launches native Pi. Pi retains its normal model, authentication, shell/file tools, and project settings. Use Pi's normal `/login` and model controls when configuring the management conversation.
+Bare `ontography` attaches to the last selected session. If none is selected, it creates one using the current directory, or `--project`. **`--project` applies when creating a session; it does not change an existing session's project.** Use `session new` for independent Pi state and another graph.
 
-The management instructions include the selected project directory. Ontography tools expose their actual argument schemas. Start with a request such as:
+Native Pi retains its authentication, model controls, shell/file tools, and global/project settings. Pi histories are stored within the owning Ontography session. Use Pi's normal `/login` and model controls as needed.
 
-> Read `examples/flow.json`, validate its graph, and start a run in this project. Show its current graph and pending work.
+An initial management request can be:
 
-`ontography_tools` lists available capability groups and activates their tools. A logical graph can be admitted and started before executable node implementations are available; inspect the returned execution status. The example uses UTF-8 payload contracts. It does not create Codex sessions or implement direct agent message delivery.
+> Read `examples/flow.json`, validate its graph, and start its run for this session. Show the graph and pending work.
 
-For the graph visualization interface:
+`ontography_tools` enables capability groups. Session-bound tools resolve the graph automatically. The example uses UTF-8 payload contracts and logical nodes; it does not launch Codex workers.
+
+## Graph display and detachment
+
+- `/graph` inside Pi opens the session's graph; `q` or Escape returns to Pi.
+- `ontography --ui` attaches to the same native manager and opens its graph first.
+- **Ctrl-B, then D** detaches from the Pi terminal and leaves the manager and graph running.
+- `ontography session detach SESSION_UUID` detaches the controlling client from another terminal, including while its graph view is open.
+
+One controlling attachment is allowed per manager terminal. A second is rejected; detach the current controller first. Different sessions can have separate attached clients.
+
+Pi `/new`, `/resume`, `/fork`, `/clone`, and `/tree` operate on conversations within the same app session and preserve its graph. Exiting Pi ends that manager process; later attachment resumes its active saved conversation while preserving the app session and graph.
+
+Full command and lifecycle reference: [SESSIONS.md](SESSIONS.md).
+
+## Storage and migration
+
+Storage precedence is `--data-dir`, `ONTOGRAPHY_DATA_DIR`, `$XDG_DATA_HOME/ontography`, then `$HOME/.ontography`. Each canonical data directory has one server. Logs are under `logs/`; session records and Pi histories are under `sessions/`.
+
+If the previous default `~/.local/share/ontography/` contains runs, default launch requires migration. Stop its server using the **matching old application build**, then run the new migration command:
 
 ```sh
-ontography --ui
+/absolute/path/to/matching-old-ontography --data-dir "$HOME/.local/share/ontography" server stop
+ontography migrate
 ```
 
-## Server lifetime
+The migration archives an existing legacy `~/.ontography/` as `~/.ontography.archive-UUID`, moves the stopped current store into `~/.ontography/`, and makes the old path a symlink to that same store. Locks reject active owners. A persisted journal allows the same command to finish an interrupted cutover. Existing app stores are not merged.
+
+```sh
+ontography migrate --from /absolute/path/to/old-store --to /absolute/path/to/new-store
+```
+
+`migrate` defaults are based on `HOME`; supply `--from`/`--to` for custom or XDG locations. Migrating storage preserves run IDs and core data. Existing runs have no inferred Pi owner: create an app session and adopt a selected run explicitly. Storage migration does not replace a run's core build or rewrite grammar.
+
+**Local cutover completed on 2026-09-25.** The legacy home was archived, the current store moved, and all three previously active runs resumed with unchanged identities and graph state. See [VERIFICATION.md](VERIFICATION.md#completed-local-storage-migration) for the archive path and evidence. Other installations use the explicit migration procedure above.
+
+## Server and structured calls
 
 ```sh
 ontography server start
 ontography server status
 ontography server stop
-```
 
-Closing Pi or its terminal disconnects that client. The detached Rust server retains graph runs and accepted operations. Reopening `ontography` connects to those same live runs. Multiple clients using the same data directory share one server.
-
-`server stop` performs an orderly suspension and preserves durable runs. Starting the server again lists those runs; resume the runs you want to use through the management tools. Explicit run closure is terminal for graph admission. Server restart also expires transient handles such as prepared rewrite plans and invocation capabilities; refresh state before using resources.
-
-The management Pi process itself exits with its client. Use native Pi session controls to reopen prior conversation history when desired. Restoring a conversation reads current graph state and never replays previous mutations.
-
-The data directory is selected by `--data-dir`, then `ONTOGRAPHY_DATA_DIR`, then `$XDG_DATA_HOME/ontography`, then `$HOME/.local/share/ontography`. Each directory has its own server and durable run stores. Server logs are under its `logs/` directory. A foreground server is available for development or an external supervisor:
-
-```sh
-ontography --data-dir /absolute/path/to/ontography-data server run
-```
-
-## Structured calls
-
-Management operations are also available without a model:
-
-```sh
 ontography call system.hello --args '{}'
 ontography call run.list --args '{}'
+ontography --session SESSION_UUID call run.inspect --args '{}'
 ontography call run.inspect --args '{"run_id":"RUN_UUID"}'
 ontography call OPERATION --file /absolute/path/to/arguments.json
 ```
 
-The arguments file contains the complete operation argument object. `system.hello` returns the operation catalog and schemas. Preserve string identifiers and decimal-string revisions exactly.
+Server stop settles accepted operations, stops managers, and suspends core runs. Startup loads records without launching every saved manager. Attach to the session you want; `session resume SESSION_UUID` resumes its graph without opening a terminal. A foreground server can be used by an external supervisor:
 
-If a request loses its response, inspect the recorded outcome using the client/request IDs from its receipt. Do not automatically repeat the mutation: it may already have committed. Outcomes can be recovered while the original server instance retains the record. After restart, reconcile against current run state.
+```sh
+ontography --data-dir /absolute/path/to/test-data server run
+```
 
-## Verify a development checkout
+`system.hello` returns the operation catalog and schemas. Scope a call with `--session` to resolve and validate its graph target. Preserve string identifiers and decimal-string revisions exactly.
+
+If a mutation loses its response, use its client/request IDs to inspect the outcome. Accepted work can have committed despite the missing response. Receipts remain within the original server instance; after restart, reconcile against current state before further work.
+
+## Development verification and troubleshooting
 
 ```sh
 cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
 cd pi
 npm ci --ignore-scripts
 npm run check
 npm test
 ```
 
-Pi development dependencies are local and pinned in `pi/package-lock.json`. The extension uses Pi's own module resolver at runtime. Tests use local Unix sockets; environments that prohibit socket listeners must allow those tests to run outside that restriction. Most tests make no model calls.
+Pi development dependencies are local and pinned. Tests use temporary stores, Unix sockets, PTYs, and local iroh endpoints; environments that prohibit these resources need the relevant execution permission. Most tests make no model calls.
 
-Builds embed fingerprints of the app and core source. Clients require the server's exact app/core build identities, and persisted runs require their stored core build identity. Missing identity fields from an older development format are incompatible; this version provides no migration across core builds.
+Builds embed app/core source fingerprints. Clients require the server's exact app/core builds; persistent runs require their stored core build and declaration identities. There is no cross-core-build migration. Use the matching client to stop an older server before changing app builds; stopping it does not change its saved core format.
 
-If startup fails, check the reported Pi version, project/data-directory paths, `ontography server status`, and the server log. The server preserves an incompatible existing owner's runs instead of replacing that process. Use the matching application build or explicitly stop the existing server before changing builds. Stopping an old server does not migrate its durable runs to another core build.
+For startup failures, inspect the Pi version, project/data paths, `server status`, and the server log. Missing previously saved conversation history is reported explicitly. Empty initial conversations have reserved IDs and can be resumed before Pi writes their first history file.

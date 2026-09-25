@@ -1,10 +1,98 @@
-# Management layer verification
+# Verification
+
+## Persistent sessions — 2026-09-25
+
+The persistent manager-session milestone is implemented and verified on macOS,
+with native Pi 0.85.1 and the unchanged sibling core. The checked application
+fingerprint is `64fdb11944f63fd5ec52acd36c89cefa983d33199189fae12172a71f301b6d34`;
+the core fingerprint is
+`819006a6fa15f139ccaee99ea2c17b7f1f51fc5f2270eafeeb95758c06904cda`.
+All seven embedded Pi assets participate in the application fingerprint.
+
+### Automated gates
+
+Passed: **90 Rust tests, 30 Pi tests**, TypeScript checking, Clippy across all
+targets with warnings denied, formatting, and `git diff --check`. The locked
+offline build succeeds. Socket, PTY, and local iroh tests ran with permission to
+create their required local resources.
+
+| Requirement | Evidence |
+| --- | --- |
+| Durable session, optional graph, exclusive run ownership | Eight [session tests](../tests/session_ownership.rs): bind once, scoped dispatch, explicit adoption, saved conversations, close/selection recovery, and initialization retries before/after core creation. |
+| Lifecycle controls remain usable | Session tests cover observation waits during suspension; [manager lifecycle](../tests/manager_lifecycle.rs) covers concurrent ensure, manager before graph initialization, suspension, explicit resume, and shutdown. |
+| Detached native terminal | Fourteen tests across [terminal backend](../src/terminal.rs) and [client](../src/terminal_client.rs): detached draining, ordered input, exclusive controller, stale identities, terminal queries, process reaping, and history navigation isolated from live input/state. |
+| Pi conversations retain graph identity | [Extension tests](../pi/test/session.test.ts) cover native lifecycle hooks, membership checks, preferences, failed registration, replacement, and saved-history materialization. Native checks below exercise the real harness. |
+| Typed tools and connection recovery | [Bridge/tool tests](../pi/test/) verify session envelopes, reconnection, cancellation, no mutation replay, bounded output, schemas, and exact wide identifiers. |
+| Fast slash commands | Installed-provider regressions reproduce stale-prefix and obsolete-candidate corruption; the public completion wrapper preserves current command text and arguments. Native checks exercise the correction. |
+| Migration and recovered paths | Eight migration tests cover exclusive ownership, archival, interrupted rename/alias stages, ambiguous stores, and substituted directories. A session integration test relocates real native-history files and checks ownership through the old path alias. |
+
+### Native acceptance
+
+Two independent PTY harnesses exercised the same compiled application build.
+Both isolated servers were explicitly stopped after verification.
+
+- Native Pi made an actual `ontography_run_inspect({})` call using its bound run.
+  Its first saved history became durably marked materialized. `/new`, `/resume`,
+  `/clone`, and `/reload` preserved the app session and graph; `/graph` continued
+  to work after those transitions. Burst slash input arrived and executed intact.
+- `--ui` displayed the session's graph first, then returned to the same native Pi
+  process. `/hotkeys` produced 93 retained history rows; Ctrl-B `[` and Page Up
+  displayed older output, and `q`/Escape restored live input. Resizing from 80×24
+  to 120×35 reached the server-owned terminal.
+- Detach restored the original terminal attributes, alternate screen, and paste
+  mode. Reattachment retained the same Pi PID and terminal identity. A second app
+  session had a different manager and graph. Server restart retained the original
+  session, conversation, and run IDs while creating a replacement terminal.
+
+Native evidence was retained at
+`/private/tmp/ontography-native-session-fncoalu3/` and
+`/private/tmp/ontography-native-terminal-ublseek2/` during verification. Those
+directories contain assertion records and terminal captures; they are temporary
+verification artifacts. Native `/fork` was not separately exercised; its extension
+hooks are covered by automated tests. Terminal presentation supports text and
+color; inline images and hyperlinks are disabled.
+
+### Completed local storage migration
+
+The old server was gracefully stopped with its matching client. The verified new
+binary then completed the authorized migration:
+
+- Current store: `/Users/hershybar/.ontography`.
+- Legacy archive:
+  `/Users/hershybar/.ontography.archive-e0fa8fb7-5475-4a9e-bd4a-2c3a4777a00e`.
+- `/Users/hershybar/.local/share/ontography` is an alias to the current store.
+- Directory identities prove both trees were renamed intact. SHA-256 comparisons
+  verified all 13 stopped run/definition files before and after relocation.
+- All three previously active runs were resumed. Their run IDs, declarations,
+  projects, checkpoints, admission, revisions, topology, and package frontiers
+  matched pre-migration inspection. Both store paths connect to the same server;
+  recovery errors are empty.
+
+| Preserved run | Definition | Nodes / edges | Revision |
+| --- | --- | --- | --- |
+| `12dccebd-f344-4482-a0b8-4006f7e472ea` | fifteen-node-chain | 15 / 14 | 0 |
+| `6c2d1977-4fd0-473a-b11d-448e92536b2a` | fifteen-node-chain-mixed | 15 / 21 | 0 |
+| `a380573c-a8f0-4ff6-bdf0-8a1250ea99d7` | logical-flow | 2 / 1 | 0 |
+
+Existing runs remain available for explicit session adoption; the migration does
+not invent an earlier Pi association. Cutover evidence is retained under
+`/private/tmp/ontography-cutover-6e7urwx1/`.
+
+### Scope
+
+This completes the manager-session foundation: native Pi ownership, multiple
+conversations, session-bound graph tooling, persistent terminal attachment,
+graph display, recovery, and storage migration. Concrete Codex worker nodes,
+their message/workspace contracts, node MCP, default editing productions, and
+worker process reconciliation remain the following implementation phase.
+
+## Historical management release — 2026-09-24
 
 Verified on macOS on 2026-09-24, using Rust 1.97.1, Node.js 22.22.3, Pi 0.85.1,
 and the sibling `ontography-core` checkout. The application uses public core APIs;
 this implementation made no changes to the sibling core.
 
-## Automated checks
+### Automated checks
 
 ```sh
 cargo test --locked --offline
@@ -31,7 +119,7 @@ the production registry does not ship those fixtures.
 | 7. Management experience | [Pi tests](../pi/test/) cover schemas, wide identifiers, cancellation, reconnection, no mutation replay, build identity, and bounded previews. Installed Pi performed actual management tool calls; copied-binary launch verified embedded extension assets. |
 | 8. Rust TUI | [UI tests](../src/ui/) cover graph identity, loops/parallel edges, resizing, selection, stale observations/previews, Pi streaming, and child cleanup. [Node-page tests](../src/ui/frontier.rs) use 400 real outbound packages to inspect a node absent from the global first 100, reach subsequent pages and history, and reject mixed revisions and obsolete responses. Actual terminal checks cover rendering, model tools, detach, session restoration, and terminal restoration. |
 
-## Live management and terminal checks
+### Live management and terminal checks
 
 Both native Pi and `ontography --ui` launched with the installed Pi configuration.
 A live model read the example declaration, called graph validation and run start,
@@ -51,9 +139,9 @@ explicit resumption, and rejected expired transient handles. Failed workspace
 capture retained recovery resources. Closing a suspended run did not relaunch its
 declared executable.
 
-## Scope of these results
+### Scope of these results
 
-- Architecture items 1–7 remain subsequent work: concrete Codex/tmux nodes,
+- Architecture items 1–7 remain subsequent work: concrete Codex nodes,
   app-specific package contracts and edge definitions, receiving harnesses, and
   node-scoped MCP. The management layer exposes existing core package/workspace
   functionality and registered execution/application integrations now.

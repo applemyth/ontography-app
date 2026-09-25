@@ -23,11 +23,28 @@ pub fn operations() -> Vec<Operation> {
     operations.extend(content::operations());
     operations.extend(workspace::operations());
     operations.extend(facts::operations());
+    operations.extend(crate::sessions::operations());
+    operations.extend(crate::session_runtime::operations());
     operations
+}
+
+pub async fn dispatch_scoped(
+    service: &Service,
+    app_session_id: Option<&str>,
+    operation: &str,
+    args: &Value,
+) -> Result<Value> {
+    match app_session_id {
+        Some(id) => crate::sessions::dispatch_scoped(service, id, operation, args).await,
+        None => dispatch(service, operation, args).await,
+    }
 }
 
 pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Result<Value> {
     match operation {
+        name if name.starts_with("session.") => {
+            crate::sessions::dispatch(service, operation, args).await
+        }
         "network.wait" => network::wait(service, args).await,
         "inspect.wait_frontier" => workflow::dispatch_wait(service, args).await,
         "run.export_facts" | "run.restore_facts" | "run.verify" => {
@@ -47,7 +64,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             let mut catalog = service.registry.catalog();
             catalog["validators"] = json!([{"id":"opaque_bytes","version":1,"description":"Accepts arbitrary bytes"},{"id":"utf8","version":1,"description":"Accepts valid UTF-8 bytes"}]);
             catalog["deferred"] = json!([
-                "Codex/tmux executable adapter",
+                "Codex worker executable adapter",
                 "semantic Message and Workspace union contracts",
                 "node MCP and worker transport receipts"
             ]);

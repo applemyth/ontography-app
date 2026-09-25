@@ -1,5 +1,15 @@
 # Rust graph client
 
+## Current session graph view
+
+Native Pi runs in a server-owned PTY. `/graph` requests the owning app session's graph through the terminal control channel. The attached Rust client opens `ui::run_graph_view` from `session_graph.rs`; `q` or Escape restores the same Pi terminal. `ontography --ui` opens this graph view first through that same attachment. There is no independent run picker in this path.
+
+The graph view reuses the Ratatui renderer described below. See [the session guide](../../docs/SESSIONS.md) for ownership, controls, and lifecycle, and [VERIFICATION.md](../../docs/VERIFICATION.md) for current acceptance evidence.
+
+## Historical combined RPC interface
+
+The following describes the initial implementation retained in source and tests. It is no longer the CLI's `--ui` path.
+
 `ui::run(client, UiOptions { pi_command })` owns the terminal and launches the
 prepared Pi command in RPC mode. The launcher supplies executable, project,
 extension, instructions, and environment. Pi continues to own its conversation,
@@ -79,4 +89,4 @@ Verified with the installed Pi 0.85.1 in an actual PTY on 2026-09-24:
   test cleanup stopped the server, preserving its runs.
 
 These checks exercise logical graphs and the real management agent. Production
-Codex/tmux worker definitions remain a separate implementation.
+Codex worker definitions and their node terminals remain a separate implementation.

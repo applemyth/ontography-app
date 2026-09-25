@@ -1,10 +1,10 @@
 # Core bindings and coverage
 
-This inventory maps [PLAN.md](../PLAN.md) to the implemented public core adapters. The authoritative operation names and JSON schemas are returned by `ontography call system.hello --args '{}'`. Pi registers one typed tool per operation; `ontography_tools` activates capability groups.
+This inventory maps [PLAN.md](../PLAN.md) to the implemented public core adapters. The authoritative operation names and JSON schemas are returned by `ontography call system.hello --args '{}'`. Pi exposes model-facing management operations; internal session/terminal controls remain extension or CLI responsibilities; `ontography_tools` activates capability groups.
 
 ## Ownership
 
-Pi owns the management conversation. The detached Rust server owns accepted requests, runtimes, sessions, executable hosts, and retained handles. Core owns admission, graph transitions, occurrence history, content, and context records. Client disconnect releases its connection; it does not suspend a run or undo an accepted operation.
+One Ontography app session owns Pi manager state, a native manager terminal, and one graph run after initialization. Pi owns native conversation semantics; the app records membership, active selection, tool preferences, and graph association. The detached Rust server retains processes, PTYs, accepted requests, core runtimes, executable hosts, and handles. Core owns admission, graph transitions, occurrence history, content, and context records. Client detach preserves these resources. See [session ownership](SESSIONS.md).
 
 The app imports the sibling core through its public Rust API. It creates manifests and graph declarations; it never reads or modifies core's private SQLite representation. The binary fingerprints app/core source. Handshakes require the exact app/core build, and run reopening requires the stored core build and original declaration/catalog identities.
 
@@ -15,6 +15,8 @@ Operation names in a row share the indicated prefix. Argument schemas define the
 | Planned family | App operations / inputs and results | Public core binding / ownership |
 | --- | --- | --- |
 | System and catalog | `system.hello`, `system.status`, `catalog.list`; versions/builds, server identity, schemas, registered implementation descriptors | App metadata and `ImplementationRegistry`; validators are explicitly versioned opaque-byte and UTF-8 implementations. |
+| App sessions | `session.create/list/inspect/select/adopt/resume/suspend/close/context/conversation/preferences` | App-owned records, conversation membership, lifecycle admission, graph binding, and durable initialization intents around existing core runs. |
+| Manager terminals | `terminal.ensure/status/graph/detach` plus attachment protocol | Server-owned native Pi through `portable-pty`, screen state through `vt100`, and one controlling client. Concrete node terminals remain deferred. |
 | Definitions | `graph.save/get/list/validate/import/export`; versioned declaration, immutable revision hash, admitted topology, explicit file paths | `Schema`, `Graph`, contract/definition/rule constructors, `Kernel::admit`, `RewriteGrammar`; drafts persist independently from runs. Import parses and saves a draft without admitting it; export writes a saved revision to the requested file. |
 | Durable runs | `run.start/list/inspect/suspend/resume/close`; explicit project directory and run ID | `ProposalRuntime::create_persistent/open_persistent`, `SessionHandle`, `ExecutionHost`; retained `ManagedRun`. Suspension drops owners and preserves admission. Closure calls the selected session's `close`. |
 | Fixed graph facts | `run.export_facts`, `run.restore_facts`, `run.verify`; absolute files, exact activation/result/output data, verification summary | `State::to_parts`, public `Activation`/`Output` constructors, `ProposalRuntime::restore/open_persistent_verified`. Restore is transient validation/inspection with no managed run; see scope below. |
@@ -33,16 +35,18 @@ Operation names in a row share the indicated prefix. Argument schemas define the
 | Network transfers | `network.download/downloads/progress/wait/cancel/release/status/discard`; ticket and retained download ID | Core verified download handles and local availability/pin APIs. Wait releases the run mutex; cancel settles work; release closes its endpoint and preserves resumable verified partial bytes. Transfer does not submit workflow occurrences. |
 | Native/project configurations | `project.providers/describe/prepare/native_validate/start`; source document, format, project root, initial input, optional rewrite grammar | `ApplicationRegistry`, `ProjectRegistry`, trusted providers and native factories. `ApplicationDeclaration` pins catalog and resolved configuration/component metadata. Start calls `Application::start_in`; managed resume uses `Application::resume`; suspension consumes `RunningApplication::suspend`. Initial input is supplied only at creation. |
 
-Implementation: [declarations](../src/declarations.rs), [catalog](../src/catalog.rs), [run ownership](../src/state.rs), [tools](../src/tools/), [trusted registry](../src/registry.rs), [application declarations](../src/application.rs).
+Implementation: [sessions](../src/sessions.rs), [manager ownership](../src/session_runtime.rs), [declarations](../src/declarations.rs), [catalog](../src/catalog.rs), [run ownership](../src/state.rs), [tools](../src/tools/), [trusted registry](../src/registry.rs), [application declarations](../src/application.rs).
 
 ## Wire and resource behavior
 
 - JSONL frames are bounded to 4 MiB including the newline. Rust validates the published argument schemas. Large content and explicit history exports use file/content references.
 - UUIDs and compound occurrence IDs are strings. Revisions, receipt sequences, content sizes, and other potentially wide counters preserve exact decimal strings across JavaScript.
 - Every non-handshake request includes the expected server instance. A replacement server rejects a stale request before dispatch. Transient resource IDs must also resolve within the named run and resource kind.
+- Session-bound requests also carry `app_session_id`. The server fills omitted session/run/project targets and rejects conflicts, including specialized execution/project/facts paths. Unscoped calls retain the administration API.
 - Accepted mutations retain `(client_id, request_id)` outcomes in a bounded server table. Repeating the same request identity with the same operation/arguments returns its existing outcome; conflicting arguments reject. `operation.get` reports running, completed, failed, or absent/expired. Restart loses this transient table.
 - A missing response is an unknown outcome. Neither Rust nor Pi automatically replays it. Pi cancellation stops waiting; accepted server work continues unless an explicit capability such as download cancellation or executable stop requests a change.
 - Socket requests are multiplexed. Run resource mutations hold that run's ownership mutex. Waiting for execution, network progress, or frontier changes must leave controls available to other requests.
+- Graph initialization additionally persists its reserved run identity and resolved source before core creation; retries reconcile that same run. General operation receipts still expire at restart.
 - File targets are absolute or explicitly relative to the target run's stored project, as documented by each operation. The server's launch directory does not decide a client's target.
 
 ## Fact export and restore scope
@@ -61,7 +65,7 @@ Fact files exclude artifact dependency records and artifact bytes, invocation/co
 
 ### Concrete worker layer, intentionally deferred
 
-The production registry starts without Codex/tmux executables, direct-message injection, semantic Message/Workspace/union contracts, node MCP, and worker transport acknowledgements. These are architecture items 1–7. Tests register deterministic implementations locally; those fixtures do not appear in the shipped catalog. Future adapters must record actual observed delivery and reconcile external processes after committed rewrites or restart.
+The production registry starts without concrete Codex workers, direct-message injection, app Message/Workspace/union contracts, node MCP, and worker transport acknowledgements. The management Pi PTY/session infrastructure is implemented separately. These are architecture items 1–7. Tests register deterministic implementations locally; those fixtures do not appear in the shipped catalog. Future adapters must record actual observed delivery and reconcile external processes after committed rewrites or restart.
 
 ### Core API limits
 
@@ -73,7 +77,7 @@ The production registry starts without Codex/tmux executables, direct-message in
 
 ### Release verification
 
-The release checks exercise the actual installed native Pi extension, Rust UI/Pi RPC cleanup, and the Rust/TypeScript suites. Live model calls separately exercised graph validation, creation, rewriting, and inspection. See [verification results](VERIFICATION.md) for the tested boundaries and limitations.
+The original release checked native Pi, the historical Rust/Pi RPC UI, and live graph tool calls. The session foundation adds manager PTYs, attachment, conversation ownership, scoped dispatch, and graph view switching. See [verification results](VERIFICATION.md) for completed checks and outstanding acceptance/cutover work; earlier evidence does not by itself validate the new session path.
 
 ## Verification evidence
 
@@ -81,6 +85,8 @@ The release checks exercise the actual installed native Pi extension, Rust UI/Pi
 | --- | --- |
 | Detached lifetime, simultaneous startup, abrupt process death, explicit recovery, expired handles, receipt recovery, stale server rejection, partial-frame multiplexing | [server process tests](../tests/server_lifecycle.rs) |
 | Malformed/partial/missing manifests isolated from healthy run recovery and creation | [manifest recovery tests](../tests/state_recovery.rs) |
+| App-session ownership, scoped targets, initialization recovery, adoption, conversation materialization, lifecycle waits | [session ownership tests](../tests/session_ownership.rs) |
+| Manager terminal lifetime, exclusive controller, snapshots, query/input handling, detach and graph control | [terminal backend](../src/terminal.rs), [terminal client](../src/terminal_client.rs) |
 | Governed delivery/consume/rejection, suspend/reopen, terminal closure, rewrite staleness and persisted topology | [management flow](../tests/management_flow.rs), workflow unit tests |
 | Fixed fact restoration, tampered evidence rejection, verification ownership release, unsupported dynamic history | [fact adapter tests](../src/tools/facts.rs) |
 | Content/package formats, closure retention, checkpoint/GC/reopen, merge conflicts | content and workspace module tests |

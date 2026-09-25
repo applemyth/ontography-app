@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { BridgeClient, BridgeError, parseHello, type Receipt } from "../client.ts";
 
-interface Request { version: number; client_id: string; request_id: string; expected_server_id?: string; operation: string; args: Record<string, unknown> }
+interface Request { version: number; client_id: string; request_id: string; app_session_id?: string; expected_server_id?: string; operation: string; args: Record<string, unknown> }
 const operations = [
   { name: "inspect.echo", group: "inspect", description: "Return input", parameters: { type: "object" }, mutating: false },
   { name: "graph.create", group: "graph", description: "Create graph", parameters: { type: "object" }, mutating: true },
@@ -13,7 +13,7 @@ const operations = [
 ];
 
 async function fixture(t: TestContext, handle: (request: Request, socket: Socket, reply: (result: unknown) => void) => void,
-  options: { maxFrameBytes?: number; timeoutMs?: number; expectedAppBuild?: string; expectedCoreBuild?: string } = {}) {
+  options: { maxFrameBytes?: number; timeoutMs?: number; expectedAppBuild?: string; expectedCoreBuild?: string; appSessionId?: string } = {}) {
   const directory = await mkdtemp("/private/tmp/onto-pi-");
   const socketPath = join(directory, "s");
   const sockets = new Set<Socket>();
@@ -154,4 +154,16 @@ test("original receipts cannot be resolved against a different server instance",
   await assert.rejects(setup.client.outcome({ client_id: "client", request_id: "r", server_id: "previous-server", operation: "graph.create" }),
     (error: unknown) => error instanceof BridgeError && error.code === "server_restarted");
   assert.equal(setup.requests.length, 1);
+});
+
+test("app-session ownership survives handshake and reconnection independently of tool arguments", async (t) => {
+  const setup = await fixture(t, (request, _socket, reply) => reply(request.args), { appSessionId: "app-session-1" });
+  const first = await setup.client.call("inspect.echo", { value: "one" });
+  setup.client.disconnect();
+  const second = await setup.client.call("inspect.echo", { value: "two" });
+  assert.equal(setup.connections(), 2);
+  assert.ok(setup.requests.every((request) => request.app_session_id === "app-session-1"));
+  assert.deepEqual(setup.requests.filter((request) => request.operation === "inspect.echo").map((request) => request.args), [{ value: "one" }, { value: "two" }]);
+  assert.equal(first.receipt.app_session_id, "app-session-1");
+  assert.equal(second.receipt.app_session_id, "app-session-1");
 });

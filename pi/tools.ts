@@ -7,6 +7,29 @@ export const DEFAULT_GROUPS = ["system", "catalog", "graph", "run", "rewrite", "
 export const BOOTSTRAP_TOOL = "ontography_tools";
 const MAX_MODEL_RESULT = 20_000;
 
+export interface ManagementScope {
+  sessionId: string;
+  ensureReady(): Promise<void>;
+  saveGroups(groups: string[]): Promise<void>;
+  toolGroups?(): string[];
+}
+
+/** Native lifecycle/view operations are invoked by hooks, never by the model. */
+function visibleInSession(operation: string): boolean {
+  if (operation.startsWith("terminal.") || operation.startsWith("server.")) return false;
+  if (operation.startsWith("session.")) return operation === "session.context" || operation === "session.inspect";
+  return true;
+}
+
+function scopedParameters(parameters: Arguments): TSchema {
+  const result = structuredClone(parameters);
+  if (object(result.properties) && object(result.properties.run_id)) {
+    result.properties.run_id.description = "Defaults to this Ontography session's graph run. An explicit run ID must match that run.";
+    if (Array.isArray(result.required)) result.required = result.required.filter((key) => key !== "run_id");
+  }
+  return result as unknown as TSchema;
+}
+
 export function toolName(operation: string): string {
   return `ontography_${operation.replaceAll(".", "_")}`;
 }
@@ -32,13 +55,16 @@ function toolError(error: unknown): Error {
 export class ManagementTools {
   private readonly pi: ExtensionAPI;
   private readonly client: BridgeClient;
+  private readonly scope: ManagementScope | undefined;
   private hello: Hello | undefined;
   private groups = new Set(DEFAULT_GROUPS);
   private registered = new Set<string>();
 
-  constructor(pi: ExtensionAPI, client: BridgeClient) {
+  constructor(pi: ExtensionAPI, client: BridgeClient, scope?: ManagementScope) {
     this.pi = pi;
     this.client = client;
+    this.scope = scope;
+    if (scope !== undefined) this.groups.add("session");
   }
 
   registerBootstrap(): void {
@@ -51,13 +77,18 @@ export class ManagementTools {
       executionMode: "sequential",
       execute: async (_callId, args) => {
         try {
-          await this.refresh();
+          await this.scope?.ensureReady();
+          await this.refresh(this.scope?.toolGroups?.());
           if (args.groups !== undefined) {
             const available = new Set(this.hello!.operations.map((operation) => operation.group));
             for (const group of args.groups) if (!available.has(group)) throw new Error(`Unknown capability group ${JSON.stringify(group)}. Available: ${[...available].sort().join(", ")}`);
-            for (const group of args.groups) this.groups.add(group);
+            const groups = [...new Set([...this.groups, ...args.groups])];
+            await this.scope?.saveGroups(groups);
+            this.groups = new Set(groups);
             this.activate();
-            this.pi.appendEntry("ontography_tool_groups", { groups: [...this.groups] });
+            // Legacy clients retain conversation-local preferences. Bound managers use
+            // app-session preferences so /new does not reset their tool selection.
+            if (this.scope === undefined) this.pi.appendEntry("ontography_tool_groups", { groups: [...this.groups] });
           }
           return modelResult({
             server_id: this.hello!.server_id,
@@ -73,8 +104,9 @@ export class ManagementTools {
   }
 
   async refresh(groups?: string[]): Promise<Hello> {
-    const hello = await this.client.connect();
-    if (groups !== undefined) this.groups = new Set([...DEFAULT_GROUPS, ...groups]);
+    const connected = await this.client.connect();
+    const hello = this.scope === undefined ? connected : { ...connected, operations: connected.operations.filter((operation) => visibleInSession(operation.name)) };
+    if (groups !== undefined) this.groups = new Set([...DEFAULT_GROUPS, ...(this.scope === undefined ? [] : ["session"]), ...groups]);
     const names = new Set<string>([BOOTSTRAP_TOOL]);
     for (const operation of hello.operations) {
       const name = toolName(operation.name);
@@ -89,17 +121,23 @@ export class ManagementTools {
         label: `Ontography · ${operation.name}`,
         description: operation.description,
         promptSnippet: operation.description,
-        parameters: operation.parameters as unknown as TSchema,
+        parameters: this.scope === undefined ? operation.parameters as unknown as TSchema : scopedParameters(operation.parameters),
         executionMode: operation.mutating ? "sequential" : "parallel",
         execute: async (_callId, args: unknown, signal) => {
           if (!object(args)) throw new Error("Tool arguments must be a JSON object.");
           try {
+            await this.scope?.ensureReady();
             const current = await this.client.connect();
             const requestId = randomUUID();
-            const receipt: Receipt = { client_id: this.client.clientId, request_id: requestId, server_id: current.server_id, operation: operation.name };
+            const receipt: Receipt = { client_id: this.client.clientId, request_id: requestId, server_id: current.server_id, operation: operation.name,
+              ...(this.scope === undefined ? {} : { app_session_id: this.scope.sessionId }) };
             // Retain the request identity before dispatch so a lost response can be inspected.
             this.pi.appendEntry("ontography_request", receipt);
-            const response: CallResult = await this.client.call(operation.name, args as Arguments, {
+            if (this.scope !== undefined && operation.name.startsWith("session.") && args.session_id !== undefined && args.session_id !== this.scope.sessionId) {
+              throw new BridgeError("session_binding", "This manager cannot target another Ontography session.");
+            }
+            const arguments_ = this.scope !== undefined && operation.name.startsWith("session.") ? { ...args, session_id: this.scope.sessionId } : args;
+            const response: CallResult = await this.client.call(operation.name, arguments_ as Arguments, {
               requestId, ...(signal === undefined ? {} : { signal }),
             });
             return modelResult(response.result, response.receipt);

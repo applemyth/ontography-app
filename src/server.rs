@@ -4,7 +4,7 @@ use crate::{
     persistence::Paths,
     protocol::{self, Request, Response},
     state::Service,
-    tools, views,
+    views,
 };
 use futures_util::FutureExt;
 use serde_json::{Value, json};
@@ -30,12 +30,14 @@ use tokio::{
 type Completion = Option<Arc<Result<Value>>>;
 struct Receipt {
     operation: String,
+    app_session_id: Option<String>,
     args: Value,
     result: watch::Receiver<Completion>,
 }
 
 pub struct Server {
     pub service: Service,
+    managers: crate::session_runtime::Managers,
     requests: Mutex<BTreeMap<(String, String), Receipt>>,
     admission: RwLock<()>,
     stopping: AtomicBool,
@@ -56,6 +58,7 @@ impl Server {
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             service: Service::with_registry(paths, registry)?,
+            managers: crate::session_runtime::Managers::default(),
             requests: Mutex::new(BTreeMap::new()),
             admission: RwLock::new(()),
             stopping: AtomicBool::new(false),
@@ -85,6 +88,13 @@ impl Server {
                     "receipt is absent or expired; reconcile against current run state",
                 )
             })?;
+            if request.app_session_id.is_some() && receipt.app_session_id != request.app_session_id
+            {
+                return Err(AppError::new(
+                    "session_scope",
+                    "receipt belongs to another session",
+                ));
+            }
             return Ok(match receipt.result.borrow().as_ref() {
                 None => json!({"state":"running","operation":receipt.operation}),
                 Some(result) => match result.as_ref() {
@@ -98,16 +108,30 @@ impl Server {
             });
         }
         if request.operation == "server.stop" {
+            if request.app_session_id.is_some() {
+                return Err(AppError::new(
+                    "global_operation",
+                    "stop the server through the explicit server CLI",
+                ));
+            }
             return self.stop().await;
         }
         let operation = catalog::operations()
             .iter()
             .find(|o| o.name == request.operation)
             .ok_or_else(|| AppError::new("unknown_operation", &request.operation))?;
-        validate_arguments(&operation.parameters, &request.args, "args")?;
+        let mut parameters = operation.parameters.clone();
+        if request.app_session_id.is_some()
+            && let Some(required) = parameters.get_mut("required").and_then(Value::as_array_mut)
+        {
+            required
+                .retain(|name| !matches!(name.as_str(), Some("run_id" | "project" | "session_id")));
+        }
+        validate_arguments(&parameters, &request.args, "args")?;
         if !operation.mutating {
-            let result = AssertUnwindSafe(tools::dispatch(
+            let result = AssertUnwindSafe(self.managers.dispatch(
                 &self.service,
+                request.app_session_id.as_deref(),
                 &request.operation,
                 &request.args,
             ))
@@ -124,7 +148,10 @@ impl Server {
         let key = (request.client_id, request.request_id);
         let mut requests = self.requests.lock().await;
         let mut result = if let Some(receipt) = requests.get(&key) {
-            if receipt.operation != request.operation || receipt.args != request.args {
+            if receipt.operation != request.operation
+                || receipt.args != request.args
+                || receipt.app_session_id != request.app_session_id
+            {
                 return Err(AppError::new(
                     "request_id_conflict",
                     "request identity was already used with different arguments",
@@ -157,6 +184,7 @@ impl Server {
                 key,
                 Receipt {
                     operation: request.operation.clone(),
+                    app_session_id: request.app_session_id.clone(),
                     args: request.args.clone(),
                     result: receiver.clone(),
                 },
@@ -171,7 +199,15 @@ impl Server {
                             "operation did not begin before shutdown",
                         ));
                     }
-                    tools::dispatch(&server.service, &request.operation, &request.args).await
+                    server
+                        .managers
+                        .dispatch(
+                            &server.service,
+                            request.app_session_id.as_deref(),
+                            &request.operation,
+                            &request.args,
+                        )
+                        .await
                 })
                 .catch_unwind()
                 .await
@@ -204,6 +240,10 @@ impl Server {
             ));
         }
         let _guard = self.admission.write().await;
+        if let Err(error) = self.managers.shutdown().await {
+            self.stopping.store(false, Ordering::Release);
+            return Err(error);
+        }
         if let Err(error) = self.service.shutdown().await {
             self.stopping.store(false, Ordering::Release);
             return Err(error);
@@ -400,6 +440,7 @@ pub async fn serve_with_registry(
             format!("another server owns this data directory: {e}"),
         )
     })?;
+    crate::migration::check_root_available(&paths.root)?;
     if paths.socket.exists() {
         std::fs::remove_file(&paths.socket)?;
     }
