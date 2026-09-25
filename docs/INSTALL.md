@@ -35,11 +35,13 @@ The binary embeds the Pi extension and management instructions, materializing ve
 
 ```sh
 ontography
-ontography --project /absolute/path/to/project session new work
-ontography --data-dir /absolute/path/to/test-data session new experiment
+ontography --project /absolute/path/to/project new work
+ontography ls
+ontography attach work
+ontography --data-dir /absolute/path/to/test-data new experiment
 ```
 
-Bare `ontography` attaches to the last selected session. If none is selected, it creates one using the current directory, or `--project`. **`--project` applies when creating a session; it does not change an existing session's project.** Use `session new` for independent Pi state and another graph.
+Bare `ontography` always creates a new session using the current directory, or `--project`. `new NAME` creates a named session; `attach NAME_OR_ID` explicitly returns to an existing one. **`--project` applies when creating a session; it does not change an existing session's project.** Pi `/quit` exits only Pi; `close NAME_OR_ID` closes the app session and graph.
 
 Native Pi retains its authentication, model controls, shell/file tools, and global/project settings. Pi histories are stored within the owning Ontography session. Use Pi's normal `/login` and model controls as needed.
 

@@ -368,7 +368,7 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "session.list",
-            "List durable Ontography sessions and the selected attachment target.",
+            "List durable Ontography sessions and the most recently selected session.",
             json!({}),
             &[],
             false,
@@ -389,7 +389,7 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "session.select",
-            "Select the default Ontography session for subsequent attachment.",
+            "Record the selected Ontography session; CLI attachment still requires an explicit target.",
             session.clone(),
             &["session_id"],
             true,

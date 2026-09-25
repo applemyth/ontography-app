@@ -31,7 +31,7 @@ The intended worker relationship remains node → execution → PTY → client v
 ## Implemented launch and initialization
 
 1. `ontography` connects to or starts the server for its canonical data directory.
-2. Explicit `--session` selects an exact session; otherwise the last selected session is used. If none is selected, create one with a reserved initial Pi conversation UUID and pending graph initialization.
+2. Bare launch always creates a session with a reserved initial Pi conversation UUID and pending graph initialization. `new NAME` names it. `attach NAME_OR_ID` or bare `--session NAME_OR_ID` explicitly resumes an existing session. IDs take precedence; names must match exactly and uniquely. Persisted selection does not control default launch.
 3. Attachment resumes the selected graph when present and launches/reuses its native Pi manager. Only one controlling attachment is admitted per terminal.
 4. Pi's first scoped `run.start` or `project.start` persists a run identity and resolved initialization source before creating core storage. The resulting run is bound to the app session. Retry/recovery reuses that identity.
 5. `/graph` switches the attached client's view to the bound run, or pending initialization. Returning restores the same Pi terminal.

@@ -4,12 +4,15 @@ A Rust application for persistent agent sessions and graphs, built on [`ontograp
 
 ```sh
 cargo build --locked
-./target/debug/ontography               # attach to the last selected session
-./target/debug/ontography session new work
-./target/debug/ontography --ui          # open that session's graph first
+./target/debug/ontography               # always create a new session
+./target/debug/ontography new work      # create a named session
+./target/debug/ontography ls            # list sessions, terminals, and graphs
+./target/debug/ontography attach work   # explicitly reattach
+./target/debug/ontography attach work --ui  # open its graph first
+./target/debug/ontography close work    # stop its manager and close its graph
 ```
 
-Inside Pi, `/graph` opens the graph; `q` or Escape returns to the same Pi process. **Ctrl-B, then D detaches while Pi and the graph continue running.** Pi `/new` starts another conversation within the same Ontography session and retains its graph.
+Inside Pi, `/graph` opens the graph; `q` or Escape returns to the same Pi process. **Ctrl-B, then D detaches while Pi and the graph continue running.** Pi `/quit` exits Pi and returns to your shell while the session and graph remain active; explicit attachment restarts Pi from its saved conversation. Pi `/new` starts another conversation within the same Ontography session and retains its graph.
 
 Keep the sibling core checkout available when building. Install Pi **0.85.1** separately; the binary embeds its Ontography extension. See [installation](docs/INSTALL.md) and the [session guide](docs/SESSIONS.md). Existing stores under `~/.local/share/ontography/` require explicit migration before the new default `~/.ontography/` is used.
 
@@ -33,17 +36,19 @@ Rust server
 
 A new session can start Pi before its graph exists. Its first scoped `run.start` or `project.start` durably binds the resulting run. Each session owns separate Pi state and, once initialized, one graph run. Saved graph definitions remain separate from the current graph of a run.
 
-Server stop suspends graph resources and stops managers. Attaching after restart restores the selected session's graph and saved Pi conversation. Transcripts do not restore process memory or in-flight agent work.
+Server stop suspends graph resources and stops managers. Explicit attachment after restart restores that session's graph and saved Pi conversation. Transcripts do not restore process memory or in-flight agent work.
 
 ## Use without a model
 
 ```sh
-./target/debug/ontography session new work --no-attach
-./target/debug/ontography session list
+./target/debug/ontography new work --no-attach
+./target/debug/ontography ls --json
 ./target/debug/ontography call system.hello --args '{}'
 ./target/debug/ontography --session SESSION_UUID call run.inspect --args '{}'
 ./target/debug/ontography call run.list --args '{}'
 ```
+
+CLI targets accept an exact session ID or a unique exact name. Ambiguous names require an ID. The `session …` command forms remain supported; `session list` retains its raw JSON output.
 
 Scoped calls resolve the session's graph and reject conflicting targets. Unscoped calls remain the explicit administration interface. The handshake publishes operation schemas. [examples/flow.json](examples/flow.json) is a logical graph with a configured rewrite; logical nodes can exist before worker implementations are installed.
 

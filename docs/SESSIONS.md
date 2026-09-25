@@ -23,30 +23,43 @@ Concrete worker nodes and their terminal views are subsequent work. Their intend
 
 ## Commands
 
-Commands target session UUIDs. Names are display labels.
+Commands accept an exact session ID or a unique exact name. IDs take precedence over names; ambiguous names return candidate IDs and perform no action. Closed sessions remain listed with their history.
 
 | Command | Effect |
 | --- | --- |
-| `ontography` | Attach to the last selected session; create one if none is selected. |
-| `ontography --session SESSION_UUID` | Resume/select/attach to that exact session. |
-| `ontography session new NAME` | Create independent manager state and attach; graph initialization starts pending. `create` aliases `new`. |
-| `ontography session new NAME --no-attach` | Create/select the session without launching Pi; print its record. |
-| `ontography session list` | List records and the selected session. |
-| `ontography session show SESSION_UUID` | Inspect the durable record. |
-| `ontography session attach SESSION_UUID` | Resume/select and attach to the existing or restored manager. |
-| `ontography session detach SESSION_UUID` | Disconnect the current controller while retaining Pi and graph execution. |
-| `ontography session resume SESSION_UUID` | Resume graph/session state without attaching or starting Pi. |
-| `ontography session suspend SESSION_UUID` | Stop the manager and suspend the graph, preserving saved state. |
-| `ontography session close SESSION_UUID` | Stop the manager and terminally close the session and graph; preserve history. |
-| `ontography session adopt SESSION_UUID RUN_UUID` | Bind an existing unowned run to an uninitialized session with the same project. |
+| `ontography` | Always create a new session and attach Pi; graph initialization starts pending. |
+| `ontography new NAME` | Create a named session with independent Pi state and attach. `create` aliases `new`. |
+| `ontography new NAME --no-attach` | Create the session without launching Pi; print its record. |
+| `ontography ls` | Show session ID/name, session state, terminal state, and graph state. `list` is equivalent. |
+| `ontography ls --json` | Print records enriched with terminal state and graph summaries; include recovery errors. |
+| `ontography show NAME_OR_ID` | Inspect the durable record. |
+| `ontography attach NAME_OR_ID` | Resume/select and attach to the existing or restored manager. |
+| `ontography --session NAME_OR_ID` | Explicit attachment shorthand; with `call`, scope that API operation. |
+| `ontography detach NAME_OR_ID` | Disconnect the controller while retaining Pi and graph execution. |
+| `ontography resume NAME_OR_ID` | Resume graph/session state without attaching or starting Pi. |
+| `ontography suspend NAME_OR_ID` | Stop the manager and suspend the graph, preserving saved state. |
+| `ontography close NAME_OR_ID` | Stop the manager and terminally close the session and graph; preserve history. |
+| `ontography adopt NAME_OR_ID RUN_UUID` | Bind an existing unowned run to an uninitialized session with the same project. |
 
-`--project` chooses the project only during session creation. Existing attachments use the saved project. `--data-dir` selects the server/store. `--pi` selects an executable when starting a manager; an existing manager is reused.
+The existing `ontography session …` forms remain supported. `session list` continues returning raw session records and selection as JSON. API calls themselves use durable IDs; name resolution belongs to the CLI.
 
-Closing the selected session clears selection. The next bare launch creates a session unless another has been selected. Run ownership is never chosen by cwd or list order.
+`--project` chooses the project only during session creation. Existing attachments use the saved project. `--data-dir` selects the server/store. `--pi` selects an executable when starting a manager; an existing manager is reused. Interactive creation requires a terminal before creating any session record; scripts use `new --no-attach`.
+
+Persisted selection records the most recently selected session. Closing that session clears selection. Every bare launch creates a new session regardless of selection, cwd, or list order. Each session owns its Pi state and optional graph; the background server hosts multiple sessions.
+
+### Exit behavior
+
+| Action | Pi | App session and graph |
+| --- | --- | --- |
+| Ctrl-B, then D | Keeps running; client returns to shell. | Keep running. |
+| Pi `/quit` | Exits; client returns to shell. | Keep running. Explicit attachment starts Pi with the saved active conversation. |
+| `ontography close NAME_OR_ID` | Stops, including any attached client. | Close permanently; retain saved history. |
+
+Pi `/new` starts another conversation inside the same app session and keeps its graph. Neither detach nor `/quit` makes the next bare launch reattach. Use `attach` explicitly.
 
 ### Graph display
 
-Enter `/graph` in Pi. The Rust client displays its graph, or an initialization-pending view. Arrow keys select nodes/pan; `q` or Escape returns to Pi. `ontography --ui` opens this view after acquiring the same manager attachment.
+Enter `/graph` in Pi. The Rust client displays its graph, or an initialization-pending view. Arrow keys select nodes/pan; `q` or Escape returns to Pi. `ontography attach NAME_OR_ID --ui` opens this view first for an existing session; bare `ontography --ui` creates a new session with its pending graph view.
 
 Pi keeps running while hidden; the server keeps reading its output. Returning displays its current screen. Graph display does not launch another Pi instance.
 
@@ -60,7 +73,7 @@ The history view belongs to the attachment; it does not modify Pi's cursor, inpu
 
 ### Detach and control ownership
 
-From the Pi terminal, press **Ctrl-B, then D**. Reattach with `ontography` or an exact session ID.
+From the Pi terminal, press **Ctrl-B, then D**. Reattach with `ontography attach NAME_OR_ID`.
 
 One controlling client owns a manager terminal's input and dimensions. A second controller is rejected. From another terminal, `session detach SESSION_UUID` disconnects the first controller, including an open graph view. Shared read-only viewers and takeover controls are deferred.
 

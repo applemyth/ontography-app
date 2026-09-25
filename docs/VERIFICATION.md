@@ -1,5 +1,49 @@
 # Verification
 
+## Explicit attachment and new-session CLI — 2026-09-25
+
+Bare `ontography` now always creates a session. Top-level `new`, `ls`, `attach`,
+`close`, and the other session controls accept exact IDs or unique exact names.
+`ls` separates session, terminal, and graph state; the existing nested command
+forms and raw `session.list` API remain available.
+
+Passed: **92 Rust tests**, Clippy across all targets with warnings denied,
+formatting, `git diff --check`, and the locked build. The two new
+[CLI integration tests](../tests/session_cli.rs) exercise real subprocesses,
+server sockets, and PTYs: independent bare launches, explicit attachment,
+manager reuse/replacement, graph survival after manager exit, scoped closure,
+name ambiguity, ID precedence, listing, and noninteractive creation preflight.
+The existing concurrent frontier test now accepts `run_suspended` when suspension
+wins before observation begins; it still requires status/receipt replies before
+the waiting request and prompt completion after suspension.
+
+Native Pi **0.85.1** independently passed the following checks in temporary
+storage, using the compiled application fingerprint
+`f0aecd11551541253c899177c2a38cb30874948323ceee5475a45ba8c3170218`:
+
+- Bare launch, detach, and another bare launch create two independent sessions
+  and managers; the first graph remains active.
+- Named `attach --ui` displays the original graph and reuses its Pi terminal.
+- Native `/quit` returns to the shell, restores terminal attributes, and keeps
+  the session, graph, and active conversation identity.
+- Explicit attachment creates a replacement Pi process and renders saved
+  history. The history was seeded with Pi's own session writer; no model call
+  was needed. Another `/quit` and attachment retain that history.
+- `close NAME` closes only that session and graph, leaving the other manager
+  detached and running. `ls --json` reports both states correctly.
+
+Evidence and terminal captures are retained temporarily under
+`/private/tmp/ontography-cli-native-07n_yc29/`; its isolated server was stopped.
+Pi extension code and sibling core were unchanged in this CLI update.
+
+The idle default server was gracefully replaced with this build. All four run
+summaries and the valid closed session record were preserved exactly: three
+graphs remain suspended and one remains closed. Restart discovered two older
+directories lacking `session.json` (`d5607719-44b0-42c9-a7df-7561b94bacdd` and
+`f9957648-e9fc-4717-a4a8-c5ad44001bd2`). They contain legacy runtime artifacts,
+were left untouched, and appear in session recovery errors. Upgrade evidence is
+retained at `/private/tmp/ontography-cli-update-54lfbnk7/upgrade.json`.
+
 ## Persistent sessions — 2026-09-25
 
 The persistent manager-session milestone is implemented and verified on macOS,

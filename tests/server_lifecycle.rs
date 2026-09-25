@@ -445,7 +445,11 @@ async fn status_and_receipt_bypass_a_long_wait_on_the_same_connection() {
         .unwrap();
     let response: Response = serde_json::from_slice(&frame).unwrap();
     assert_eq!(response.request_id, wait.request_id);
-    response.into_result().unwrap();
+    // Dispatch is concurrent: suspension can win before the wait acquires its
+    // live observation handle. Both outcomes must release the pending request.
+    if let Err(error) = response.into_result() {
+        assert_eq!(error.code, "run_suspended");
+    }
     drop(read);
     drop(write);
     fixture.stop().await;
