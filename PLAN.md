@@ -1,6 +1,8 @@
 # Management layer implementation plan
 
-Status: implementation plan; no application code implemented by this document. Scope: item 8 in [ARCHITECTURE.md](ARCHITECTURE.md). Items 1–7 supply the later concrete agent nodes, package semantics, edges, harnesses, and node MCP.
+Status: implemented and verified on 2026-09-24. Scope: item 8 in [ARCHITECTURE.md](ARCHITECTURE.md). Items 1–7 supply the later concrete agent nodes, package semantics, edges, harnesses, and node MCP. This document preserves the implementation sequence and gates; [verification results](docs/VERIFICATION.md) and [core bindings](docs/CORE_BINDINGS.md) record the delivered behavior and public-core limits.
+
+Implementation decisions: native Pi is the default management client; `ontography --ui` opens the unified Rust interface. Graph drawing uses a native Ratatui widget after evaluating `tuiflow`; see the [renderer decision](src/ui/README.md#renderer-decision). No sibling core changes were required.
 
 ## 1. Outcome and ownership
 

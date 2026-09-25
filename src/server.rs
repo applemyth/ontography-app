@@ -1,0 +1,483 @@
+//! Local transport and operation ownership. A socket never owns a core operation.
+use crate::{
+    AppError, Result, catalog, declarations,
+    persistence::Paths,
+    protocol::{self, Request, Response},
+    state::Service,
+    tools, views,
+};
+use futures_util::FutureExt;
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    fs::{File, OpenOptions},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    panic::AssertUnwindSafe,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    io::BufReader,
+    net::{UnixListener, UnixStream},
+    sync::{Mutex, Notify, RwLock, watch},
+    task::JoinSet,
+};
+
+type Completion = Option<Arc<Result<Value>>>;
+struct Receipt {
+    operation: String,
+    args: Value,
+    result: watch::Receiver<Completion>,
+}
+
+pub struct Server {
+    pub service: Service,
+    requests: Mutex<BTreeMap<(String, String), Receipt>>,
+    admission: RwLock<()>,
+    stopping: AtomicBool,
+    stopped: Notify,
+}
+
+impl Server {
+    pub fn new(paths: Paths) -> Result<Arc<Self>> {
+        Self::with_registry(
+            paths,
+            Arc::new(crate::registry::ImplementationRegistry::default()),
+        )
+    }
+
+    pub fn with_registry(
+        paths: Paths,
+        registry: Arc<crate::registry::ImplementationRegistry>,
+    ) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            service: Service::with_registry(paths, registry)?,
+            requests: Mutex::new(BTreeMap::new()),
+            admission: RwLock::new(()),
+            stopping: AtomicBool::new(false),
+            stopped: Notify::new(),
+        }))
+    }
+
+    pub async fn request(self: &Arc<Self>, request: Request) -> Result<Value> {
+        request.validate()?;
+        if request.operation != "system.hello"
+            && request.expected_server_id.as_deref() != Some(&self.service.server_id)
+        {
+            return Err(AppError::new(
+                "server_restarted",
+                "handshake again and refresh state before sending operations",
+            ));
+        }
+        if request.operation == "operation.get" {
+            let key = (
+                views::field(&request.args, "client_id")?.to_owned(),
+                views::field(&request.args, "request_id")?.to_owned(),
+            );
+            let requests = self.requests.lock().await;
+            let receipt = requests.get(&key).ok_or_else(|| {
+                AppError::new(
+                    "unknown_outcome",
+                    "receipt is absent or expired; reconcile against current run state",
+                )
+            })?;
+            return Ok(match receipt.result.borrow().as_ref() {
+                None => json!({"state":"running","operation":receipt.operation}),
+                Some(result) => match result.as_ref() {
+                    Ok(value) => {
+                        json!({"state":"completed","operation":receipt.operation,"result":value})
+                    }
+                    Err(error) => {
+                        json!({"state":"failed","operation":receipt.operation,"error":error})
+                    }
+                },
+            });
+        }
+        if request.operation == "server.stop" {
+            return self.stop().await;
+        }
+        let operation = catalog::operations()
+            .iter()
+            .find(|o| o.name == request.operation)
+            .ok_or_else(|| AppError::new("unknown_operation", &request.operation))?;
+        validate_arguments(&operation.parameters, &request.args, "args")?;
+        if !operation.mutating {
+            let result = AssertUnwindSafe(tools::dispatch(
+                &self.service,
+                &request.operation,
+                &request.args,
+            ))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(AppError::new(
+                    "runtime_fault",
+                    "inspection panicked; inspect server and run state before retrying",
+                ))
+            });
+            return bounded(result);
+        }
+        let key = (request.client_id, request.request_id);
+        let mut requests = self.requests.lock().await;
+        let mut result = if let Some(receipt) = requests.get(&key) {
+            if receipt.operation != request.operation || receipt.args != request.args {
+                return Err(AppError::new(
+                    "request_id_conflict",
+                    "request identity was already used with different arguments",
+                ));
+            }
+            receipt.result.clone()
+        } else {
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(AppError::new(
+                    "server_stopping",
+                    "server is settling accepted work",
+                ));
+            }
+            if requests.len() >= 128 {
+                let completed = requests
+                    .iter()
+                    .find(|(_, r)| r.result.borrow().is_some())
+                    .map(|(key, _)| key.clone());
+                if let Some(key) = completed {
+                    requests.remove(&key);
+                } else {
+                    return Err(AppError::new(
+                        "busy",
+                        "too many accepted operations; wait for one to finish",
+                    ));
+                }
+            }
+            let (sender, receiver) = watch::channel(None);
+            requests.insert(
+                key,
+                Receipt {
+                    operation: request.operation.clone(),
+                    args: request.args.clone(),
+                    result: receiver.clone(),
+                },
+            );
+            let server = self.clone();
+            tokio::spawn(async move {
+                let result = AssertUnwindSafe(async {
+                    let _guard = server.admission.read().await;
+                    if server.stopping.load(Ordering::Acquire) {
+                        return Err(AppError::new(
+                            "server_stopping",
+                            "operation did not begin before shutdown",
+                        ));
+                    }
+                    tools::dispatch(&server.service, &request.operation, &request.args).await
+                })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AppError::new(
+                        "runtime_fault",
+                        "operation panicked; inspect run state before further mutations",
+                    ))
+                });
+                sender.send_replace(Some(Arc::new(bounded(result))));
+            });
+            receiver
+        };
+        drop(requests);
+        loop {
+            if let Some(value) = result.borrow().as_ref() {
+                return value.as_ref().clone();
+            }
+            result.changed().await.map_err(|_| {
+                AppError::new("unknown_outcome", "operation owner ended without a receipt")
+            })?;
+        }
+    }
+
+    pub async fn stop(&self) -> Result<Value> {
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return Err(AppError::new(
+                "server_stopping",
+                "shutdown is already in progress",
+            ));
+        }
+        let _guard = self.admission.write().await;
+        if let Err(error) = self.service.shutdown().await {
+            self.stopping.store(false, Ordering::Release);
+            return Err(error);
+        }
+        self.stopped.notify_one();
+        Ok(json!({"stopped":true,"runs_preserved":true}))
+    }
+}
+
+fn bounded(result: Result<Value>) -> Result<Value> {
+    let result = result.map(|mut value| {
+        crate::tools::content::normalize_content_ids_output(&mut value);
+        value
+    });
+    match result {
+        Ok(value) if serde_json::to_vec(&value)?.len() > protocol::MAX_FRAME_BYTES / 2 => {
+            Err(AppError::new(
+                "result_too_large",
+                "operation finished, but its result exceeds the response budget; use bounded inspection or export",
+            ))
+        }
+        other => other,
+    }
+}
+
+/// The same schema supplied to Pi also validates incoming arguments in Rust.
+fn validate_arguments(schema: &Value, value: &Value, path: &str) -> Result<()> {
+    if schema == &Value::Bool(false) {
+        return Err(AppError::invalid(format!("{path} is not permitted")));
+    }
+    if let Some(clauses) = schema.get("allOf").and_then(Value::as_array) {
+        for clause in clauses {
+            validate_arguments(clause, value, path)?;
+        }
+    }
+    if let Some(expected) = schema.get("const")
+        && expected != value
+    {
+        return Err(AppError::invalid(format!("{path} must equal {expected}")));
+    }
+    if let Some(excluded) = schema.get("not")
+        && validate_arguments(excluded, value, path).is_ok()
+    {
+        return Err(AppError::invalid(format!(
+            "{path} matches a forbidden form"
+        )));
+    }
+    if let Some(choices) = schema.get("oneOf").and_then(Value::as_array)
+        && choices
+            .iter()
+            .filter(|s| validate_arguments(s, value, path).is_ok())
+            .count()
+            != 1
+    {
+        return Err(AppError::invalid(format!(
+            "{path} must match exactly one permitted form"
+        )));
+    }
+    if let Some(choices) = schema.get("anyOf").and_then(Value::as_array)
+        && !choices
+            .iter()
+            .any(|s| validate_arguments(s, value, path).is_ok())
+    {
+        return Err(AppError::invalid(format!(
+            "{path} does not match any permitted form"
+        )));
+    }
+    if let Some(choices) = schema.get("enum").and_then(Value::as_array)
+        && !choices.contains(value)
+    {
+        return Err(AppError::invalid(format!(
+            "{path} has an unsupported value"
+        )));
+    }
+    if let Some(kind) = schema.get("type") {
+        let matches = |kind: &str| match kind {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "number" => value.is_number(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        let valid = kind.as_str().map(matches).unwrap_or_else(|| {
+            kind.as_array()
+                .is_some_and(|kinds| kinds.iter().filter_map(Value::as_str).any(matches))
+        });
+        if !valid {
+            return Err(AppError::invalid(format!("{path} must be {kind}")));
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(AppError::invalid(format!("{path}.{field} is required")));
+                }
+            }
+        }
+        for (key, value) in object {
+            if let Some(property) = schema.get("properties").and_then(|p| p.get(key)) {
+                validate_arguments(property, value, &format!("{path}.{key}"))?;
+            } else if let Some(additional) = schema.get("additionalProperties") {
+                validate_arguments(additional, value, &format!("{path}.{key}"))?;
+            }
+        }
+    }
+    if let (Some(pattern), Some(text)) = (
+        schema.get("pattern").and_then(Value::as_str),
+        value.as_str(),
+    ) {
+        let pattern = regex::Regex::new(pattern)
+            .map_err(|e| AppError::new("invalid_tool_schema", e.to_string()))?;
+        if !pattern.is_match(text) {
+            return Err(AppError::invalid(format!(
+                "{path} does not match its required pattern"
+            )));
+        }
+    }
+    if let (Some(items), Some(values)) = (schema.get("items"), value.as_array()) {
+        for (index, value) in values.iter().enumerate() {
+            validate_arguments(items, value, &format!("{path}[{index}]"))?;
+        }
+    }
+    for (size, min, max) in [
+        (value.as_array().map(Vec::len), "minItems", "maxItems"),
+        (
+            value.as_str().map(|s| s.chars().count()),
+            "minLength",
+            "maxLength",
+        ),
+    ] {
+        if let Some(size) = size
+            && (schema
+                .get(min)
+                .and_then(Value::as_u64)
+                .is_some_and(|n| (size as u64) < n)
+                || schema
+                    .get(max)
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| (size as u64) > n))
+        {
+            return Err(AppError::invalid(format!(
+                "{path} length is outside its bounds"
+            )));
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        for (field, lower) in [("minimum", true), ("maximum", false)] {
+            if let Some(bound) = schema.get(field).and_then(Value::as_f64)
+                && ((lower && number < bound) || (!lower && number > bound))
+            {
+                return Err(AppError::invalid(format!("{path} exceeds its {field}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct Ownership {
+    _lock: File,
+    socket: PathBuf,
+}
+impl Drop for Ownership {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+pub async fn serve(paths: Paths) -> Result<()> {
+    serve_with_registry(
+        paths,
+        Arc::new(crate::registry::ImplementationRegistry::default()),
+    )
+    .await
+}
+
+pub async fn serve_with_registry(
+    paths: Paths,
+    registry: Arc<crate::registry::ImplementationRegistry>,
+) -> Result<()> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(paths.root.join("server.lock"))?;
+    lock.try_lock().map_err(|e| {
+        AppError::new(
+            "server_owned",
+            format!("another server owns this data directory: {e}"),
+        )
+    })?;
+    if paths.socket.exists() {
+        std::fs::remove_file(&paths.socket)?;
+    }
+    let listener = UnixListener::bind(&paths.socket)?;
+    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
+    let _ownership = Ownership {
+        _lock: lock,
+        socket: paths.socket.clone(),
+    };
+    let server = Server::with_registry(paths, registry)?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut clients = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept(), if clients.len() < 256 => {
+                let (socket,_) = accepted?;
+                let server = server.clone();
+                clients.spawn(async move { let _ = connection(server,socket).await; });
+            }
+            _ = server.stopped.notified() => break,
+            _ = terminate.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
+            _ = interrupt.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
+            _ = clients.join_next(), if !clients.is_empty() => {},
+        }
+    }
+    drop(listener);
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while clients.join_next().await.is_some() {}
+    })
+    .await;
+    clients.abort_all();
+    Ok(())
+}
+
+async fn connection(server: Arc<Server>, socket: UnixStream) -> Result<()> {
+    let (reader, writer) = socket.into_split();
+    let writer = Arc::new(Mutex::new(writer));
+    let mut reader = BufReader::new(reader);
+    let mut requests = JoinSet::new();
+    let slots = Arc::new(tokio::sync::Semaphore::new(32));
+    let result = loop {
+        while requests.try_join_next().is_some() {}
+        let permit = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("connection semaphore stays open");
+        // Never cancel read_frame midway: it owns the partial frame buffer.
+        let frame = match protocol::read_frame(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        };
+        let parsed = std::str::from_utf8(&frame)
+            .map_err(|e| AppError::invalid(e.to_string()))
+            .and_then(|s| {
+                declarations::parse_json::<Request>(s).map_err(|e| AppError::invalid(e.to_string()))
+            });
+        let server = server.clone();
+        let writer = writer.clone();
+        requests.spawn(async move {
+            let _permit = permit;
+            let response = match parsed {
+                Ok(request) => {
+                    let id = request.request_id.clone();
+                    Response::new(
+                        &server.service.server_id,
+                        &id,
+                        server.request(request).await,
+                    )
+                }
+                Err(error) => Response::new(&server.service.server_id, "", Err(error)),
+            };
+            let _ = protocol::write_frame(&mut *writer.lock().await, &response).await;
+        });
+    };
+    // A complete received request reaches admission even if its client closes immediately.
+    while requests.join_next().await.is_some() {}
+    result
+}

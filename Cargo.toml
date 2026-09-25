@@ -1,0 +1,51 @@
+[package]
+name = "ontography-app"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+description = "Persistent graph management and a Rust terminal client for Ontography"
+
+[lib]
+name = "ontography_app"
+
+[[bin]]
+name = "ontography"
+path = "src/main.rs"
+
+[dependencies]
+ontography = { package = "ontography-core", path = "../ontography-core" }
+clap = { version = "4.6", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = "0.3"
+iroh = { version = "1.2.0", default-features = false, features = ["tls-ring"] }
+nix = { version = "0.29", features = ["process", "user"] }
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+regex = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+schemars = "1.2.2"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

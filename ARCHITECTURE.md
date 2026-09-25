@@ -30,7 +30,7 @@ The app builds on `../ontography-core`. These are the eight agreed pieces to imp
 
    Implemented by the node's harness. Exposes the node's identity, outgoing connections, accepted package definitions, received inputs, and permitted context. Provides operations to read packages, construct messages or artifact packages, and request publication through an edge.
 
-- [ ] **8. Graph TUI and native management harness**
+- [x] **8. Graph TUI and native management harness**
 
    This part consists of three pieces:
 
@@ -38,11 +38,11 @@ The app builds on `../ontography-core`. These are the eight agreed pieces to imp
    | --- | --- |
    | CLI + Pi harness | The `ontography` command connects to or starts the local server, then launches the management conversation with Ontography instructions and tools. |
    | Ontography tools | Expose core's supported graph and runtime capabilities. A detached Rust server retains core objects across client connections. The connection, handle ownership, tool arguments, results, and errors are implementation responsibilities within this integration. |
-   | Graph TUI — later | Rust UI using Ratatui; visualize core state and issue actions through the existing server bindings. Pi remains the management harness. |
+   | Graph TUI | Rust UI using Ratatui; visualize core state and issue actions through the existing server bindings. Pi remains the management harness. |
 
-   Immediate scope: CLI/Pi integration and tools exposing the existing core. Our concrete Codex node, message/union package, and corresponding edge definitions are still future work in items 1–7. Their registration and management hooks follow those implementations. Graph visualization can follow the working agent and core tools.
+   Implemented scope: CLI/Pi integration, tools exposing the existing core, and Rust graph visualization. Our concrete Codex node, message/union package, and corresponding edge definitions are still future work in items 1–7. Their registration and management hooks follow those implementations.
 
-   The graph UI is implemented in Rust. Initial management can use Pi's existing interactive client. For a later unified Rust graph/conversation screen, the proposed integration drives Pi through its RPC mode and renders the conversation in Ratatui. The Pi extension supplies tool bindings; graph rendering belongs to the Rust client. The graph widget dependency requires a focused suitability check before selection.
+   The graph UI is implemented in Rust. Default management uses Pi's existing interactive client. `ontography --ui` drives Pi through its RPC mode and renders the graph and conversation in Ratatui. The Pi extension supplies tool bindings; graph rendering belongs to the Rust client. A native Ratatui widget supports core cycles, self loops, and parallel edges; the [renderer decision](src/ui/README.md#renderer-decision) records the dependency evaluation.
 
    Core already establishes the graph/runtime API. The management tools bind that API to Pi, supplying serialization and retained-handle access. Graph authoring is one capability group within that interface. The core capability groups are:
 
@@ -64,4 +64,4 @@ Current design focus: the Pi management agent and its Ontography tools. Core alr
 
 Confirmed lifecycle: graph/node execution continues when Pi exits; a later `ontography` invocation reconnects. Pi's active management turn has client lifetime. Explicit run suspension preserves resumability; run closure is terminal. Explicit server stop gracefully suspends its resources and preserves durable runs. Server-crash recovery reconstructs committed state and requires explicit resumption initially.
 
-The detailed sequence, API coverage, integration boundaries, and verification gates are in [PLAN.md](PLAN.md).
+The detailed sequence, API coverage, integration boundaries, and verification gates are in [PLAN.md](PLAN.md). Item 8 passed its implementation gates; [verification results](docs/VERIFICATION.md) record automated coverage, live Pi/terminal checks, and the limits of these results.

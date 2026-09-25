@@ -1,0 +1,7 @@
+{
+  "production_id": "remove_receiver",
+  "nodes": {"A": "A", "B": "B"},
+  "edges": {"A_to_B": "A_to_B"},
+  "fresh_nodes": {},
+  "fresh_edges": {}
+}
