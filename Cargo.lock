@@ -2769,7 +2769,6 @@ dependencies = [
  "bao-tree",
  "bytes",
  "futures-lite",
- "iroh",
  "iroh-blobs",
  "reflink-copy",
  "rusqlite",
