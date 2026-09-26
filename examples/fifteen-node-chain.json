@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "id": "fifteen-node-chain",
+  "schema": {
+    "node_types": ["Stage"],
+    "object_types": ["Text"],
+    "authority_tags": ["work"]
+  },
+  "contracts": [
+    {"id": "text", "object_type": "Text", "validator": "utf8", "validator_version": 1}
+  ],
+  "nodes": [
+    {"id": "N01", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N02", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N03", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N04", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N05", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N06", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N07", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N08", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N09", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N10", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N11", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N12", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N13", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N14", "types": ["Stage"], "result_contract": "text"},
+    {"id": "N15", "types": ["Stage"], "result_contract": "text"}
+  ],
+  "edges": [
+    {"id": "E01_02", "source": "N01", "target": "N02", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E02_03", "source": "N02", "target": "N03", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E03_04", "source": "N03", "target": "N04", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E04_05", "source": "N04", "target": "N05", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E05_06", "source": "N05", "target": "N06", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E06_07", "source": "N06", "target": "N07", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E07_08", "source": "N07", "target": "N08", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E08_09", "source": "N08", "target": "N09", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E09_10", "source": "N09", "target": "N10", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E10_11", "source": "N10", "target": "N11", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E11_12", "source": "N11", "target": "N12", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E12_13", "source": "N12", "target": "N13", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E13_14", "source": "N13", "target": "N14", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]},
+    {"id": "E14_15", "source": "N14", "target": "N15", "types": ["Flow"], "package_contract": "text", "authority_tags": ["work"]}
+  ],
+  "roots": [{"node_id": "N01", "ceiling": ["work"]}]
+}
