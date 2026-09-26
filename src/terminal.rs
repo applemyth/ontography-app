@@ -553,6 +553,26 @@ impl Terminal {
         &self.id
     }
 
+    pub fn foreground_process_group(&self) -> Option<i32> {
+        self.master
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .process_group_leader()
+    }
+
+    pub fn tty_name(&self) -> Option<PathBuf> {
+        self.master
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .tty_name()
+    }
+
+    /// Recover the virtual terminal when an abruptly killed foreground owner
+    /// could not disable its private modes before returning to the shell.
+    pub fn reset_program_modes(&self) {
+        self.shared.update(|state| state.parser.process(b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<99u\x1b[0m\x1b[2J\x1b[H"));
+    }
+
     pub fn status(&self) -> TerminalStatus {
         let state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
         let (rows, cols) = state.parser.screen().size();

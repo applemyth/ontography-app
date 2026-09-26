@@ -34,10 +34,12 @@ fn identity(base: &Path, names: &[&str]) -> String {
 }
 
 fn main() {
-    let core = identity(
-        Path::new("../ontography-core"),
-        &["Cargo.toml", "src", "vendor"],
-    );
+    let core_root = Path::new("../ontography-core");
+    let mut core_sources = vec!["Cargo.toml", "src", "vendor"];
+    if core_root.join("crates").is_dir() {
+        core_sources.push("crates");
+    }
+    let core = identity(core_root, &core_sources);
     let app = identity(
         Path::new("."),
         &[

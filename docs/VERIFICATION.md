@@ -1,5 +1,57 @@
 # Verification
 
+## Persistent shell and session panel — 2026-09-26
+
+Passed: **110 app Rust tests and 31 Pi tests**, TypeScript checking, all-target
+Clippy with warnings denied, formatting, `git diff --check`, and the locked
+offline build against committed core.
+
+The sibling core working tree contains an unfinished API refactor that already
+prevented the app from compiling before this change (56 baseline errors). This
+session update leaves that work untouched. Verification uses an isolated copy of
+the last committed core, `9336977`, with the corresponding app lockfile from
+`e2d709a`. App source is shared with the real checkout; the verification workspace
+is `/private/tmp/ontography-shell-r49ti58g/ontographyapp-v2`. The ordinary checkout
+still needs adaptation to the new core APIs before it can build against that
+uncommitted core. No dependency pin or core source change was introduced here.
+
+- [Manager lifecycle tests](../tests/manager_lifecycle.rs) verify exclusive shell
+  ownership, actual Pi process startup, Ctrl-C, abrupt launcher loss, Pi cleanup,
+  terminal recovery, and reentry in the same shell.
+- [CLI tests](../tests/session_cli.rs) verify `/quit`, saved/latest conversation
+  selection, persistent shell variables across detach/attach, failed Pi launch
+  recovery, resize, foreground interruption, detached shell exit, background-job
+  cleanup, session isolation, server restart, and permanent closure.
+- [Panel tests](../src/terminal_panel.rs) verify explicit process modes, launch
+  errors, unavailable observations, bounded outstanding reads, exact package
+  counts, responsive geometry, and clipped Unicode/style rendering.
+- Review corrected failure isolation during exited-shell reconciliation and
+  fenced replacement against an old shell's exit. A cursor-query race during
+  split-view redraw was also removed.
+
+Native **Pi 0.85.1** passed the complete flow in isolated storage: initial launch;
+`/quit` to an empty-graph shell panel; graph status updates; wide/narrow layouts;
+Ctrl-B G graph display; detach/attach with a retained shell variable; `pi` restoring
+history written by Pi's native session writer; `/new` followed by `pi` selecting
+the latest conversation; shell `exit` suspending the graph; and explicit attachment
+resuming the same conversation and graph. Terminal attributes were restored on
+detach and exit. No model call was needed. Evidence is retained temporarily at
+`/private/tmp/ontography-cli-native-14_10lze/evidence.json`; its server was stopped.
+
+The idle default server was replaced with this build at `~/.ontography`. Both
+saved session records, their selections, and Pi references were preserved;
+there are no active terminals or graph runs. Restart rediscovered the two legacy
+directories `d5607719-44b0-42c9-a7df-7561b94bacdd` and
+`f9957648-e9fc-4717-a4a8-c5ad44001bd2`, each containing only runtime artifacts and
+no `session.json`. They remain untouched and appear as session recovery errors.
+The initial activation check rejected those errors; subsequent inspection
+confirmed the valid sessions were unchanged and the replacement server healthy.
+Final evidence: `/private/tmp/ontography-shell-r49ti58g/activation-final.json`.
+Application fingerprint:
+`276b164a74256cc94fc2ca7c9a4f3b0a5404845e056bf30124b8f4731b1c867e`;
+core fingerprint:
+`0b5f4f316927115ac62d75b85bafa76438130d060a4a39c84db2e2307ba659e3`.
+
 ## Core extension and retirement integration — 2026-09-25
 
 Passed: **104 app Rust tests, 51 core Rust tests, and 31 Pi tests**, TypeScript

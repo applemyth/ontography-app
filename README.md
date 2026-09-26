@@ -1,6 +1,6 @@
 # Ontography
 
-A Rust application for persistent agent sessions and graphs, built on [`ontography-core`](../ontography-core). Native Pi manages each session; the Rust server owns its terminal and graph runtime.
+A Rust application for persistent agent sessions and graphs, built on [`ontography-core`](../ontography-core). Native Pi manages each session; the Rust server owns its persistent shell terminal and graph runtime.
 
 ```sh
 cargo build --locked
@@ -12,7 +12,7 @@ cargo build --locked
 ./target/debug/ontography close work    # stop its manager and close its graph
 ```
 
-Inside Pi, `/graph` opens the graph; `q` or Escape returns to the same Pi process. **Ctrl-B, then D detaches while Pi and the graph continue running.** Pi `/quit` exits Pi and returns to your shell while the session and graph remain active; explicit attachment restarts Pi from its saved conversation. Pi `/new` starts another conversation within the same Ontography session and retains its graph.
+Inside Pi, `/graph` opens the graph; `q` or Escape returns to the same Pi process. **Ctrl-B, then D detaches while Pi and the graph continue running.** Pi `/quit` returns to the managed shell with a session status panel. Type `pi` there to resume the latest active conversation. Shell `exit` suspends the session and graph; `attach` resumes it. Detach and reattach preserve an existing shell prompt without restarting Pi. Pi `/new` starts another conversation within the same Ontography session and retains its graph.
 
 Keep the sibling core checkout available when building. Install Pi **0.85.1** separately; the binary embeds its Ontography extension. See [installation](docs/INSTALL.md) and the [session guide](docs/SESSIONS.md). Existing stores under `~/.local/share/ontography/` require explicit migration before the new default `~/.ontography/` is used.
 
@@ -22,13 +22,13 @@ Keep the sibling core checkout available when building. Install Pi **0.85.1** se
 Rust server
 └── Ontography session
     ├── Pi manager state: conversations, active selection, tool preferences
-    ├── Native Pi process and server-owned PTY
+    ├── Server-owned shell and PTY → native Pi when launched
     └── Optional graph run and core runtime
 ```
 
 | Component | Responsibility |
 | --- | --- |
-| Rust CLI/client | Select a session; attach input/output; display Pi or its graph. |
+| Rust CLI/client | Select a session; attach input/output; display Pi, shell + session panel, or graph. |
 | Pi | Native conversations, model execution, and management tools. |
 | Rust server | Own sessions, manager processes, terminal screen state, graph runtimes, and accepted operations. |
 | Core | Enforce graph admission, contracts, authority, workflow commits, rewrites, packages, and durable graph history. |

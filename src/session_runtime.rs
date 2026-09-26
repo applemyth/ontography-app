@@ -1,12 +1,6 @@
 //! Live manager ownership, separate from durable session records and core runs.
 use crate::{
-    AppError, Result,
-    catalog::Operation,
-    launcher::{self, PiSessionLaunch},
-    sessions::SessionStatus,
-    state::Service,
-    terminal::{LaunchSpec, Terminal},
-    tools,
+    AppError, Result, catalog::Operation, managed_shell::ManagedShell, state::Service, tools,
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -15,7 +9,15 @@ use tokio::sync::Mutex;
 #[derive(Default)]
 pub struct Managers {
     /// Serializes launch/stop so one session cannot acquire two manager processes.
-    live: Mutex<BTreeMap<String, Arc<Terminal>>>,
+    live: Mutex<BTreeMap<String, Arc<ManagedShell>>>,
+}
+
+impl Drop for Managers {
+    fn drop(&mut self) {
+        for shell in self.live.get_mut().values() {
+            shell.request_stop();
+        }
+    }
 }
 
 pub fn operations() -> Vec<Operation> {
@@ -23,7 +25,7 @@ pub fn operations() -> Vec<Operation> {
     vec![
         Operation::new(
             "terminal.ensure",
-            "Start or reuse the session's native Pi terminal. Attachment is separate.",
+            "Start or reuse the session shell. New shells launch Pi; existing shells retain their current foreground program. Attachment is separate.",
             json!({"session_id":session,"pi":{"type":"string"},"rows":{"type":"integer","minimum":2,"maximum":200},"cols":{"type":"integer","minimum":10,"maximum":500}}),
             &["session_id"],
             true,
@@ -67,94 +69,38 @@ fn session_id<'a>(scope: Option<&'a str>, args: &'a Value) -> Result<&'a str> {
 impl Managers {
     pub async fn dispatch(
         &self,
-        service: &Service,
+        service: &Arc<Service>,
         scope: Option<&str>,
         operation: &str,
         args: &Value,
     ) -> Result<Value> {
+        if operation == "session.resume" {
+            let id = session_id(scope, args)?;
+            let mut managers = self.live.lock().await;
+            Self::reconcile_one(&mut managers, service, id).await?;
+            return tools::dispatch_scoped(service, scope, operation, args).await;
+        }
         match operation {
             "terminal.ensure" => {
                 let id = session_id(scope, args)?;
                 let mut managers = self.live.lock().await;
-                if let Some(terminal) = managers.get(id)
-                    && terminal.status().running
-                {
-                    return Ok(serde_json::to_value(terminal.status())?);
+                Self::reconcile_one(&mut managers, service, id).await?;
+                if let Some(terminal) = managers.get(id) {
+                    // It may exit immediately after reconciliation, just as an
+                    // attached terminal may exit at any moment. Retain ownership
+                    // so the watcher settles that generation before replacement.
+                    return terminal.status();
                 }
-                if let Some(old) = managers.get(id) {
-                    old.shutdown().await?;
-                }
-                managers.remove(id);
-                let handle = service.sessions.get(id).await?;
-                let record = handle.lock().await.clone();
-                if record.status != SessionStatus::Active {
-                    return Err(AppError::new(
-                        "session_inactive",
-                        "resume the Ontography session before starting its manager",
-                    ));
-                }
-                let active = record
-                    .pi
-                    .conversations
-                    .get(&record.pi.active_conversation_id)
-                    .ok_or_else(|| {
-                        AppError::new("invalid_session", "active Pi conversation is missing")
-                    })?;
-                let path = match &active.path {
-                    Some(path) if path.is_file() => Some(path.clone()),
-                    _ if active.materialized => {
-                        return Err(AppError::new(
-                            "conversation_missing",
-                            "saved Pi history is missing; restore it before resuming",
-                        ));
-                    }
-                    _ => None,
-                };
                 let pi = PathBuf::from(args.get("pi").and_then(Value::as_str).unwrap_or("pi"));
-                let command = launcher::pi_session_command(
-                    &service.paths,
-                    &record.project,
-                    &pi,
-                    &PiSessionLaunch {
-                        session_id: id.into(),
-                        conversations_dir: service.sessions.conversations_dir(id)?,
-                        conversation_id: active.conversation_id.clone(),
-                        conversation_path: path,
-                    },
+                let terminal = ManagedShell::launch(
+                    service.clone(),
+                    id,
+                    pi,
+                    args.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16,
+                    args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16,
                 )
                 .await?;
-                let command = command.as_std();
-                let spec = LaunchSpec {
-                    program: command.get_program().into(),
-                    args: command
-                        .get_args()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .collect(),
-                    env: command
-                        .get_envs()
-                        .filter_map(|(key, value)| {
-                            value.map(|value| {
-                                (
-                                    key.to_string_lossy().into_owned(),
-                                    value.to_string_lossy().into_owned(),
-                                )
-                            })
-                        })
-                        .collect(),
-                    cwd: record.project,
-                    rows: args.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16,
-                    cols: args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16,
-                    server_id: service.server_id.clone(),
-                    session_id: id.into(),
-                };
-                let socket = service
-                    .paths
-                    .socket
-                    .parent()
-                    .expect("server socket has a parent")
-                    .join(format!("pty-{id}.sock"));
-                let terminal = Terminal::launch(spec, socket).await?;
-                let status = serde_json::to_value(terminal.status())?;
+                let status = terminal.status()?;
                 managers.insert(id.into(), terminal);
                 Ok(status)
             }
@@ -164,7 +110,9 @@ impl Managers {
                 let managers = self.live.lock().await;
                 let Some(terminal) = managers.get(id) else {
                     if operation == "terminal.status" {
-                        return Ok(json!({"running":false,"session_id":id}));
+                        return Ok(
+                            json!({"running":false,"session_id":id,"manager_mode":"shell","manager_pid":null}),
+                        );
                     }
                     return Err(AppError::new(
                         "manager_not_running",
@@ -172,12 +120,12 @@ impl Managers {
                     ));
                 };
                 if operation == "terminal.graph" {
-                    terminal.request_graph_view()?;
+                    terminal.terminal.request_graph_view()?;
                 }
                 if operation == "terminal.detach" {
-                    terminal.request_detach()?;
+                    terminal.terminal.request_detach()?;
                 }
-                Ok(serde_json::to_value(terminal.status())?)
+                Ok(terminal.status()?)
             }
             "session.suspend" | "session.close" => {
                 let id = session_id(scope, args)?;
@@ -190,6 +138,41 @@ impl Managers {
             }
             _ => tools::dispatch_scoped(service, scope, operation, args).await,
         }
+    }
+
+    /// Called by the server independently of clients. Holding the manager lock
+    /// fences replacement terminals until the old shell's graph is suspended.
+    pub async fn reconcile(&self, service: &Service) -> Result<()> {
+        let mut managers = self.live.lock().await;
+        let exited = managers
+            .iter()
+            .filter(|(_, shell)| !shell.terminal.status().running)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut first = None;
+        for id in exited {
+            if let Err(error) = Self::reconcile_one(&mut managers, service, &id).await {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    async fn reconcile_one(
+        managers: &mut BTreeMap<String, Arc<ManagedShell>>,
+        service: &Service,
+        id: &str,
+    ) -> Result<()> {
+        let Some(shell) = managers.get(id) else {
+            return Ok(());
+        };
+        if shell.terminal.status().running {
+            return Ok(());
+        }
+        shell.shutdown().await?;
+        tools::dispatch_scoped(service, Some(id), "session.suspend", &json!({})).await?;
+        managers.remove(id);
+        Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<()> {

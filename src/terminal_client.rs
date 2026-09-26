@@ -1,8 +1,13 @@
 //! A view onto an existing server-owned native terminal.
 use crate::{
-    AppError, Result, protocol,
+    AppError, Result,
+    client::Client,
+    protocol,
     terminal::{AttachRequest, ClientFrame, HistoryAction, ServerFrame, Snapshot},
 };
+
+#[path = "terminal_panel.rs"]
+mod panel;
 use crossterm::{
     event::{
         self, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -86,6 +91,7 @@ struct InputState {
 enum InputAction {
     Ignore,
     Detach,
+    Graph,
     History(HistoryAction),
     Input(Vec<u8>),
 }
@@ -101,6 +107,7 @@ impl InputState {
                 self.prefix = false;
                 match key.code {
                     KeyCode::Char('d' | 'D') => return InputAction::Detach,
+                    KeyCode::Char('g' | 'G') => return InputAction::Graph,
                     KeyCode::Char('[') => {
                         self.history = true;
                         return InputAction::History(HistoryAction::Enter);
@@ -166,6 +173,41 @@ pub async fn run_with_initial_graph<F, Fut>(
     socket: &Path,
     request: AttachRequest,
     initial_graph: bool,
+    graph: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    run_inner(socket, request, initial_graph, None, graph).await
+}
+
+/// Display native Pi at full size, and the persistent shell beside live session
+/// status after Pi exits. The backend's explicit mode determines the layout.
+pub async fn run_with_session_panel<F, Fut>(
+    socket: &Path,
+    request: AttachRequest,
+    initial_graph: bool,
+    client: Client,
+    graph: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let monitor = panel::Monitor::spawn(
+        client,
+        request.session_id.clone(),
+        request.terminal_id.clone(),
+    );
+    run_inner(socket, request, initial_graph, Some(monitor), graph).await
+}
+
+async fn run_inner<F, Fut>(
+    socket: &Path,
+    request: AttachRequest,
+    initial_graph: bool,
+    mut monitor: Option<panel::Monitor>,
     mut graph: F,
 ) -> Result<()>
 where
@@ -206,6 +248,7 @@ where
     let mut read = BufReader::new(read);
     let (screen_tx, mut screen_rx) = watch::channel::<Option<Snapshot>>(None);
     let (notice_tx, mut notice_rx) = mpsc::channel(8);
+    let local_notices = notice_tx.clone();
     if initial_graph {
         notice_tx
             .try_send(Notice::Graph)
@@ -276,12 +319,34 @@ where
         let mut guard = TerminalGuard::enter()?;
         let mut events = Some(EventStream::new());
         let mut input = InputState::default();
+        let mut presentation = monitor.as_ref().map(|monitor| panel::Presentation::new(monitor.updates.borrow().clone(), request.cols, request.rows));
+        let initial_dimensions = presentation.as_ref().map_or((request.rows, request.cols), panel::Presentation::dimensions);
+        if initial_dimensions != (request.rows, request.cols) {
+            send_resize(&mut write, &request.terminal_id, initial_dimensions).await?;
+        }
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
         loop {
             tokio::select! {
                 _ = terminate.recv() => break,
                 _ = hangup.recv() => break,
+                changed = panel_changed(&mut monitor) => {
+                    if changed {
+                        let status = monitor.as_mut().expect("panel poller exists").updates.borrow_and_update().clone();
+                        let view = presentation.as_mut().expect("panel presentation exists");
+                        let previous = view.dimensions();
+                        let mode_changed = view.update(status);
+                        let dimensions = view.dimensions();
+                        if previous != dimensions || mode_changed {
+                            input = InputState::default();
+                            view.invalidate();
+                            send_resize(&mut write, &request.terminal_id, dimensions).await?;
+                        }
+                        if let Some(snapshot) = screen_rx.borrow().as_ref() { render_view(snapshot, &mut presentation)?; }
+                    } else {
+                        monitor = None;
+                    }
+                },
                 notice = notice_rx.recv() => match notice {
                     Some(Notice::Graph) => {
                         if input.history {
@@ -310,31 +375,41 @@ where
                         guard.resume()?;
                         events = Some(EventStream::new());
                         let (cols, rows) = terminal::size()?;
-                        protocol::write_frame(&mut write, &ClientFrame::Resize { terminal_id: request.terminal_id.clone(), rows, cols }).await?;
-                        if let Some(snapshot) = screen_rx.borrow().as_ref() { render(snapshot)?; }
+                        if let (Some(monitor), Some(view)) = (&mut monitor, &mut presentation) {
+                            view.update(monitor.updates.borrow_and_update().clone());
+                        }
+                        let dimensions = resize_view(&mut presentation, cols, rows);
+                        send_resize(&mut write, &request.terminal_id, dimensions).await?;
+                        if let Some(snapshot) = screen_rx.borrow().as_ref() { render_view(snapshot, &mut presentation)?; }
                         outcome?;
                     },
                     Some(Notice::Error(error)) => return Err(error),
                     Some(Notice::Closed) | None => {
-                        if let Some(snapshot) = screen_rx.borrow().as_ref() { render(snapshot)?; }
+                        if let Some(snapshot) = screen_rx.borrow().as_ref() { render_view(snapshot, &mut presentation)?; }
                         break;
                     },
                 },
                 changed = screen_rx.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = screen_rx.borrow_and_update().clone();
-                    if let Some(snapshot) = snapshot { render(&snapshot)?; }
+                    if let Some(snapshot) = snapshot { render_view(&snapshot, &mut presentation)?; }
                 },
                 event = events.as_mut().expect("input stream exists outside graph callback").next() => match event {
                     Some(Ok(Event::Resize(cols, rows))) => {
                         input = InputState::default();
-                        protocol::write_frame(&mut write, &ClientFrame::Resize { terminal_id: request.terminal_id.clone(), rows, cols }).await?;
+                        let dimensions = resize_view(&mut presentation, cols, rows);
+                        send_resize(&mut write, &request.terminal_id, dimensions).await?;
                     },
                     Some(Ok(event)) => {
+                        let event = match &presentation {
+                            Some(view) => match view.input(event) { Some(event) => event, None => continue },
+                            None => event,
+                        };
                         let snapshot = screen_rx.borrow().clone();
                         match input.handle(event, snapshot.as_ref()) {
                             InputAction::Ignore => {},
                             InputAction::Detach => break,
+                            InputAction::Graph => { let _ = local_notices.try_send(Notice::Graph); },
                             InputAction::Input(bytes) => send_input(&mut write, &request.terminal_id, bytes).await?,
                             InputAction::History(action) => protocol::write_frame(&mut write, &ClientFrame::History { terminal_id: request.terminal_id.clone(), action }).await?,
                         }
@@ -349,6 +424,46 @@ where
     }.await;
     reader_task.abort();
     result
+}
+
+async fn panel_changed(monitor: &mut Option<panel::Monitor>) -> bool {
+    match monitor {
+        Some(monitor) => monitor.updates.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+fn resize_view(presentation: &mut Option<panel::Presentation>, cols: u16, rows: u16) -> (u16, u16) {
+    match presentation {
+        Some(view) => {
+            view.resize(cols, rows);
+            view.dimensions()
+        }
+        None => (rows, cols),
+    }
+}
+
+fn render_view(snapshot: &Snapshot, presentation: &mut Option<panel::Presentation>) -> Result<()> {
+    match presentation {
+        Some(view) => view.render(snapshot),
+        None => render(snapshot),
+    }
+}
+
+async fn send_resize(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    id: &str,
+    (rows, cols): (u16, u16),
+) -> Result<()> {
+    protocol::write_frame(
+        writer,
+        &ClientFrame::Resize {
+            terminal_id: id.into(),
+            rows,
+            cols,
+        },
+    )
+    .await
 }
 
 async fn send_input(
@@ -386,12 +501,24 @@ fn render(snapshot: &Snapshot) -> Result<()> {
         let column = usize::from(snapshot.cols).saturating_sub(label.chars().count()) + 1;
         write!(stdout, "\x1b[1;{column}H\x1b[0;7m{label}\x1b[0m\x1b[?25l")?;
     }
-    if snapshot.mouse || snapshot.history.is_some() {
-        stdout.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
-    } else {
-        stdout.write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")?;
-    }
+    write_mouse_capture(&mut stdout, snapshot)?;
     stdout.write_all(b"\x1b[?2026l")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn write_mouse_capture(writer: &mut impl Write, snapshot: &Snapshot) -> Result<()> {
+    if snapshot.mouse || snapshot.history.is_some() {
+        writer.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+    } else {
+        writer.write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")?;
+    }
+    Ok(())
+}
+
+fn mouse_capture(snapshot: &Snapshot) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    write_mouse_capture(&mut stdout, snapshot)?;
     stdout.flush()?;
     Ok(())
 }
@@ -680,6 +807,11 @@ mod tests {
         assert_eq!(
             state.handle(key(KeyCode::Char('x')), Some(&snapshot)),
             InputAction::Input(vec![2, b'x'])
+        );
+        assert_eq!(state.handle(prefix(), Some(&snapshot)), InputAction::Ignore);
+        assert_eq!(
+            state.handle(key(KeyCode::Char('g')), Some(&snapshot)),
+            InputAction::Graph
         );
         for detach in ['d', 'D'] {
             assert_eq!(state.handle(prefix(), Some(&snapshot)), InputAction::Ignore);

@@ -65,15 +65,15 @@ The app builds on `../ontography-core`. These are the eight agreed pieces to imp
 Rust server
 └── Ontography session
     ├── Pi manager state: conversations, active selection, tool preferences
-    ├── Server-owned Pi process, PTY, and terminal state
+    ├── Server-owned shell, PTY, and terminal state → managed Pi process
     └── One graph run/runtime after initialization
 ```
 
 A new session can start Pi before the graph exists. The first scoped start operation persists a reserved run identity and resolved definition, constructs core storage, and binds that run. Retries recover the same initialization. Existing runs are adopted explicitly; no Pi ownership is inferred from cwd or old transcripts.
 
-Bare `ontography` always creates an independent app session. `attach NAME_OR_ID` (or `--session NAME_OR_ID`) explicitly attaches; persisted selection is metadata and never an implicit launch target. Pi `/new`, `/resume`, `/fork`, `/clone`, and `/tree` preserve its graph. One controlling client owns the manager terminal's input/dimensions. Ctrl-B, then D detaches while manager and graph continue. Pi `/quit` ends the manager process but retains session/graph state. Session suspension stops the manager and suspends graph resources; closure is terminal. Server restart loads records; attachment explicitly resumes the named session's graph and native history.
+Bare `ontography` always creates an independent app session. `attach NAME_OR_ID` (or `--session NAME_OR_ID`) explicitly attaches; persisted selection is metadata and never an implicit launch target. Pi `/new`, `/resume`, `/fork`, `/clone`, and `/tree` preserve its graph. One controlling client owns the manager terminal's input/dimensions. Ctrl-B, then D detaches while manager and graph continue. Pi `/quit` returns to the managed shell and session panel. Shell `pi` resolves the latest saved active conversation and launches it with the same graph binding. Shell `exit` suspends the session and graph even while detached. Explicit suspension also stops the terminal; closure is terminal. Server restart loads records; attachment explicitly resumes the named session's graph and native history.
 
-`portable-pty` hosts processes; `vt100` maintains terminal state; the Rust client renders the terminal or the bound graph. The manager terminal is implemented. Worker terminal provisioning, views, package delivery, and execution reconciliation remain subsequent work.
+`portable-pty` hosts processes; `vt100` maintains terminal state; the Rust client renders native Pi, shell + session status, or the bound graph. The manager terminal is implemented. Worker terminal provisioning, views, package delivery, and execution reconciliation remain subsequent work.
 
 The [session guide](docs/SESSIONS.md) documents commands and storage. [SESSION_DESIGN.md](docs/SESSION_DESIGN.md) records ownership and recovery details. [CORE_BINDINGS.md](docs/CORE_BINDINGS.md) maps the existing core API. [PLAN.md](PLAN.md) is the original item-8 implementation plan.
 
@@ -86,6 +86,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 - [x] **Graph display inside the Pi interaction.** `/graph` and `--ui` use the same server-owned native Pi manager and the session's bound run; there is no second management conversation.
 - [x] **Unified Ontography session.** Durable manager state, graph initialization/adoption, conversation ownership, selection, lifecycle commands, and scoped dispatch are implemented. App-session fork/archive/delete remain deferred.
 - [x] **Rust manager terminal backend.** Server-owned PTY, terminal parsing, attachment snapshots, input/resize ownership, detach/reconnect, and manager supervision are implemented. This replaces the proposed tmux backend.
+- [x] **Persistent session shell.** Launch into Pi, return to shell + session status on `/quit`, resume the active conversation with shell `pi`, and suspend the session when its shell exits. Structured process leases distinguish manager state from terminal state.
 - [ ] **Concrete worker layer.** Implement items 1–7, then connect admitted graph nodes to supervised executions and node terminal views. Worker package delivery remains a governed core/harness operation.
 - [ ] **Default app rewrite grammar.** Define versioned productions alongside the concrete node/edge/package definitions. Cover supported add/remove/connect/disconnect/rewire operations with core validation. Existing runtimes keep their original grammar; editing a saved declaration does not retrofit an empty-grammar run.
 

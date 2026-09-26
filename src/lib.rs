@@ -9,6 +9,7 @@ pub mod error;
 pub mod extensions;
 pub mod launcher;
 pub mod logging;
+pub mod managed_shell;
 pub mod migration;
 pub mod persistence;
 pub mod protocol;

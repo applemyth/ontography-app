@@ -2,7 +2,7 @@
 
 ## Current session graph view
 
-Native Pi runs in a server-owned PTY. `/graph` requests the owning app session's graph through the terminal control channel. The attached Rust client opens `ui::run_graph_view` from `session_graph.rs`; `q` or Escape restores the same Pi terminal. `ontography --ui` opens this graph view first through that same attachment. There is no independent run picker in this path.
+Native Pi runs in the session's server-owned shell PTY. Pi is full screen; after `/quit`, the shell shares the client with a session status panel. `/graph` in Pi or Ctrl-B G requests the owning session's graph. The attached Rust client opens `ui::run_graph_view` from `session_graph.rs`; `q` or Escape restores the same terminal. `ontography --ui` opens this graph view first through that same attachment. There is no independent run picker in this path.
 
 The graph view reuses the Ratatui renderer described below. See [the session guide](../../docs/SESSIONS.md) for ownership, controls, and lifecycle, and [VERIFICATION.md](../../docs/VERIFICATION.md) for current acceptance evidence.
 

@@ -65,7 +65,7 @@ pub async fn run(client: Client, session_id: String) -> Result<()> {
                     format!("Node {} · received {} · outbound {}\n{}", node.id, node.received, node.outbound, graph.incident_edges(&node.id).join("\n"))
                 } else { "Pi remains running. Create and start the graph through its management tools.".into() };
                 frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), areas[2]);
-                frame.render_widget(Paragraph::new("↑/↓ select · ←/→ pan · q/Esc return to Pi"), areas[3]);
+                frame.render_widget(Paragraph::new("↑/↓ select · ←/→ pan · q/Esc return to terminal"), areas[3]);
             })?;
             tokio::select! {
                 changed = latest.changed() => {

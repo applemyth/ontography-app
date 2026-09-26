@@ -18,7 +18,7 @@ use std::{
     name = "ontography",
     version,
     about = "Persistent agent sessions and Ontography graphs",
-    after_help = "With no command, create a new session. Use `attach NAME_OR_ID` to return to an existing session.\nCtrl-B D detaches; Pi /quit exits only Pi; `close NAME_OR_ID` closes the session and graph."
+    after_help = "With no command, create a new session in Pi. Use `attach NAME_OR_ID` to return to an existing session.\nCtrl-B D detaches; Pi /quit opens the session shell; shell exit suspends the session; `close NAME_OR_ID` closes it permanently."
 )]
 struct Cli {
     #[command(flatten)]
@@ -43,6 +43,14 @@ struct Options {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Internal launcher used by the managed session shell.
+    #[command(hide = true)]
+    InternalPi {
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        generation: String,
+    },
     #[command(flatten)]
     Manage(SessionAction),
     Server {
@@ -144,6 +152,10 @@ async fn run(cli: Cli) -> Result<()> {
         None => persistence::default_data_dir()?,
     })?;
     match cli.action {
+        Some(Action::InternalPi {
+            session_id,
+            generation,
+        }) => ontography_app::managed_shell::run_pi(&paths, &session_id, &generation).await,
         Some(Action::Server {
             action: ServerAction::Run { detach },
         }) => {
@@ -341,6 +353,11 @@ async fn list_sessions(client: &Client, as_json: bool) -> Result<()> {
         } else {
             "detached"
         });
+        session["program"] = if terminal["running"] == true {
+            terminal["manager_mode"].clone()
+        } else {
+            json!("stopped")
+        };
         session["graph"] = session["run_id"].as_str().map_or(Value::Null, |id| {
             runs.get(id)
                 .cloned()
@@ -362,16 +379,21 @@ async fn list_sessions(client: &Client, as_json: bool) -> Result<()> {
             .unwrap_or(4)
             .max(4);
         println!(
-            "{:<36}  {:<name_width$}  {:<9}  {:<8}  GRAPH",
-            "SESSION", "NAME", "STATE", "TERMINAL"
+            "{:<36}  {:<name_width$}  {:<9}  {:<8}  {:<8}  GRAPH",
+            "SESSION", "NAME", "STATE", "TERMINAL", "PROGRAM"
         );
         for session in &sessions {
             println!(
-                "{:<36}  {:<name_width$}  {:<9}  {:<8}  {}",
+                "{:<36}  {:<name_width$}  {:<9}  {:<8}  {:<8}  {}",
                 value_id(session)?,
                 session["name"].as_str().unwrap_or("?"),
-                session["status"].as_str().unwrap_or("?"),
+                match session["status"].as_str() {
+                    Some("suspended") => "inactive",
+                    Some(status) => status,
+                    None => "?",
+                },
                 session["terminal"].as_str().unwrap_or("?"),
+                session["program"].as_str().unwrap_or("unknown"),
                 session["graph"]["status"]
                     .as_str()
                     .unwrap_or("uninitialized")
@@ -442,7 +464,7 @@ async fn attach(client: &Client, id: &str, pi: &Path, graph_first: bool) -> Resu
         rows: rows.max(2),
         cols: cols.max(10),
     };
-    terminal_client::run_with_initial_graph(&socket, request, graph_first, || {
+    terminal_client::run_with_session_panel(&socket, request, graph_first, client.clone(), || {
         ui::run_graph_view(client.clone(), id.to_owned())
     })
     .await

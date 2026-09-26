@@ -36,11 +36,12 @@ struct Receipt {
 }
 
 pub struct Server {
-    pub service: Service,
+    pub service: Arc<Service>,
     managers: crate::session_runtime::Managers,
     requests: Mutex<BTreeMap<(String, String), Receipt>>,
     admission: RwLock<()>,
     stopping: AtomicBool,
+    manager_monitor_started: AtomicBool,
     stopped: Notify,
 }
 
@@ -57,17 +58,19 @@ impl Server {
         registry: Arc<crate::registry::ImplementationRegistry>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            service: Service::with_registry(paths, registry)?,
+            service: Arc::new(Service::with_registry(paths, registry)?),
             managers: crate::session_runtime::Managers::default(),
             requests: Mutex::new(BTreeMap::new()),
             admission: RwLock::new(()),
             stopping: AtomicBool::new(false),
+            manager_monitor_started: AtomicBool::new(false),
             stopped: Notify::new(),
         }))
     }
 
     pub async fn request(self: &Arc<Self>, request: Request) -> Result<Value> {
         request.validate()?;
+        self.start_manager_monitor();
         if request.operation != "system.hello"
             && request.expected_server_id.as_deref() != Some(&self.service.server_id)
         {
@@ -230,6 +233,40 @@ impl Server {
                 AppError::new("unknown_outcome", "operation owner ended without a receipt")
             })?;
         }
+    }
+
+    /// Reap naturally exited shells independently of attached clients. A stale
+    /// terminal is fenced by Managers before it can suspend a newer one.
+    fn start_manager_monitor(self: &Arc<Self>) {
+        if self.manager_monitor_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_error = None;
+            loop {
+                interval.tick().await;
+                let Some(server) = weak.upgrade() else {
+                    break;
+                };
+                let _guard = server.admission.read().await;
+                if server.stopping.load(Ordering::Acquire) {
+                    continue;
+                }
+                match server.managers.reconcile(&server.service).await {
+                    Ok(()) => last_error = None,
+                    Err(error) => {
+                        let message = error.to_string();
+                        if last_error.as_ref() != Some(&message) {
+                            crate::logging::record(&server.service.paths.root, &message);
+                            last_error = Some(message);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub async fn stop(&self) -> Result<Value> {

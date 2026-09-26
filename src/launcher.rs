@@ -7,6 +7,27 @@ use std::{
 use tokio::process::Command;
 
 pub const PI_VERSION: &str = "0.85.1";
+
+/// Integration tests host a server in a test executable under `deps`; its shell
+/// children must still enter the actual application's hidden launcher command.
+pub fn application_executable() -> Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    if executable
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "deps")
+    {
+        let binary = executable
+            .parent()
+            .and_then(Path::parent)
+            .expect("deps has a build root")
+            .join("ontography");
+        if binary.is_file() {
+            return Ok(binary);
+        }
+    }
+    Ok(executable)
+}
 const ASSETS: &[(&str, &str)] = &[
     ("index.ts", include_str!("../pi/index.ts")),
     ("client.ts", include_str!("../pi/client.ts")),
