@@ -164,7 +164,7 @@ pub struct ContractDeclaration {
 }
 
 impl ContractDeclaration {
-    fn compile(&self) -> Result<Contract, DeclarationError> {
+    pub(crate) fn compile(&self) -> Result<Contract, DeclarationError> {
         if self.validator_version != VALIDATOR_VERSION {
             return Err(DeclarationError::UnsupportedValidatorVersion {
                 contract_id: self.id.clone(),

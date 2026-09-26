@@ -52,7 +52,7 @@ CLI targets accept an exact session ID or a unique exact name. Ambiguous names r
 
 Scoped calls resolve the session's graph and reject conflicting targets. Unscoped calls remain the explicit administration interface. The handshake publishes operation schemas. [examples/flow.json](examples/flow.json) is a logical graph with a configured rewrite; logical nodes can exist before worker implementations are installed.
 
-The management bindings expose definitions, runs, execution, rewrites, workflow, packages, workspaces, iroh transfers, scoped invocations/context, inspection, and trusted project applications. [The binding inventory](docs/CORE_BINDINGS.md) maps these to core's public API.
+The management bindings expose definitions, runs, live vocabulary extension, execution, rewrites, workflow, explicit package retirement, packages, workspaces, iroh transfers, scoped invocations/context, inspection, and trusted project applications. [Core update usage](docs/CORE_UPDATE.md) covers the new operations and restart recovery. [The binding inventory](docs/CORE_BINDINGS.md) maps these to core's public API.
 
 ## Development and status
 

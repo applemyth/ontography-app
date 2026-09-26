@@ -1,5 +1,57 @@
 # Verification
 
+## Core extension and retirement integration — 2026-09-25
+
+Passed: **104 app Rust tests, 51 core Rust tests, and 31 Pi tests**, TypeScript
+checking, Clippy across all targets with warnings denied in both Rust crates,
+formatting, and the locked offline build. Core retains one previously ignored
+failed-SQLite-commit probe; it was not counted as passing.
+
+- [Extension tests](../tests/extensions.rs) cover monotone admission, retained
+  authority and topology, stale rewrite plans, persistent recovery, both sides
+  of an interrupted journal commit, executable resume without replaying entry
+  input, and rejection by fixed-graph fact APIs. An internal boundary test
+  verifies both journal forms fit the metadata reader limit before core mutates.
+- [Request tests](../tests/extension_scope.rs) exercise actual server dispatch,
+  nested schema validation, session ownership, lifecycle gates, and receipt
+  deduplication.
+- [Retirement tests](../tests/retirement.rs) cover explicit retirement, all four
+  reasons, local rewrite cleanup, `All` receiver route removal, invalid evidence,
+  consumed/retired rejection, pagination, exports, reopening, and session scope.
+- Pi tests verify capability discovery, generated schemas, default run-group
+  availability, retirement group activation, scoped dispatch, and exact decimal
+  revisions. Independent review also checked crash recovery and core application
+  reconstruction.
+
+A real compiled-CLI check used an isolated server: create a session/run, extend
+all four vocabulary categories, submit and retire a package, inspect its evidence,
+stop/restart the server, explicitly resume, and compare the recovered vocabulary,
+unchanged graph, journal, package disposition, and retirement page. It passed;
+the isolated server was stopped. Evidence is retained temporarily under
+`/private/tmp/ontography-core-update-opz9g2tm/`.
+
+Core's public API gained schema iterators and an application reconstruction
+helper that retains executables and grammar. Its new integration test verifies
+live extension followed by application resume without a second initial input.
+The original core additions were committed separately before this integration.
+See [CORE_UPDATE.md](CORE_UPDATE.md) for semantics, limits, and examples. Core
+schema 9 requires fresh runs; this update implements no run migration.
+
+The default server now runs the verified update at `~/.ontography`, with zero
+runs, zero sessions, and no recovery errors. Application fingerprint:
+`ff2cc187f5ac9b34697e2b024091d53ddb4ffea5a43d79b9aaaeb6ea58e60412`;
+core fingerprint:
+`0b5f4f316927115ac62d75b85bafa76438130d060a4a39c84db2e2307ba659e3`.
+The previous manager was stopped and no executable worker bindings were active.
+The old server was gracefully stopped, then its store was renamed intact to
+`/Users/hershybar/.ontography.archive-core8-20260926T055318Z-e450eb46`.
+The archive includes `previous-ontography`, the matching old binary. Directory
+identity and hashes of all 12 retained JSON metadata files were checked after
+rename. The earlier legacy archive was untouched. An initial replacement attempt
+safely rolled back because the legacy alias required an initialized store; the
+successful retry initialized the new store explicitly, then checked default-path
+commands. `cutover.json` in the evidence directory records the result.
+
 ## Explicit attachment and new-session CLI — 2026-09-25
 
 Bare `ontography` now always creates a session. Top-level `new`, `ls`, `attach`,

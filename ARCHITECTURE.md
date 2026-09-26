@@ -51,7 +51,8 @@ The app builds on `../ontography-core`. These are the eight agreed pieces to imp
    | Definitions/admission | Validate schemas, graphs, contracts, authority rules, and rewrite grammars; save/import/export reusable declarations. |
    | Run lifecycle | Create/open, inspect, suspend, resume, and terminally close runs; manage registered executable implementations. |
    | Graph rewriting | Prepare, inspect, commit, and discard configured productions. |
-   | Workflow | Submit activations/emissions and transfer packages through permitted edges. |
+   | Workflow | Submit activations/emissions, transfer packages through permitted edges, and retire pending work with recorded reasons. |
+   | Vocabulary | Add node/object types, authority tags, and trusted contracts to live runs; persist accepted extensions across restart. |
    | Content/packages/workspaces | Import/read/retain, compose/resolve, checkout/capture, diff/merge, transfer through iroh. |
    | Invocation/context | Issue scoped invocations, prepare grants, enforce budgets, and record observed exposure/delivery evidence. |
    | Inspection | Inspect topology, frontier, package history, executions, and revision notifications. |
@@ -87,5 +88,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 - [x] **Rust manager terminal backend.** Server-owned PTY, terminal parsing, attachment snapshots, input/resize ownership, detach/reconnect, and manager supervision are implemented. This replaces the proposed tmux backend.
 - [ ] **Concrete worker layer.** Implement items 1–7, then connect admitted graph nodes to supervised executions and node terminal views. Worker package delivery remains a governed core/harness operation.
 - [ ] **Default app rewrite grammar.** Define versioned productions alongside the concrete node/edge/package definitions. Cover supported add/remove/connect/disconnect/rewire operations with core validation. Existing runtimes keep their original grammar; editing a saved declaration does not retrofit an empty-grammar run.
+
+Live `run.extend` admits additional vocabulary and trusted contracts while preserving existing meanings and graph structure. It does not replace the configured rewrite grammar. Core schema version 9 requires fresh runs in this WIP update; [CORE_UPDATE.md](docs/CORE_UPDATE.md) describes the integration.
 
 A definition is reusable configuration; starting it creates a run. Rewriting changes that run's current graph and preserves its history under the configured grammar. Core commits graph/package state; the future worker supervisor reconciles external processes separately and exposes partial failures. Opening or closing a terminal view has no graph-topology effect.

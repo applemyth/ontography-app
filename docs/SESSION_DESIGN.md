@@ -66,6 +66,8 @@ The migration command implements an exclusive journaled cutover: archive existin
 
 Initialization persists the chosen run ID, operation arguments, resolved definition, and initial application input before core creation. Recovery handles an intent without a run, an empty reserved directory, or an existing run awaiting session binding. Existing application state resumes without replaying its fresh input. Unopenable partial core storage remains an explicit error.
 
+Accepted vocabulary additions are stored in each run's `extensions.json`, with one pending intent persisted before the core commit. Recovery resolves whether that commit occurred before launching workers and reconstructs the extended binding. The original declaration and rewrite grammar remain fixed. See [CORE_UPDATE.md](CORE_UPDATE.md).
+
 General accepted-operation receipts remain bounded and server-instance-local. Session initialization has a durable intent; arbitrary mutations do not gain automatic durable replay. After server replacement, refresh graph state and reconcile unknown outcomes. Prepared rewrites, invocation capabilities, and other live handles expire.
 
 | Action | Ownership outcome |
@@ -91,7 +93,7 @@ The current backend hosts the management terminal. Worker terminal creation and 
 1. Define concrete Codex nodes, workspace/message/union contracts, edge rules, node harnesses, and scoped MCP.
 2. Supply their app editing productions at run creation; implement worker process reconciliation and views.
 3. Specify explicit app-session fork/archive/delete, complete artifact-backed export, and optional viewer/takeover behavior.
-4. Existing runs with empty grammars require a separate core-backed migration design; live grammar/schema replacement is unavailable.
+4. Runs need the desired grammar at creation. Live grammar replacement remains unavailable; `run.extend` only adds vocabulary and trusted contracts. This WIP uses fresh runs instead of migrating empty-grammar runs.
 
 ## Historical baseline
 

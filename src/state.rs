@@ -208,6 +208,7 @@ impl ManagedRun {
 
     pub async fn inspect(&self, limit: usize) -> Result<Value> {
         let mut result = self.summary();
+        result["extensions"] = self.extension_summary();
         if let Some(live) = &self.live {
             let overview = live
                 .session
@@ -226,6 +227,7 @@ impl ManagedRun {
                 .collect();
             result["revision"] = json!(overview.revision().to_string());
             result["graph"] = views::graph(overview.kernel());
+            result["vocabulary"] = crate::extensions::vocabulary(overview.kernel());
             result["frontier"] = json!({"counts":counts,
                 "received":overview.received().iter().map(|(id,p)|views::package(*id,p)).collect::<Vec<_>>(),
                 "outbound":overview.outbound().iter().map(|(id,p)|views::package(*id,p)).collect::<Vec<_>>()});
@@ -243,8 +245,19 @@ impl ManagedRun {
         }
         self.validate_metadata()?;
         if let RunDefinition::Application(declaration) = &self.manifest.declaration {
+            self.recover_extension_intent()?;
             let compiled = declaration.compile(&self.registry, &self.manifest.project)?;
-            match compiled.application.resume(self.core_path()?).await {
+            let kernel = self.extend_compiled_kernel(compiled.kernel)?;
+            let application = if kernel.fingerprint() == compiled.application.kernel().fingerprint()
+            {
+                compiled.application
+            } else {
+                compiled
+                    .application
+                    .with_vocabulary_extension(kernel)
+                    .map_err(AppError::core)?
+            };
+            match application.resume(self.core_path()?).await {
                 Ok(application) => {
                     self.live = Some(LiveRun::from_application(application));
                     self.manifest.status = "active".into();
@@ -287,18 +300,7 @@ impl ManagedRun {
             return Ok(());
         }
         self.validate_metadata()?;
-        let compiled = self
-            .manifest
-            .declaration
-            .compile(&self.registry, &self.manifest.project)?;
-        self.registry.validate_bindings(
-            self.manifest.declaration.execution_bindings(),
-            &compiled.kernel,
-        )?;
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
-        let session = runtime
-            .open_persistent(self.core_path()?)
-            .map_err(AppError::core)?;
+        let (runtime, session) = self.open_extended()?;
         self.live = Some(LiveRun::new(runtime, session));
         self.manifest.status = "active".into();
         self.save()

@@ -6,6 +6,7 @@ pub mod client;
 pub mod declarations;
 pub mod definition;
 pub mod error;
+pub mod extensions;
 pub mod launcher;
 pub mod logging;
 pub mod migration;

@@ -72,14 +72,14 @@ pub fn operations() -> Vec<Operation> {
     vec![
         Operation::new(
             "run.export_facts",
-            "Export complete fixed-graph activation facts and exact output payload evidence to an absolute file. Materializes history. Rewrites/transfers reject; excludes artifacts, context, and executable state.",
+            "Export complete fixed-graph activation facts and exact output payload evidence to an absolute file. Materializes history. Rewrites, transfers, retirements, and vocabulary extensions reject; excludes artifacts, context, and executable state.",
             json!({"run_id":text,"path":text}),
             &["run_id", "path"],
             true,
         ),
         Operation::new(
             "run.verify",
-            "Verify an already suspended persistent fixed-graph run by replaying its complete history and payload evidence through core, then release ownership. Rewrites/transfers reject; no executables launch.",
+            "Verify an already suspended persistent fixed-graph run by replaying its complete history and payload evidence through core, then release ownership. Rewrites, transfers, retirements, and vocabulary extensions reject; no executables launch.",
             json!({"run_id":text}),
             &["run_id"],
             true,
@@ -337,10 +337,7 @@ async fn verify(run: &ManagedRun) -> Result<Value> {
             "saved definition fingerprint mismatch",
         ));
     }
-    let compiled = run
-        .manifest
-        .declaration
-        .compile(&run.registry, &run.manifest.project)?;
+    let compiled = run.compile_current_definition()?;
     run.registry.validate_bindings(
         run.manifest.declaration.execution_bindings(),
         &compiled.kernel,

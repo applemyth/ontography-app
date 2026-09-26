@@ -207,6 +207,14 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
 async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Result<Value> {
     match operation {
         "run.inspect" => run.inspect(views::limit(args)?).await,
+        "run.extend" => {
+            let extension = serde_json::from_value(
+                args.get("extension")
+                    .cloned()
+                    .ok_or_else(|| AppError::invalid("extension is required"))?,
+            )?;
+            run.extend_vocabulary(extension).await
+        }
         "run.resume" => {
             run.resume().await?;
             run.inspect(100).await
@@ -230,7 +238,7 @@ async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .prepare_rewrite(&request.compile())
                 .await
                 .map_err(transition_error)?;
-            let summary = json!({"run_id":run_id,"plan_id":id,"revision":plan.revision().to_string(),"base_revision":plan.revision().to_string(),"graph":views::graph(plan.next_kernel()),"retirements":plan.retirements().iter().map(|(id,reason)|json!({"package_id":id.to_string(),"reason":format!("{reason:?}")})).collect::<Vec<_>>()});
+            let summary = json!({"run_id":run_id,"plan_id":id,"revision":plan.revision().to_string(),"base_revision":plan.revision().to_string(),"graph":views::graph(plan.next_kernel()),"retirements":plan.retirements().iter().map(|(id,reason)|json!({"package_id":id.to_string(),"reason":format!("{reason:?}"),"reason_code":views::retirement_reason(*reason)})).collect::<Vec<_>>()});
             live.rewrites.insert(
                 id,
                 RewriteHandle {
@@ -271,7 +279,7 @@ async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .await
                 .map_err(transition_error)?;
             Ok(
-                json!({"revision":result.revision().to_string(),"retirements":result.retirements().iter().map(|(id,reason)|json!({"package_id":id.to_string(),"reason":format!("{reason:?}")})).collect::<Vec<_>>()}),
+                json!({"revision":result.revision().to_string(),"retirements":result.retirements().iter().map(|(id,reason)|json!({"package_id":id.to_string(),"reason":format!("{reason:?}"),"reason_code":views::retirement_reason(*reason)})).collect::<Vec<_>>()}),
             )
         }
         name if name.starts_with("workflow.") || name.starts_with("inspect.") => {
@@ -294,7 +302,7 @@ fn transition_error(error: ontography::SessionTransitionError) -> AppError {
     let code = match &error {
         E::Stale => "stale",
         E::ForeignSession => "foreign_session",
-        E::Rewrite(_) | E::Transfer(_) => "rejected",
+        E::Rewrite(_) | E::Transfer(_) | E::Retire(_) | E::Extension(_) => "rejected",
         _ => "core_error",
     };
     AppError::new(code, error.to_string())

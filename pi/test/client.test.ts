@@ -53,14 +53,15 @@ async function fixture(t: TestContext, handle: (request: Request, socket: Socket
   return { client, requests, connections: () => connections };
 }
 
-test("concurrent calls share a handshake and preserve wide decimal IDs and Unicode", async (t) => {
+test("concurrent calls share a handshake and preserve wide decimals, nested retirement revisions, and Unicode", async (t) => {
   const setup = await fixture(t, (request, _socket, reply) => reply(request.args));
-  const values = ["18446744073709551615", "9007199254740993", "λ → 🌳"];
+  const values = ["18446744073709551615", "9007199254740993", "λ → 🌳",
+    { revision: "18446744073709551615", retirements: [{ revision: "9007199254740993", evidence_activation_id: "ffffffff-ffff-ffff-ffff-ffffffffffff" }] }];
   const responses = await Promise.all(values.map((value) => setup.client.call("inspect.echo", { value })));
   assert.deepEqual(responses.map((response) => response.result), values.map((value) => ({ value })));
   assert.equal(setup.connections(), 1);
   assert.equal(setup.requests.filter((request) => request.operation === "system.hello").length, 1);
-  assert.equal(new Set(responses.map((response) => response.receipt.request_id)).size, 3);
+  assert.equal(new Set(responses.map((response) => response.receipt.request_id)).size, values.length);
 });
 
 test("lost mutation response reconnects to its retained outcome without replay", async (t) => {

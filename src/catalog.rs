@@ -131,9 +131,16 @@ fn build_operations() -> Vec<Operation> {
         ),
         Operation::new(
             "run.resume",
-            "Reopen the stored current graph under its exact original definition and grammar.",
+            "Reopen the stored current graph with its accepted vocabulary extensions and original grammar.",
             json!({"run_id":text}),
             &["run_id"],
+            true,
+        ),
+        Operation::new(
+            "run.extend",
+            "Add node types, object types, authority tags, or trusted contracts to the live run. Existing contracts, graph, roots, authority rules, and rewrite grammar remain fixed. Accepted additions persist across restart; this does not create nodes or launch workers.",
+            json!({"run_id":text,"extension":schema::<crate::extensions::VocabularyExtension>()}),
+            &["run_id", "extension"],
             true,
         ),
         Operation::new(

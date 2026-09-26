@@ -6,7 +6,7 @@ This inventory maps [PLAN.md](../PLAN.md) to the implemented public core adapter
 
 One Ontography app session owns Pi manager state, a native manager terminal, and one graph run after initialization. Pi owns native conversation semantics; the app records membership, active selection, tool preferences, and graph association. The detached Rust server retains processes, PTYs, accepted requests, core runtimes, executable hosts, and handles. Core owns admission, graph transitions, occurrence history, content, and context records. Client detach preserves these resources. See [session ownership](SESSIONS.md).
 
-The app imports the sibling core through its public Rust API. It creates manifests and graph declarations; it never reads or modifies core's private SQLite representation. The binary fingerprints app/core source. Handshakes require the exact app/core build, and run reopening requires the stored core build and original declaration/catalog identities.
+The app imports the sibling core through its public Rust API. It creates manifests and graph declarations; it never reads or modifies core's private SQLite representation. The binary fingerprints app/core source. Handshakes require the exact app/core build, and run reopening requires the stored core build and original declaration/catalog identities. Accepted vocabulary additions are recorded separately and reconstructed on reopening.
 
 ## Capability matrix
 
@@ -22,8 +22,9 @@ Operation names in a row share the indicated prefix. Argument schemas define the
 | Fixed graph facts | `run.export_facts`, `run.restore_facts`, `run.verify`; absolute files, exact activation/result/output data, verification summary | `State::to_parts`, public `Activation`/`Output` constructors, `ProposalRuntime::restore/open_persistent_verified`. Restore is transient validation/inspection with no managed run; see scope below. |
 | Executable hosting | `execution.launch/list/inspect/activity/stop/abort/wait/release`; registered ID/version/config, node ID, execution handle | `ExecutionHost::launch`, `ExecutionHandle` status/activity/stop/abort/wait. Declaration bindings restart on resume; manually launched bindings have live-run lifetime. Initial production catalog has no worker implementation. |
 | Rewrite grammar and live graph | `rewrite.list/prepare/inspect/commit/discard`; production/match, plan ID, base revision, exact resulting topology and retirements | Retained `SessionRewrite` from `SessionHandle::prepare_rewrite`, applied by `commit_rewrite`. Preparation has no graph mutation. Intervening transitions make a plan stale. |
-| Workflow | `workflow.submit`, `workflow.transfer`; root/package/join triggers, results, emissions, authority, content dependencies | `ActivationProposal`, `Emission`, session `submit_with_content` and `transfer`; core enforces contracts, authority, consumed inputs, custody, and one delivery. |
-| Bounded observations | `inspect.frontier/trigger/package/activation/activation_content/wait_frontier`, `run.inspect` | Session frontier overview/pages, trigger selection, package history, artifact references, and frontier watch. Activation inspection currently materializes a complete snapshot before returning a bounded result preview. |
+| Vocabulary extension | `run.extend`; additive node types, object types, authority tags, and trusted contract declarations | `Kernel::prepare_extension`, `SessionHandle::extend`; reused live validator identities. A durable per-run intent and accepted-additions journal reconstruct the updated binding on restart. Topology, existing contracts, roots, authority rules, and grammar stay fixed. |
+| Workflow | `workflow.submit`, `workflow.transfer`, `workflow.retire`; triggers, emissions, transfers, explicit retirement with optional activation evidence | `ActivationProposal`, `Emission`, session `submit_with_content`, `transfer`, and `retire`; core enforces contracts, authority, consumed inputs, custody, one delivery, and the live/consumed/retired partition. Retirement preserves historical facts and artifact bytes. |
+| Observations | `inspect.frontier/trigger/package/retirements/activation/activation_content/wait_frontier`, `run.inspect` | Session frontier overview/pages, trigger selection, package history, artifact references, and frontier watch. Package disposition, retirement history, and activation inspection currently materialize a complete snapshot before returning bounded results. Retirement paging is by occurrence package ID; revisions remain decimal strings. |
 | Explicit history export | `inspect.export`; full graph/occurrence snapshot to an absolute file | `SessionHandle::try_snapshot`; diagnostic export includes occurrences, not a restorable complete session backup. |
 | Content import and reads | `content.import_bytes/import_file/import_stream/metadata/resolve/read/export`; content identity or local path | `ContentStore`; file-backed stream import uses 64 KiB buffers. Bounded reads are at most 64 KiB. Digest resolution verifies the payload commitment; it is distinct from an iroh hash. |
 | Retention and collections | `content.retain/release/gc/hash_sequence_put/hash_sequence_read/collection_put/collection_read` | Public content retention, GC, hash-sequence and native named-collection APIs. Checkpoint and live checkout references remain protected. Native collections differ from semantic package documents. |
@@ -57,7 +58,7 @@ Implementation: [sessions](../src/sessions.rs), [manager ownership](../src/sessi
 
 `run.verify` requires released run ownership. It checks the same core/declaration/catalog compatibility as reopening, calls `open_persistent_verified`, then releases all owners without terminal runtime shutdown. The original suspended run remains resumable. This verifies fixed-graph activation history and payloads; it is not a claim of a complete artifact/context audit.
 
-Core's checked fact export and historical verification reject histories with rewrites or explicit transfers. Ordinary `run.resume` restores those histories through core's trusted current-state loader. Core currently exposes no durable import of `StateParts`; adding durable imported runs requires an upstream public API.
+Core's checked fact export and historical verification reject histories with rewrites, explicit transfers, retirements, or vocabulary extensions. Ordinary `run.resume` restores those histories through core's trusted current-state loader. Core currently exposes no durable import of `StateParts`; adding durable imported runs requires an upstream public API.
 
 Fact files exclude artifact dependency records and artifact bytes, invocation/context records, retained executable resources, and source admission lifecycle. Content/package exports or transfer tools handle artifact content separately. Neither fact export nor `inspect.export` is advertised as a complete run backup.
 
@@ -69,11 +70,15 @@ The production registry starts without concrete Codex workers, direct-message in
 
 ### Core API limits
 
-- Durable fact import and verified replay of dynamic rewrite/transfer histories are absent from the public core API.
-- Live grammar/schema/trusted validator replacement is absent. Use the configured grammar or construct a new definition/run.
-- Single-activation inspection currently requires materializing a full snapshot. The response preview is bounded; the underlying history read is not.
+- Durable fact import and verified replay of dynamic rewrite/transfer/retirement/extension histories are absent from the public core API.
+- Live vocabulary additions are supported by `run.extend`. Grammar replacement, vocabulary removal, and replacement of existing validators remain unavailable. Use configured productions for topology changes.
+- Activation inspection, package disposition, and retirement paging currently require a full core snapshot. Responses are bounded; the underlying history read is not.
 - Workspace checkout requires supported OS copy-on-write behavior. Advisory read-only permissions do not establish execution confinement. Writers must be stopped before capture.
 - A trusted provider's description identity is not a code hash. The app pins expanded application configuration, component descriptions/specs, project identity, catalog versions, and core build. Registered adapters remain responsible for truthful immutable implementation identities and referenced executable resources.
+
+### Core update
+
+Core storage now uses schema version 9 and rejects older stores. This WIP app uses fresh runs for the update; no run migration is implemented. See [CORE_UPDATE.md](CORE_UPDATE.md) for operation examples and extension recovery.
 
 ### Release verification
 

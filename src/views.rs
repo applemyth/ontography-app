@@ -1,7 +1,7 @@
 use crate::{AppError, Result};
 use ontography::{
     ActivationId, Authority, AuthorityTag, ContentDigest, Kernel, Package, PackageId, Payload,
-    ProposalDecision, SessionStatus,
+    Phase, ProposalDecision, Retirement, RetirementReason, SessionStatus, State,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -23,6 +23,53 @@ pub fn graph(kernel: &Kernel) -> Value {
 
 pub fn package(id: PackageId, value: &Package) -> Value {
     json!({"package_id":id.to_string(),"producer":id.producer().to_string(),"edge_id":value.edge_id(),"node_id":value.node_id(),"object_type":value.object_type(),"authority":value.authority().tags().map(|t|t.id()).collect::<Vec<_>>(),"content_digest":value.content_digest().to_string()})
+}
+
+pub fn phase(value: Phase) -> &'static str {
+    match value {
+        Phase::In => "received",
+        Phase::Out => "outbound",
+    }
+}
+
+pub fn retirement_reason(value: RetirementReason) -> &'static str {
+    match value {
+        RetirementReason::HolderRemoved => "holder_removed",
+        RetirementReason::NoAcceptingEdge => "no_accepting_edge",
+        RetirementReason::RouteRemoved => "route_removed",
+        RetirementReason::Explicit => "explicit",
+    }
+}
+
+pub fn retirement(value: &Retirement) -> Value {
+    json!({"reason":retirement_reason(value.reason()),"holder":value.holder(),
+        "phase":phase(value.phase()),"revision":value.revision().to_string(),
+        "evidence_activation_id":value.evidence().map(|id|id.to_string())})
+}
+
+/// Report current custody and historical disposition from one consistent snapshot.
+pub fn package_state(state: &State, id: PackageId, value: &Package) -> Result<Value> {
+    let position = state.position(id);
+    let consumer = state.package_consumer(id);
+    let retired = state.retirement(id);
+    let disposition = match (position.is_some(), consumer.is_some(), retired.is_some()) {
+        (true, false, false) => "live",
+        (false, true, false) => "consumed",
+        (false, false, true) => "retired",
+        _ => {
+            return Err(AppError::new(
+                "invalid_state",
+                "package disposition is inconsistent",
+            ));
+        }
+    };
+    Ok(
+        json!({"package":package(id,value),"disposition":disposition,
+        "consumer":consumer.map(|id|id.to_string()),
+        "position":position.map(|p|json!({"holder":p.holder(),"phase":phase(p.phase())})),
+        "delivery":state.deliveries().get(&id).map(|d|json!({"edge_id":d.edge_id(),"source":d.source(),"receiver":d.receiver()})),
+        "retirement":retired.map(retirement)}),
+    )
 }
 
 pub fn decision(value: ProposalDecision) -> Result<Value> {

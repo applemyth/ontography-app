@@ -72,7 +72,7 @@ export class ManagementTools {
       name: BOOTSTRAP_TOOL,
       label: "Ontography capabilities",
       description: "List Ontography server capabilities and activate their typed tool groups. Call without groups to inspect; supply groups to make their tools available. Does not execute graph operations.",
-      promptSnippet: "Discover graph, run, rewrite, content, and context tools; activate a group when needed.",
+      promptSnippet: "Discover graph/run, vocabulary extension, workflow retirement, inspection, content, and context tools; activate their groups when needed.",
       parameters: Type.Object({ groups: Type.Optional(Type.Array(Type.String(), { description: "Capability groups to activate, added to the current selection." })) }, { additionalProperties: false }),
       executionMode: "sequential",
       execute: async (_callId, args) => {

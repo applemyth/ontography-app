@@ -5,7 +5,7 @@ use crate::state::{ManagedRun, Service};
 use crate::{AppError, Result, persistence, views};
 use ontography::{
     Activation, ActivationId, ActivationProposal, ContentId, Emission, OutputAuthority,
-    PendingFrontier, Phase, SessionSnapshot, Trigger,
+    PendingFrontier, SessionSnapshot, Trigger,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -107,6 +107,23 @@ impl ProposalInput {
 struct TransferInput {
     package_id: String,
     edge_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetireInput {
+    package_id: String,
+    #[serde(default)]
+    evidence_activation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementQuery {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: usize,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -265,6 +282,24 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 json!({"package_id":package_id.to_string(),"edge_id":delivery.edge_id(),"source":delivery.source(),"receiver":delivery.receiver()}),
             )
         }
+        "workflow.retire" => {
+            let input: RetireInput = parse_args(run, args)?;
+            let id = views::package_id(&input.package_id)?;
+            let evidence = input
+                .evidence_activation_id
+                .as_deref()
+                .map(views::activation_id)
+                .transpose()?;
+            let retirement = run
+                .live()?
+                .session
+                .retire(id, evidence)
+                .await
+                .map_err(transition_error)?;
+            Ok(
+                json!({"package_id":id.to_string(),"disposition":"retired","revision":retirement.revision().to_string(),"retirement":views::retirement(&retirement)}),
+            )
+        }
         "inspect.frontier" => {
             let input: FrontierInput = parse_args(run, args)?;
             check_limit(input.limit)?;
@@ -311,15 +346,63 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         "inspect.package" => {
             let input: PackageQuery = parse_args(run, args)?;
             let id = views::package_id(&input.package_id)?;
-            let history = run
+            let snapshot = run
                 .live()?
                 .session
-                .package_history(id)
+                .try_snapshot()
                 .await
-                .map_err(AppError::core)?
+                .map_err(AppError::core)?;
+            let state = snapshot.state();
+            let package = state
+                .package(id)
                 .ok_or_else(|| AppError::new("not_found", "package occurrence does not exist"))?;
+            let producer = state
+                .activation(id.producer())
+                .ok_or_else(|| AppError::new("invalid_state", "package producer does not exist"))?;
+            let inputs = match producer.trigger() {
+                Trigger::Orig { .. } => Vec::new(),
+                Trigger::Pkgs { package_ids } => {
+                    package_ids.iter().map(ToString::to_string).collect()
+                }
+            };
+            let mut value = views::package_state(state, id, package)?;
+            value["inputs"] = json!(inputs);
+            value["revision"] = json!(snapshot.revision().to_string());
+            Ok(value)
+        }
+        "inspect.retirements" => {
+            let input: RetirementQuery = parse_args(run, args)?;
+            check_limit(input.limit)?;
+            let after = input.after.as_deref().map(views::package_id).transpose()?;
+            let snapshot = run
+                .live()?
+                .session
+                .try_snapshot()
+                .await
+                .map_err(AppError::core)?;
+            let mut records = snapshot
+                .state()
+                .retirements()
+                .iter()
+                .filter(|(id, _)| after.is_none_or(|after| **id > after));
+            let retirements = records
+                .by_ref()
+                .take(input.limit)
+                .map(|(id, record)| {
+                    let mut value = views::retirement(record);
+                    value["package_id"] = json!(id.to_string());
+                    value
+                })
+                .collect::<Vec<_>>();
+            let next_after = if records.next().is_some() {
+                retirements
+                    .last()
+                    .map(|record| record["package_id"].clone())
+            } else {
+                None
+            };
             Ok(
-                json!({"package":views::package(id,history.package()),"inputs":history.inputs().iter().map(ToString::to_string).collect::<Vec<_>>()}),
+                json!({"revision":snapshot.revision().to_string(),"retirements":retirements,"next_after":next_after}),
             )
         }
         "inspect.activation" => {
@@ -371,7 +454,7 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .try_snapshot()
                 .await
                 .map_err(AppError::core)?;
-            let value = snapshot_view(run, &snapshot);
+            let value = snapshot_view(run, &snapshot)?;
             persistence::write_json(&path, &value)?;
             Ok(
                 json!({"path":path,"revision":snapshot.revision().to_string(),"kind":"workflow_snapshot","artifact_bytes_included":false,"context_records_included":false}),
@@ -384,7 +467,9 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
 fn transition_error(error: ontography::SessionTransitionError) -> AppError {
     match error {
         ontography::SessionTransitionError::Transfer(_)
-        | ontography::SessionTransitionError::Rewrite(_) => {
+        | ontography::SessionTransitionError::Rewrite(_)
+        | ontography::SessionTransitionError::Retire(_)
+        | ontography::SessionTransitionError::Extension(_) => {
             AppError::new("rejected", error.to_string())
         }
         ontography::SessionTransitionError::Stale => AppError::new("stale", error.to_string()),
@@ -414,17 +499,26 @@ fn activation_view(id: ActivationId, activation: &Activation, preview_bytes: usi
         "outputs":activation.package_outputs().iter().map(|(id,output)|json!({"package_id":id.to_string(),"edge_id":output.edge_id(),"object_type":output.object_type(),"authority":output.authority().tags().map(|tag|tag.id()).collect::<Vec<_>>(),"content_digest":output.content_digest().to_string()})).collect::<Vec<_>>()})
 }
 
-fn snapshot_view(run: &ManagedRun, snapshot: &SessionSnapshot) -> Value {
+fn snapshot_view(run: &ManagedRun, snapshot: &SessionSnapshot) -> Result<Value> {
     let state = snapshot.state();
     let kernel = snapshot.kernel();
-    json!({"format":"ontography.workflow_snapshot","version":1,"run_id":run.manifest.run_id,
+    let packages = state
+        .packages()
+        .iter()
+        .map(|(id, p)| views::package_state(state, *id, p))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(
+        json!({"format":"ontography.workflow_snapshot","version":1,"run_id":run.manifest.run_id,
         "declaration":run.manifest.declaration,"revision":snapshot.revision().to_string(),"admission":views::status(snapshot.status()),
+        "current_vocabulary":crate::extensions::vocabulary(kernel),"extensions":run.extension_summary(),
         "current_graph":views::graph(kernel),"current_node_definitions":kernel.node_definitions(),"current_edge_definitions":kernel.edge_definitions(),
         "current_roots":kernel.roots(),"current_authority_transitions":kernel.authority_transitions(),"current_fingerprint":kernel.fingerprint().to_string(),
         "activations":state.activations().iter().map(|(id,a)|activation_view(*id,a,usize::MAX)).collect::<Vec<_>>(),
-        "packages":state.packages().iter().map(|(id,p)|json!({"package":views::package(*id,p),"consumer":state.package_consumer(*id).map(|id|id.to_string()),"position":state.position(*id).map(|p|json!({"holder":p.holder(),"phase":match p.phase(){Phase::In=>"received",Phase::Out=>"outbound"}})),"delivery":state.deliveries().get(id).map(|d|json!({"edge_id":d.edge_id(),"source":d.source(),"receiver":d.receiver()}))})).collect::<Vec<_>>(),
+        "packages":packages,
+        "retirements":state.retirements().iter().map(|(id,record)|{let mut value=views::retirement(record);value["package_id"]=json!(id.to_string());value}).collect::<Vec<_>>(),
         "activation_content":snapshot.activation_content().iter().map(|(id,contents)|json!({"activation_id":id.to_string(),"contents":contents})).collect::<Vec<_>>(),
-        "artifact_bytes_included":false,"context_records_included":false})
+        "artifact_bytes_included":false,"context_records_included":false}),
+    )
 }
 
 pub(crate) fn parse_args<T: DeserializeOwned>(run: &ManagedRun, args: &Value) -> Result<T> {
@@ -509,6 +603,13 @@ pub fn operations() -> Vec<Operation> {
             true,
         ),
         operation(
+            "workflow.retire",
+            "Retire one live received or outbound package without consuming it. Optional evidence must identify an accepted activation; retirement rejects if the package is already consumed or retired.",
+            json!({"package_id":{"type":"string"},"evidence_activation_id":{"type":"string"}}),
+            &["package_id"],
+            true,
+        ),
+        operation(
             "inspect.wait_frontier",
             "Observe the current frontier revision, or wait up to 30s after a decimal revision. Notifications are coalesced hints: refresh state after waking. Admission is null while suspended or another run operation is busy.",
             json!({"after_revision":{"type":"string","pattern":"^[0-9]+$"},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000}}),
@@ -531,9 +632,16 @@ pub fn operations() -> Vec<Operation> {
         ),
         operation(
             "inspect.package",
-            "Read retained occurrence metadata and its producer's causal inputs, including consumed or retired packages. Does not report current custody.",
+            "Read retained occurrence metadata, producer inputs, current live/consumed/retired disposition, custody, and retirement evidence at one revision. Core currently materializes complete history for this query.",
             json!({"package_id":{"type":"string"}}),
             &["package_id"],
+            false,
+        ),
+        operation(
+            "inspect.retirements",
+            "Page retirement records in package_id order with bounded response size. Restart pagination if revision changes. Core currently materializes complete history for this query.",
+            json!({"after":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}}),
+            &[],
             false,
         ),
         operation(

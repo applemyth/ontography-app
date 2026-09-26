@@ -8,6 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Persisted JSON writers that accumulate records must remain readable by read_json.
+pub const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub root: PathBuf,
@@ -96,7 +99,7 @@ fn private_directory(path: &Path) -> Result<()> {
 
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let metadata = fs::metadata(path)?;
-    if metadata.len() > 16 * 1024 * 1024 {
+    if metadata.len() > MAX_JSON_BYTES {
         return Err(AppError::new("file_too_large", path.display().to_string()));
     }
     Ok(serde_json::from_slice(&fs::read(path)?)?)
