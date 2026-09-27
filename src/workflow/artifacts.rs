@@ -96,8 +96,9 @@ pub async fn workspace(run: &mut ManagedRun, args: &Value) -> Result<Value> {
     }
 }
 
-/// Export into a new destination. A sibling staging object is published only
-/// after all bytes and metadata have been written, using an exclusive rename.
+/// Export into a new destination with 0644 files and 0755 directories/executables.
+/// A private sibling container hides staging until an exclusive rename publishes
+/// the finished payload. Explicit permissions intentionally override the umask.
 pub async fn export(run: &ManagedRun, payload: WorkflowPayload, path: &Path) -> Result<Value> {
     let path = tools::content::local_path(run, path);
     let name = path
@@ -144,7 +145,9 @@ pub async fn export(run: &ManagedRun, payload: WorkflowPayload, path: &Path) -> 
             let mut staging = Staging::new(&parent, true)?;
             for entry in package.entries() {
                 if !entry.path.is_empty() && matches!(entry.kind, ResolvedEntryKind::Directory) {
-                    fs::create_dir(entry_path(&staging.path, &entry.path)?)?;
+                    let directory = entry_path(&staging.path, &entry.path)?;
+                    fs::create_dir(&directory)?;
+                    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
                 }
             }
             for entry in package.entries() {
@@ -171,7 +174,6 @@ pub async fn export(run: &ManagedRun, payload: WorkflowPayload, path: &Path) -> 
                     symlink(target, entry_path(&staging.path, &entry.path)?)?;
                 }
             }
-            File::open(&staging.path)?.sync_all()?;
             staging.publish(&destination)?;
             "workspace"
         }
@@ -196,30 +198,44 @@ fn entry_path(root: &Path, entry: &str) -> Result<PathBuf> {
 /// Cleanup also runs if an export future is cancelled during a content read.
 struct Staging {
     path: PathBuf,
+    container: PathBuf,
     directory: bool,
-    published: bool,
 }
 
 impl Staging {
     fn new(parent: &Path, directory: bool) -> Result<Self> {
-        let path = parent.join(format!(".ontography-export-{}.tmp", uuid::Uuid::new_v4()));
+        let container = parent.join(format!(".ontography-export-{}.tmp", uuid::Uuid::new_v4()));
+        fs::DirBuilder::new().mode(0o700).create(&container)?;
+        let staging = Self {
+            path: container.join("payload"),
+            container,
+            directory,
+        };
+        // Restore owner access if the umask removed it; never grant other users
+        // access to this container, even while assigning final payload modes.
+        fs::set_permissions(&staging.container, fs::Permissions::from_mode(0o700))?;
         if directory {
-            fs::DirBuilder::new().mode(0o700).create(&path)?;
+            fs::DirBuilder::new().mode(0o700).create(&staging.path)?;
         } else {
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&path)?;
+                .open(&staging.path)?;
         }
-        Ok(Self {
-            path,
-            directory,
-            published: false,
-        })
+        fs::set_permissions(
+            &staging.path,
+            fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
+        )?;
+        Ok(staging)
     }
 
     fn publish(&mut self, destination: &Path) -> Result<()> {
+        fs::set_permissions(
+            &self.path,
+            fs::Permissions::from_mode(if self.directory { 0o755 } else { 0o644 }),
+        )?;
+        File::open(&self.path)?.sync_all()?;
         rustix::fs::renameat_with(
             rustix::fs::CWD,
             &self.path,
@@ -237,20 +253,15 @@ impl Staging {
                 std::io::Error::from(error).into()
             }
         })?;
-        self.published = true;
         Ok(())
     }
 }
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        if !self.published {
-            if self.directory {
-                let _ = fs::remove_dir_all(&self.path);
-            } else {
-                let _ = fs::remove_file(&self.path);
-            }
-        }
+        // A successful publish moved only the payload. On failure/cancellation,
+        // the same private container still owns all partial output.
+        let _ = fs::remove_dir_all(&self.container);
     }
 }
 
@@ -263,12 +274,47 @@ mod tests {
         package::{PackageDocument, PackageStore},
     };
 
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn staging_stays_private_until_payload_is_published_with_final_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        for is_directory in [false, true] {
+            let mut stage = Staging::new(directory.path(), is_directory).unwrap();
+            let container = stage.container.clone();
+            let destination = directory
+                .path()
+                .join(if is_directory { "tree" } else { "message" });
+            assert_eq!(mode(&container), 0o700);
+            assert_eq!(mode(&stage.path), if is_directory { 0o700 } else { 0o600 });
+            if !is_directory {
+                fs::write(&stage.path, "message").unwrap();
+            }
+            stage.publish(&destination).unwrap();
+            assert_eq!(mode(&destination), if is_directory { 0o755 } else { 0o644 });
+            assert_eq!(mode(&container), 0o700);
+            assert!(!stage.path.exists());
+            drop(stage);
+            assert!(!container.exists());
+            assert!(destination.exists());
+        }
+    }
+
     #[tokio::test]
     async fn workspace_capture_release_and_export_preserve_the_visible_files() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
         fs::create_dir_all(source.join("nested/empty")).unwrap();
         fs::write(source.join("nested/script"), "before").unwrap();
+        fs::write(source.join("nested/plain"), "ordinary file").unwrap();
+        fs::set_permissions(source.join("nested"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            source.join("nested/plain"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         fs::set_permissions(
             source.join("nested/script"),
             fs::Permissions::from_mode(0o755),
@@ -302,14 +348,11 @@ mod tests {
             "after"
         );
         assert!(destination.join("nested/empty").is_dir());
-        assert_ne!(
-            fs::metadata(destination.join("nested/script"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
+        assert_eq!(mode(&destination), 0o755);
+        assert_eq!(mode(&destination.join("nested")), 0o755);
+        assert_eq!(mode(&destination.join("nested/empty")), 0o755);
+        assert_eq!(mode(&destination.join("nested/script")), 0o755);
+        assert_eq!(mode(&destination.join("nested/plain")), 0o644);
         assert_eq!(
             fs::read_link(destination.join("link")).unwrap(),
             Path::new("nested/script")
@@ -346,6 +389,7 @@ mod tests {
         let destination = directory.path().join("message.txt");
         export(&run, message(), &destination).await.unwrap();
         assert_eq!(fs::read_to_string(&destination).unwrap(), "new message");
+        assert_eq!(mode(&destination), 0o644);
         fs::write(&destination, "keep me").unwrap();
         assert_eq!(
             export(&run, message(), &destination)

@@ -104,7 +104,9 @@ actual graph and proceeds toward that target. If new work would be retired,
 it stops; preview the same target again and review the additional retirements.
 There is no rollback or substitution of an unrelated target mid-recovery.
 
-A stale preview before the edit starts needs a new preview. If a response is
+A stale topology preview before the edit starts needs a new preview. Config-only
+edits tolerate unrelated tasks completing, but still reject a changed document
+version or unexpected graph changes. If a response is
 lost, read `operation.get` or current status before retrying. Repeating a saved
 commit recovers that edit; accepted initial input is not replayed on resume.
 
@@ -120,7 +122,9 @@ its captured changes. The original directory is preserved. Without a workspace,
 the task runs in the workflow project and publishes stdout (or Codex's last
 message).
 
-For a human task, call `flow.workspace` with `action:"open"` and its `node`.
+For a human task, call `flow.workspace` with `action:"open"`, its `node`, and
+the `task_id` from status. This opens that task's current input and rejects
+a task that has already been replaced or completed.
 The result gives a private `path` and `workspace_id`. Edit files there, then
 call `action:"capture"` with that handle. Supply the captured `workspace_id`
 to `flow.decide` instead of a message. Release with `action:"release"` when
@@ -131,6 +135,34 @@ saved handle reopens it, including after restart. Opening an explicit local
 `flow.export` writes a workspace result to a new directory, preserving
 directories, files, symlinks, and executable bits. Output/status represent a
 workspace as `{"workspace":true}`; use workspace/export tools to obtain files.
+Exported message and ordinary files use mode `0644`, executable files `0755`,
+and directories `0755`. Staging remains private until publication.
+
+## Selecting inputs and results
+
+`flow.output` on a human node shows its ready task before any earlier decision.
+Use `task_id` to pin that task. `source:"output"` explicitly reads the node's
+last execution/decision result; `source:"pending"` reads pending inputs.
+These selectors also apply to `flow.workspace` open and `flow.export`.
+Resume a suspended run to inspect current tasks or inbox items; the explicit
+`source:"output"` selector can still read a cached result while suspended.
+
+An inbox returns `items`, each with an opaque `work_id` and an input preview.
+Pass that `work_id` to read, open, or export the exact item. A single item can
+be selected implicitly; several items require a selection for open/export.
+Items are ordered by stable identity, with no claim of arrival order. To page,
+set `limit` (1–100, default 20), then pass `next_after` as `after` along with
+the returned `revision`. A changed revision rejects the page; restart listing.
+Handles remain valid across restart while the item remains pending at the node.
+
+A joined task returns `work_ids` matching its input array. Select a `work_id`
+to export one input. Workspace open selects the unique workspace in that task,
+allowing accompanying messages to remain visible in status/output.
+
+Worker status uses `execution.state` (`running`, `exited`, `failed`, `panicked`,
+or `aborted`) and, on failure, `execution.error.class` and `.message`. Error
+messages preserve their original text. When no worker handle exists, `execution`
+is null.
 
 ## Current policies and limits
 

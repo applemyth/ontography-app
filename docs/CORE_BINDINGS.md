@@ -42,7 +42,7 @@ Schemas are available through the session-scoped `system.hello` handshake.
 | `flow.define` | Document → reusable revision | App validation and immutable document storage; declaration admission checks on start. |
 | `flow.start` | Document or revision, message or workspace directory → run | `GraphDeclaration`, persistent runtime/session, reserved initialization, app worker bindings. |
 | `flow.status` | Run → document, named graph, pending edit, worker state, tasks | Current kernel/frontier, app edit state, hosted execution status. |
-| `flow.output` | Node name → latest committed output or waiting input | Accepted invocation/publication evidence and content reads. |
+| `flow.output` | Node and optional task/work selection → ready input, last result, or inbox page | Accepted invocation/publication evidence, bounded pending queries, and content reads. |
 | `flow.edit` | Updated document → plan and exact retirement preview | Cloned state and configured core rewrite preparation. |
 | `flow.commit` | Plan ID → completed or recoverable edit | Revision-fenced `SessionHandle::prepare_rewrite` / `commit_rewrite`, persisted target and identities. |
 | `flow.resume` | Run → recovered edit and restarted workers | Core reopening, saved target recovery, worker reconciliation. |
@@ -56,7 +56,11 @@ There is no group activation/bootstrap tool. Its visible schemas do not
 include raw graph, rewrite, content, package, or context tools. Native workspace
 payloads appear as `{"workspace":true}`; tools accept workspace handles rather
 than content roots. Status/output previews bound text; artifact export obtains
-the complete result.
+the complete result. Human reads prefer their ready task; `source:"output"`
+selects the prior result. Inboxes expose every item with a `work_id`, which
+also selects the exact input for workspace opening/export. Pages use stable
+identity order and require the same revision, not inferred chronological order.
+Worker status is structured as `{state,error?}` with original error text.
 
 The session handshake separately advertises `session.*`, `terminal.*`,
 `system.hello`, `system.status`, and `operation.get` for CLI/extension lifecycle
@@ -182,6 +186,7 @@ Other existing limits remain:
 | Every allowed ingress/root variant and self loop in the fixed grammar | [grammar tests](../src/workflow/grammar.rs) |
 | Retirement previews, stale plans, partial edits, saved-target recovery | [editor tests](../src/workflow/edit.rs), [workflow recovery](../tests/workflow_recovery.rs) |
 | Command → human → inbox, config changes, added workers, repeated commits | [workflow flow](../tests/workflow_flow.rs) |
+| Repeated reviews, exact inbox selection, pagination, structured failure status | [workflow outputs](../tests/workflow_outputs.rs) |
 | Task execution, cancellation, failures, process supervision, workspace constraints | [harness tests](../src/workflow/harness.rs) |
 | Workspace capture/reopen/export and no-clobber/path validation | [artifact tests](../src/workflow/artifacts.rs), [workspace flow](../tests/workflow_artifacts.rs) |
 | Session ownership, scoped targets, manager catalog, initialization recovery | [session ownership](../tests/session_ownership.rs), [catalog tests](../src/catalog.rs) |

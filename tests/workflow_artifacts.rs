@@ -1,6 +1,6 @@
 use ontography_app::{persistence::Paths, state::Service, tools};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{os::unix::fs::PermissionsExt, path::Path};
 
 async fn call(service: &Service, operation: &str, args: Value) -> Value {
     tools::dispatch(service, operation, &args)
@@ -88,6 +88,22 @@ async fn captured_workspace_survives_restart_and_becomes_the_human_result() {
     )
     .await;
     assert_eq!(exported["kind"], "workspace");
+    assert_eq!(
+        std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    assert_eq!(
+        std::fs::metadata(destination.join("draft.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o644
+    );
     assert_eq!(
         std::fs::read_to_string(destination.join("draft.txt")).unwrap(),
         "reviewed"

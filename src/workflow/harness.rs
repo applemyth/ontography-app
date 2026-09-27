@@ -445,29 +445,151 @@ struct ProcessLease {
     identity: String,
 }
 
-struct ProcessGroup(Pid);
+struct ProcessGroup(Option<Pid>);
+impl ProcessGroup {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    fn terminate(&mut self) {
+        self.terminate_with(|pid| {
+            let _ = killpg(pid, Signal::SIGKILL);
+        });
+    }
+
+    fn terminate_with(&mut self, signal: impl FnOnce(Pid)) {
+        if let Some(pid) = self.0.take() {
+            signal(pid);
+        }
+    }
+}
+
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        let _ = killpg(self.0, Signal::SIGKILL);
+        self.terminate();
+    }
+}
+
+struct ProcessFiles {
+    directory: PathBuf,
+    token: String,
+    leased: bool,
+}
+
+impl ProcessFiles {
+    fn path(&self, suffix: &str) -> PathBuf {
+        self.directory.join(format!("{}.{}", self.token, suffix))
+    }
+}
+
+impl Drop for ProcessFiles {
+    fn drop(&mut self) {
+        for suffix in ["input", "status"] {
+            let _ = std::fs::remove_file(self.path(suffix));
+        }
+        if self.leased
+            && crate::persistence::read_json::<ProcessLease>(&lease_path(&self.directory))
+                .is_ok_and(|lease| lease.token == self.token)
+        {
+            let _ = std::fs::remove_file(lease_path(&self.directory));
+        }
     }
 }
 
 struct SupervisedProcess {
-    child: tokio::process::Child,
+    child: Option<tokio::process::Child>,
     group: ProcessGroup,
-    lifetime: tokio::process::ChildStdin,
+    lifetime: Option<tokio::process::ChildStdin>,
     token: String,
+    files: Option<ProcessFiles>,
+}
+
+impl SupervisedProcess {
+    fn child(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("owned supervisor")
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let result = self.child().wait().await;
+        if result.is_ok() {
+            // Reaping releases the PID. This must precede any other await or
+            // output error, because that number can now belong to a new group.
+            self.group.disarm();
+        }
+        result
+    }
+
+    fn terminate(&mut self) {
+        if matches!(self.child().try_wait(), Ok(Some(_))) {
+            self.group.disarm();
+        } else {
+            // The unreaped child still reserves its PID while we signal.
+            self.group.terminate();
+        }
+    }
+}
+
+impl Drop for SupervisedProcess {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        self.terminate();
+        self.lifetime.take();
+        let mut child = self.child.take().expect("owned supervisor");
+        let files = self.files.take();
+        // A cancelled startup still owns an unreaped child. Keep its files
+        // until reaping finishes, so a late supervisor write cannot recreate
+        // the status file after cleanup.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+                drop(files);
+            });
+        }
+    }
 }
 
 fn lease_path(directory: &Path) -> PathBuf {
     directory.join("worker-process.json")
 }
 
-async fn process_identity(pid: i32, token: &str) -> WorkerResult<Option<String>> {
-    use nix::{errno::Errno, sys::signal::kill, unistd::getpgid};
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessIdentity {
+    Gone,
+    ArgumentsUnavailable,
+    Verified(String),
+}
+
+fn classify_identity(pid: i32, token: &str, output: &[u8]) -> WorkerResult<ProcessIdentity> {
     use sha2::{Digest, Sha256};
+    let text = String::from_utf8_lossy(output);
+    let mut fields = text.split_whitespace().skip(5); // lstart has five fields.
+    if fields.next().and_then(|value| value.parse::<i32>().ok()) != Some(pid) {
+        return Err(failure(
+            "Saved worker process ownership is uncertain; no process was signalled",
+        ));
+    }
+    let command = fields.collect::<Vec<_>>().join(" ");
+    if command == "(sh)" {
+        // macOS can report the process name before argv becomes readable.
+        return Ok(ProcessIdentity::ArgumentsUnavailable);
+    }
+    if !command.contains(&format!("workflow-worker-{token}")) {
+        return Err(failure(
+            "Saved worker process ownership is uncertain; no process was signalled",
+        ));
+    }
+    Ok(ProcessIdentity::Verified(format!(
+        "{:x}",
+        Sha256::digest(output)
+    )))
+}
+
+async fn inspect_process_identity(pid: i32, token: &str) -> WorkerResult<ProcessIdentity> {
+    use nix::{errno::Errno, sys::signal::kill, unistd::getpgid};
     match kill(Pid::from_raw(pid), None) {
-        Err(Errno::ESRCH) => return Ok(None),
+        Err(Errno::ESRCH) => return Ok(ProcessIdentity::Gone),
         Err(error) => {
             return Err(failure(format!(
                 "Cannot inspect saved worker process: {error}"
@@ -487,24 +609,68 @@ async fn process_identity(pid: i32, token: &str) -> WorkerResult<Option<String>>
             "-o",
             "command=",
         ])
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(failure)?;
     if !observed.status.success() {
         if kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH) {
-            return Ok(None);
+            return Ok(ProcessIdentity::Gone);
         }
         return Err(failure("Cannot verify the saved worker process identity"));
     }
-    let label = format!("workflow-worker-{token}");
-    if getpgid(Some(Pid::from_raw(pid))).ok() != Some(Pid::from_raw(pid))
-        || !String::from_utf8_lossy(&observed.stdout).contains(&label)
-    {
-        return Err(failure(
-            "Saved worker process ownership is uncertain; no process was signalled",
-        ));
+    match getpgid(Some(Pid::from_raw(pid))) {
+        Ok(group) if group == Pid::from_raw(pid) => {}
+        Err(Errno::ESRCH) => return Ok(ProcessIdentity::Gone),
+        _ => {
+            return Err(failure(
+                "Saved worker process ownership is uncertain; no process was signalled",
+            ));
+        }
     }
-    Ok(Some(format!("{:x}", Sha256::digest(&observed.stdout))))
+    classify_identity(pid, token, &observed.stdout)
+}
+
+async fn process_identity(pid: i32, token: &str) -> WorkerResult<Option<String>> {
+    match inspect_process_identity(pid, token).await? {
+        ProcessIdentity::Gone => Ok(None),
+        ProcessIdentity::Verified(identity) => Ok(Some(identity)),
+        ProcessIdentity::ArgumentsUnavailable => Err(failure(
+            "Saved worker process ownership is uncertain; no process was signalled",
+        )),
+    }
+}
+
+async fn startup_identity<F, Fut>(mut inspect: F, timeout: Duration) -> WorkerResult<String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = WorkerResult<ProcessIdentity>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let identity = tokio::time::timeout_at(deadline, inspect())
+            .await
+            .map_err(|_| failure("Worker supervisor arguments were unavailable at startup"))??;
+        match identity {
+            ProcessIdentity::Verified(identity) => return Ok(identity),
+            ProcessIdentity::Gone => {
+                return Err(failure(
+                    "Worker supervisor exited before its lease was saved",
+                ));
+            }
+            ProcessIdentity::ArgumentsUnavailable => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(failure(
+                        "Worker supervisor arguments were unavailable at startup",
+                    ));
+                }
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+                )
+                .await;
+            }
+        }
+    }
 }
 
 async fn wait_group_gone(pid: i32) -> WorkerResult<()> {
@@ -569,23 +735,49 @@ async fn spawn_supervised(
     directory: &Path,
     input: &[u8],
 ) -> WorkerResult<SupervisedProcess> {
+    spawn_supervised_using(
+        argv,
+        cwd,
+        directory,
+        input,
+        |pid, token| async move { inspect_process_identity(pid, &token).await },
+        Duration::from_secs(1),
+    )
+    .await
+}
+
+async fn spawn_supervised_using<F, Fut>(
+    argv: &[String],
+    cwd: &Path,
+    directory: &Path,
+    input: &[u8],
+    mut inspect: F,
+    timeout: Duration,
+) -> WorkerResult<SupervisedProcess>
+where
+    F: FnMut(i32, String) -> Fut,
+    Fut: std::future::Future<Output = WorkerResult<ProcessIdentity>>,
+{
     if argv.is_empty() {
         return Err(failure("Worker argv is empty"));
     }
     let token = uuid::Uuid::new_v4().to_string();
-    let input_path = directory.join(format!("{token}.input"));
-    let status_path = directory.join(format!("{token}.status"));
-    tokio::fs::write(&input_path, input)
-        .await
-        .map_err(failure)?;
+    let files = ProcessFiles {
+        directory: directory.to_owned(),
+        token: token.clone(),
+        leased: false,
+    };
+    // Keep creation synchronous with guard ownership: cancelling tokio's
+    // blocking file write could otherwise recreate a file after guard cleanup.
+    std::fs::write(files.path("input"), input).map_err(failure)?;
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
         .arg(SUPERVISOR)
         .arg(format!("workflow-worker-{token}"))
         .arg(&token)
-        .arg(input_path)
-        .arg(status_path)
+        .arg(files.path("input"))
+        .arg(files.path("status"))
         .args(argv)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -597,26 +789,36 @@ async fn spawn_supervised(
     let pid = child
         .id()
         .ok_or_else(|| failure("Worker supervisor has no identity"))? as i32;
-    let group = ProcessGroup(Pid::from_raw(pid));
-    let identity = process_identity(pid, &token)
-        .await?
-        .ok_or_else(|| failure("Worker supervisor exited before its lease was saved"))?;
-    write_json(
-        &lease_path(directory),
-        &ProcessLease {
-            pid,
-            token: token.clone(),
-            identity,
-        },
-    )
-    .map_err(failure)?;
     let lifetime = child.stdin.take().expect("piped supervisor lifetime");
-    Ok(SupervisedProcess {
-        child,
-        group,
-        lifetime,
-        token,
-    })
+    let mut process = SupervisedProcess {
+        child: Some(child),
+        group: ProcessGroup(Some(Pid::from_raw(pid))),
+        lifetime: Some(lifetime),
+        token: token.clone(),
+        files: Some(files),
+    };
+    let leased = async {
+        let identity = startup_identity(|| inspect(pid, token.clone()), timeout).await?;
+        write_json(
+            &lease_path(directory),
+            &ProcessLease {
+                pid,
+                token,
+                identity,
+            },
+        )
+        .map_err(failure)?;
+        process.files.as_mut().expect("owned process files").leased = true;
+        Ok::<_, ExecutionFailure>(())
+    }
+    .await;
+    if let Err(error) = leased {
+        process.terminate();
+        let _ = process.wait().await;
+        process.files.take();
+        return Err(error);
+    }
+    Ok(process)
 }
 
 async fn read_bounded(reader: impl AsyncRead + Unpin) -> WorkerResult<Vec<u8>> {
@@ -663,9 +865,6 @@ async fn process(
             })
             .collect::<WorkerResult<_>>()?
     };
-    let mut supervised = spawn_supervised(&argv, cwd, directory, &input).await?;
-    let stdout = supervised.child.stdout.take().expect("piped stdout");
-    let stderr = supervised.child.stderr.take().expect("piped stderr");
     let timeout = Duration::from_secs(
         node.config
             .get("timeout_secs")
@@ -675,11 +874,16 @@ async fn process(
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| failure("Worker timeout is too large"))?;
+    let mut supervised = spawn_supervised(&argv, cwd, directory, &input).await?;
+    let stdout = supervised.child().stdout.take().expect("piped stdout");
+    let stderr = supervised.child().stderr.take().expect("piped stderr");
     let mut stop = context.stop();
     let completed = {
         let running = async {
             supervised
                 .lifetime
+                .as_mut()
+                .expect("owned lifetime pipe")
                 .write_all(format!("{}\n", supervised.token).as_bytes())
                 .await
                 .map_err(failure)?;
@@ -687,7 +891,7 @@ async fn process(
             if let Some(receipt) = workspace_receipt {
                 invocation.mark_sent(receipt).await.map_err(failure)?;
             }
-            let wait = async { supervised.child.wait().await.map_err(failure) };
+            let wait = async { supervised.wait().await.map_err(failure) };
             let (stdout, stderr, _) =
                 tokio::try_join!(read_bounded(stdout), read_bounded(stderr), wait)?;
             Ok::<_, ExecutionFailure>((stdout, stderr))
@@ -698,12 +902,12 @@ async fn process(
             () = tokio::time::sleep_until(deadline) => Err(failure("Worker exceeded its timeout")),
         }
     };
-    drop(supervised.group);
-    let _ = supervised.child.wait().await;
-    // Read the exit record before recovery removes the lease's temporary files.
+    supervised.terminate();
+    supervised.wait().await.map_err(failure)?;
+    // Read the exit record before dropping this process's temporary files.
     let exit_record =
         tokio::fs::read_to_string(directory.join(format!("{}.status", supervised.token))).await;
-    recover_process(directory).await?;
+    supervised.files.take();
     let (stdout, stderr) = completed?;
     let stderr = String::from_utf8_lossy(&stderr).into_owned();
     let status =
@@ -765,9 +969,182 @@ mod tests {
     async fn permit(process: &mut SupervisedProcess) {
         process
             .lifetime
+            .as_mut()
+            .unwrap()
             .write_all(format!("{}\n", process.token).as_bytes())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_retries_only_unavailable_arguments_with_a_deadline() {
+        let pid = 123;
+        let token = "fixture-token";
+        let bare = format!("Sat Sep 26 12:00:00 2026 {pid} (sh)\n");
+        let full =
+            format!("Sat Sep 26 12:00:00 2026 {pid} /bin/sh -c script workflow-worker-{token}\n");
+        let mut attempts = 0;
+        let identity = startup_identity(
+            || {
+                attempts += 1;
+                std::future::ready(classify_identity(
+                    pid,
+                    token,
+                    if attempts < 3 {
+                        bare.as_bytes()
+                    } else {
+                        full.as_bytes()
+                    },
+                ))
+            },
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            classify_identity(pid, token, full.as_bytes()).unwrap(),
+            ProcessIdentity::Verified(identity),
+        );
+        // A readable but different command or a different group is not the
+        // macOS metadata race, even if an expected value might appear later.
+        for output in [
+            format!("Sat Sep 26 12:00:00 2026 {pid} /bin/sh unrelated\n"),
+            "Sat Sep 26 12:00:00 2026 456 (sh)\n".into(),
+        ] {
+            let mut attempts = 0;
+            let result = startup_identity(
+                || {
+                    attempts += 1;
+                    std::future::ready(classify_identity(pid, token, output.as_bytes()))
+                },
+                Duration::from_millis(100),
+            )
+            .await;
+            assert!(
+                result
+                    .unwrap_err()
+                    .message()
+                    .contains("ownership is uncertain")
+            );
+            assert_eq!(attempts, 1);
+        }
+        let result = startup_identity(
+            || std::future::ready(classify_identity(pid, token, bare.as_bytes())),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .message()
+                .contains("unavailable at startup")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_timed_out_and_cancelled_startups_reap_and_remove_temporary_files() {
+        use nix::{errno::Errno, sys::signal::kill};
+        for timeout in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut pid = 0;
+            let result = spawn_supervised_using(
+                &["/bin/sh".into(), "-c".into(), "touch ran".into()],
+                directory.path(),
+                directory.path(),
+                b"input",
+                |observed, _| {
+                    pid = observed;
+                    std::future::ready(if timeout {
+                        Ok(ProcessIdentity::ArgumentsUnavailable)
+                    } else {
+                        Err(failure("ownership mismatch"))
+                    })
+                },
+                Duration::from_millis(20),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut sender = Some(pid_sender);
+            spawn_supervised_using(
+                &["/bin/sh".into(), "-c".into(), "touch ran".into()],
+                &path,
+                &path,
+                b"input",
+                |pid, _| {
+                    sender.take().unwrap().send(pid).unwrap();
+                    std::future::pending::<WorkerResult<ProcessIdentity>>()
+                },
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        let pid = pid_receiver.await.unwrap();
+        task.abort();
+        assert!(task.await.err().unwrap().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH)
+                    && std::fs::read_dir(directory.path()).unwrap().count() == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Even an OS spawn error occurs after the input file was created.
+        assert!(
+            spawn_supervised(
+                &["/bin/true".into()],
+                &directory.path().join("missing-working-directory"),
+                directory.path(),
+                b"input",
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn output_error_after_reaping_cannot_signal_a_reused_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut process = spawn_supervised(
+            &["/bin/true".into()],
+            directory.path(),
+            directory.path(),
+            b"",
+        )
+        .await
+        .unwrap();
+        permit(&mut process).await;
+        let (reaped, completion) = tokio::sync::oneshot::channel();
+        let result = tokio::try_join!(
+            async {
+                process.wait().await.map_err(failure)?;
+                reaped.send(()).unwrap();
+                Ok(())
+            },
+            async {
+                completion.await.unwrap();
+                Err::<(), _>(failure("pipe failed after child exit"))
+            },
+        );
+        assert!(result.unwrap_err().message().contains("pipe failed"));
+        process
+            .group
+            .terminate_with(|_| panic!("A reaped child's group ID must never be signalled"));
+        assert!(process.group.0.is_none());
     }
 
     #[tokio::test]
@@ -814,7 +1191,7 @@ printf changed > artifact.txt
         .await
         .unwrap();
         permit(&mut process).await;
-        tokio::time::timeout(Duration::from_secs(3), process.child.wait())
+        tokio::time::timeout(Duration::from_secs(3), process.wait())
             .await
             .unwrap()
             .unwrap();
@@ -858,13 +1235,10 @@ printf changed > artifact.txt
             }
             // Model abrupt parent loss: no Rust Drop signal is available;
             // the OS closes only the parent's lifetime-pipe write end.
-            let SupervisedProcess {
-                mut child,
-                group,
-                lifetime,
-                ..
-            } = process;
-            std::mem::forget(group);
+            let mut child = process.child.take().unwrap();
+            let lifetime = process.lifetime.take().unwrap();
+            process.group.disarm();
+            std::mem::forget(process.files.take());
             drop(lifetime);
             tokio::time::timeout(Duration::from_secs(3), child.wait())
                 .await
@@ -901,13 +1275,12 @@ printf changed > artifact.txt
                 .contains("identity changed")
         );
         assert!(
-            process.child.try_wait().unwrap().is_none(),
+            process.child().try_wait().unwrap().is_none(),
             "mismatch must not signal the process"
         );
         lease.identity = original;
         write_json(&lease_path(directory.path()), &lease).unwrap();
-        let (recovered, exited) =
-            tokio::join!(recover_process(directory.path()), process.child.wait());
+        let (recovered, exited) = tokio::join!(recover_process(directory.path()), process.wait());
         recovered.unwrap();
         exited.unwrap();
         assert!(!lease_path(directory.path()).exists());

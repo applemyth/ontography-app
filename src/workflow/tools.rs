@@ -1,6 +1,8 @@
 //! The manager's complete workflow interface. Core identities stay behind it.
 
-use super::{Document, IdentityMap, NodeKind, WorkflowPayload, artifacts, edit, expand, runtime};
+use super::{
+    Document, IdentityMap, NodeKind, WorkflowPayload, artifacts, edit, expand, output, runtime,
+};
 use crate::{
     AppError, Result,
     catalog::Operation,
@@ -21,6 +23,7 @@ pub fn operations() -> Vec<Operation> {
     let text = json!({"type":"string"});
     let document = crate::catalog::schema::<Document>();
     let run = json!({"run_id":text});
+    let source = json!({"enum":["auto","output","pending"]});
     vec![
         Operation::new(
             "flow.define",
@@ -45,8 +48,8 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.output",
-            "Read a node's latest output or waiting input.",
-            json!({"run_id":text,"node":text}),
+            "Read the current human task, latest worker output, or a page of inbox items. Use source:output for a previous result, task_id for a specific ready task, or work_id for an exact pending item. Inbox pages use stable identity order, not arrival order; pass revision with after to continue.",
+            json!({"run_id":text,"node":text,"source":source,"task_id":text,"work_id":text,"after":text,"revision":text,"limit":{"type":"integer","minimum":1,"maximum":100}}),
             &["run_id", "node"],
             false,
         ),
@@ -80,8 +83,8 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.workspace",
-            "Open a private workspace from a path or node, capture its changes, or release it. Capture before using workspace_id in a human decision.",
-            json!({"run_id":text,"action":{"enum":["open","capture","release"]},"node":text,"path":text,"workspace_id":text}),
+            "Open a private workspace from a path, saved handle, or node's current task/result. Pin a task_id or choose an inbox work_id from flow.output; source:output selects the previous result. Capture before submitting the workspace_id in a human decision.",
+            json!({"run_id":text,"action":{"enum":["open","capture","release"]},"node":text,"path":text,"workspace_id":text,"source":source,"task_id":text,"work_id":text}),
             &["run_id", "action"],
             true,
         ),
@@ -94,8 +97,8 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.export",
-            "Export a node's output as a new file or workspace directory.",
-            json!({"run_id":text,"node":text,"path":text}),
+            "Export the selected task input or node result as a new file or workspace directory. Choose a work_id when an inbox has several items; source:output selects the previous result. Files use 0644 (0755 if executable), directories 0755.",
+            json!({"run_id":text,"node":text,"path":text,"source":source,"task_id":text,"work_id":text}),
             &["run_id", "node", "path"],
             true,
         ),
@@ -235,7 +238,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
     let state = runtime::load(&run)?;
     match operation {
         "flow.status" => status(&run).await,
-        "flow.output" => output(&run, &state, views::field(args, "node")?).await,
+        "flow.output" => output::inspect(&run, &state, args).await,
         "flow.resume" => {
             run.resume().await?;
             status(&run).await
@@ -288,11 +291,20 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         "flow.decide" => decide(&mut run, &state, args).await,
         "flow.workspace" => {
             let mut internal = args.clone();
-            if args["action"] == "open"
+            let node_source = args["action"] == "open"
                 && args.get("path").is_none()
-                && args.get("workspace_id").is_none()
+                && args.get("workspace_id").is_none();
+            if !node_source
+                && ["source", "task_id", "work_id"]
+                    .iter()
+                    .any(|key| args.get(key).is_some())
             {
-                let payload = node_payload(&run, &state, views::field(args, "node")?).await?;
+                return Err(AppError::invalid(
+                    "Task/result selectors apply only when opening a workspace from a node",
+                ));
+            }
+            if node_source {
+                let payload = output::payload(&run, &state, args, true).await?;
                 let WorkflowPayload::Workspace(envelope) = payload else {
                     return Err(AppError::invalid(
                         "This node has no workspace input or output",
@@ -303,7 +315,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             artifacts::workspace(&mut run, &internal).await
         }
         "flow.export" => {
-            let payload = node_payload(&run, &state, views::field(args, "node")?).await?;
+            let payload = output::payload(&run, &state, args, false).await?;
             let path = PathBuf::from(views::field(args, "path")?);
             let path = if path.is_absolute() {
                 path
@@ -329,7 +341,7 @@ pub struct Task {
     pub input: Value,
     pub work_ids: Vec<String>,
     #[serde(skip)]
-    raw_input: Value,
+    pub(super) raw_input: Value,
     #[serde(skip)]
     packages: Vec<PackageId>,
     #[serde(skip)]
@@ -341,11 +353,11 @@ fn task_id(node: &str, packages: &[PackageId]) -> String {
     format!("task_{:x}", Sha256::digest(json!([node, ids]).to_string()))
 }
 
-fn work_id(package: &str) -> String {
+pub(super) fn work_id(package: &str) -> String {
     format!("work_{:x}", Sha256::digest(package))
 }
 
-fn payload_view(value: &Value) -> Value {
+pub(super) fn payload_view(value: &Value) -> Value {
     if value.get("ontography_package").is_some() {
         return json!({"workspace":true});
     }
@@ -364,6 +376,23 @@ fn payload_view(value: &Value) -> Value {
 }
 
 pub async fn tasks(run: &ManagedRun, state: &edit::WorkflowState) -> Result<Vec<Task>> {
+    ready_tasks(run, state, None).await
+}
+
+pub(super) async fn ready_task(
+    run: &ManagedRun,
+    state: &edit::WorkflowState,
+    node: &str,
+) -> Result<Option<Task>> {
+    run.live()?;
+    Ok(ready_tasks(run, state, Some(node)).await?.pop())
+}
+
+async fn ready_tasks(
+    run: &ManagedRun,
+    state: &edit::WorkflowState,
+    only: Option<&str>,
+) -> Result<Vec<Task>> {
     if run.live.is_none() {
         return Ok(vec![]);
     }
@@ -373,7 +402,12 @@ pub async fn tasks(run: &ManagedRun, state: &edit::WorkflowState) -> Result<Vec<
     let original_entry = &initial.state.identities.nodes[&initial.state.current.entry];
     let pending_initial = runtime::initial_pending(run).await?;
     let mut tasks = Vec::new();
-    for node in &state.current.nodes {
+    for node in state
+        .current
+        .nodes
+        .iter()
+        .filter(|node| only.is_none_or(|id| node.id == id))
+    {
         let id = &state.identities.nodes[&node.id];
         if kernel.graph().node(id).is_none() {
             continue;
@@ -445,7 +479,7 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
         let id = &state.identities.nodes[&node.id];
         let execution = run.live.as_ref().and_then(|live| live.workers.get(id).and_then(|worker| live.executions.get(&worker.execution_id)));
         json!({"id":node.id,"kind":node.kind,"pending":counts.as_ref().and_then(|view|view.counts().get(id.as_str())).map_or(0,|count|count.received()),
-            "execution":execution.map(|handle|format!("{:?}",handle.status()).to_lowercase())})
+            "execution":execution.map(|handle|execution_status(handle.status()))})
     }).collect();
     // The existing graph view uses workflow names, including intermediate
     // topology during an unfinished edit. No incarnation IDs leave this view.
@@ -480,93 +514,19 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
     Ok(result)
 }
 
-pub async fn output(run: &ManagedRun, state: &edit::WorkflowState, node: &str) -> Result<Value> {
-    let mut output = output_record(run, state, node).await?;
-    if let Some(object) = output.as_object_mut() {
-        object.remove("invocation_id");
-        object.remove("activation_id");
-    }
-    for field in ["result", "input"] {
-        if let Some(value) = output.get(field) {
-            output[field] = payload_view(value);
+fn execution_status(status: ontography::ExecutionStatus) -> Value {
+    use ontography::ExecutionStatus;
+    match status {
+        ExecutionStatus::Running => json!({"state":"running"}),
+        ExecutionStatus::Exited => json!({"state":"exited"}),
+        ExecutionStatus::Aborted => json!({"state":"aborted"}),
+        ExecutionStatus::Failed(error) => {
+            json!({"state":"failed","error":{"class":error.class(),"message":error.message()}})
+        }
+        ExecutionStatus::Panicked(message) => {
+            json!({"state":"panicked","error":{"class":"panic","message":message}})
         }
     }
-    for field in ["stdout", "stderr"] {
-        if let Some(value) = output.get(field).and_then(Value::as_str) {
-            let preview: String = value.chars().take(8192).collect();
-            if preview.len() < value.len() {
-                output["truncated"] = json!(true);
-            }
-            output[field] = json!(preview);
-        }
-    }
-    Ok(output)
-}
-
-async fn output_record(run: &ManagedRun, state: &edit::WorkflowState, node: &str) -> Result<Value> {
-    let id = state
-        .identities
-        .nodes
-        .get(node)
-        .ok_or_else(|| AppError::invalid("Unknown workflow node"))?;
-    let path = runtime::node_directory(run, id).join("output.json");
-    if path.exists() {
-        let mut output: Value = persistence::read_json(&path)?;
-        output["node"] = json!(node);
-        if output["publication_status"] == "prepared" && run.live.is_some() {
-            let mut after = None;
-            loop {
-                let page = run
-                    .live()?
-                    .session
-                    .invocations_page(Some(id), after.as_deref(), 100)
-                    .await
-                    .map_err(AppError::core)?;
-                if let Some(record) = page
-                    .iter()
-                    .find(|record| output["invocation_id"] == record.id.to_string())
-                {
-                    output["publication_status"] = json!(match record.status {
-                        ontography::InvocationStatus::Accepted => "committed",
-                        ontography::InvocationStatus::Open => "prepared",
-                        _ => "failed",
-                    });
-                    break;
-                }
-                if page.len() < 100 {
-                    break;
-                }
-                after = page.last().map(|record| record.id.to_string());
-            }
-        }
-        return Ok(output);
-    }
-    let input = tasks(run, state)
-        .await?
-        .into_iter()
-        .find(|task| task.node == node)
-        .map(|task| task.raw_input);
-    Ok(json!({"node":node,"input":input,"publication_status":"waiting"}))
-}
-
-async fn node_payload(
-    run: &ManagedRun,
-    state: &edit::WorkflowState,
-    node: &str,
-) -> Result<WorkflowPayload> {
-    let output = output_record(run, state, node).await?;
-    if output.get("result").is_some() && output["publication_status"] != "committed" {
-        return Err(AppError::new(
-            "output_not_committed",
-            "This worker output has not been accepted; inspect or resume the task",
-        ));
-    }
-    let value = output
-        .get("result")
-        .or_else(|| output.get("input"))
-        .filter(|value| !value.is_null())
-        .ok_or_else(|| AppError::new("no_output", "This node has no output or input yet"))?;
-    WorkflowPayload::decode(&serde_json::to_vec(value)?)
 }
 
 async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value) -> Result<Value> {

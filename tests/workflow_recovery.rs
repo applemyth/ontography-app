@@ -203,7 +203,7 @@ async fn start_retry_finishes_workers_after_initial_workspace_import_failure() {
         .unwrap();
     service.shutdown().await.unwrap();
     assert_eq!(
-        gate["execution"], "running",
+        gate["execution"]["state"], "running",
         "the retry must finish launching the entry worker after recovering the input import"
     );
 }

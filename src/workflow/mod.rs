@@ -5,6 +5,7 @@ pub mod document;
 pub mod edit;
 pub mod grammar;
 pub mod harness;
+mod output;
 pub mod runtime;
 pub mod tools;
 

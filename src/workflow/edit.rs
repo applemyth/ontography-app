@@ -179,11 +179,23 @@ pub async fn commit(
         return recover(session, state, path).await;
     }
     let revision = session.frontier().revision();
-    if state.version != plan.base_version || revision != plan.base_core_revision {
+    if state.version != plan.base_version || (plan.steps > 0 && revision != plan.base_core_revision)
+    {
         return Err(AppError::new(
             "stale_preview",
             "The workflow changed after this preview; preview it again",
         ));
+    }
+    if plan.steps == 0 {
+        // Worker progress cannot stale a settings edit. Its graph must still
+        // match, so skipping the work revision never authorizes graph repair.
+        let kernel = session.kernel().await.map_err(AppError::core)?;
+        if next_step(&kernel, &plan.document, &plan.identities)?.is_some() {
+            return Err(AppError::new(
+                "workflow_drift",
+                "Core's graph changed after this settings preview",
+            ));
+        }
     }
     let mut accepted = state.clone();
     accepted.pending = Some(plan);
@@ -222,6 +234,12 @@ pub async fn recover(
                 steps_applied,
             });
         };
+        if plan.steps == 0 {
+            return Err(AppError::new(
+                "workflow_drift",
+                "A settings edit cannot repair an unexpected graph change",
+            ));
+        }
         let prepared = session
             .prepare_rewrite(&request)
             .await
@@ -565,6 +583,138 @@ mod tests {
                 .current,
             next
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_edit_survives_unrelated_work_after_preview() {
+        let (directory, _runtime, session, mut state) = fixture();
+        let original_ids = state.identities.clone();
+        let mut next = state.current.clone();
+        next.nodes
+            .iter_mut()
+            .find(|node| node.id == "writer")
+            .unwrap()
+            .config = json!({"prompt":"after"});
+        let plan = preview(&session, &state, next.clone()).await.unwrap();
+        assert_eq!(plan.steps, 0);
+        let package = produce(&session, &state, true).await.unwrap();
+        let revision = session.frontier().revision();
+        assert!(revision > plan.base_core_revision);
+        let result = commit(
+            &session,
+            &mut state,
+            &directory.path().join("workflow.json"),
+            plan,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.version, 2);
+        assert_eq!(result.core_revision, revision);
+        assert_eq!(result.steps_applied, 0);
+        assert_eq!(state.current, next);
+        assert_eq!(state.identities, original_ids);
+        assert!(session.try_snapshot().await.unwrap().state().packages()[&package].is_live());
+    }
+
+    #[tokio::test]
+    async fn prompt_edit_still_rejects_a_conflicting_document_version() {
+        let (directory, _runtime, session, mut state) = fixture();
+        let path = directory.path().join("workflow.json");
+        let mut first = state.current.clone();
+        first
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "writer")
+            .unwrap()
+            .config = json!({"prompt":"first"});
+        let first = preview(&session, &state, first).await.unwrap();
+        let mut second = state.current.clone();
+        second
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "writer")
+            .unwrap()
+            .config = json!({"prompt":"second"});
+        let accepted = preview(&session, &state, second.clone()).await.unwrap();
+        commit(&session, &mut state, &path, accepted).await.unwrap();
+        let error = commit(&session, &mut state, &path, first)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "stale_preview");
+        assert_eq!(state.current, second);
+        assert_eq!(state.version, 2);
+        assert!(state.pending.is_none());
+        assert_eq!(load(&path).unwrap().current, second);
+    }
+
+    #[tokio::test]
+    async fn settings_plan_cannot_replace_an_incompatible_pending_target() {
+        let (directory, _runtime, session, mut state) = fixture();
+        let path = directory.path().join("workflow.json");
+        let mut next = state.current.clone();
+        next.nodes
+            .iter_mut()
+            .find(|node| node.id == "writer")
+            .unwrap()
+            .config = json!({"prompt":"after"});
+        let settings = preview(&session, &state, next).await.unwrap();
+        let mut topology = state.current.clone();
+        topology.edges.clear();
+        let pending = preview(&session, &state, topology).await.unwrap();
+        let pending_id = pending.id.clone();
+        state.pending = Some(pending);
+        store(&path, &state).unwrap();
+        let error = commit(&session, &mut state, &path, settings)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "pending_edit");
+        assert_eq!(load(&path).unwrap().pending.unwrap().id, pending_id);
+        assert_eq!(session.frontier().revision(), 0);
+    }
+
+    #[tokio::test]
+    async fn settings_edits_never_repair_unexpected_topology_drift() {
+        for accepted_before_drift in [false, true] {
+            let (directory, _runtime, session, mut state) = fixture();
+            let path = directory.path().join("workflow.json");
+            let mut next = state.current.clone();
+            next.nodes
+                .iter_mut()
+                .find(|node| node.id == "writer")
+                .unwrap()
+                .config = json!({"prompt":"after"});
+            let plan = preview(&session, &state, next).await.unwrap();
+            if accepted_before_drift {
+                state.pending = Some(plan.clone());
+                store(&path, &state).unwrap();
+            }
+            // Simulate a bypassing topology writer. A settings edit must not
+            // remove its new node, before acceptance or during recovery.
+            let mut changed = state.current.clone();
+            changed
+                .nodes
+                .push(serde_json::from_value(json!({"id":"unexpected","kind":"inbox"})).unwrap());
+            let ids = target_identities(&state, &changed);
+            let kernel = session.kernel().await.unwrap();
+            let request = next_step(&kernel, &changed, &ids).unwrap().unwrap();
+            let prepared = session.prepare_rewrite(&request).await.unwrap().unwrap();
+            session.commit_rewrite(prepared).await.unwrap().unwrap();
+            let revision = session.frontier().revision();
+            let error = commit(&session, &mut state, &path, plan).await.unwrap_err();
+            assert_eq!(error.code, "workflow_drift");
+            assert_eq!(session.frontier().revision(), revision);
+            assert!(
+                session
+                    .kernel()
+                    .await
+                    .unwrap()
+                    .graph()
+                    .node(&ids.nodes["unexpected"])
+                    .is_some()
+            );
+            assert_eq!(state.version, 1);
+            assert_eq!(state.pending.is_some(), accepted_before_drift);
+        }
     }
 
     #[tokio::test]
