@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-w
 import { Check } from "typebox/value";
 import { BridgeClient, BridgeError, type Arguments, type Hello } from "../client.ts";
 import { registerSessionHooks, SessionBinding } from "../session.ts";
-import { BOOTSTRAP_TOOL, ManagementTools } from "../tools.ts";
+import { ManagementTools } from "../tools.ts";
 
 type Hook = (event: Record<string, unknown>, ctx: ExtensionContext) => Promise<unknown>;
 const sessionId = "app-session-1";
@@ -18,8 +18,8 @@ function fixture() {
   const hello: Hello = {
     protocol_version: 1, server_id: "server-1", app_version: "test", core_version: "test", app_build: "test", core_build: "test",
     operations: [
-      { name: "run.inspect", group: "run", description: "Inspect", mutating: false, parameters: { type: "object", properties: { run_id: { type: "string" } }, required: ["run_id"], additionalProperties: false } },
-      { name: "run.suspend", group: "run", description: "Suspend", mutating: true, parameters: { type: "object", properties: { run_id: { type: "string" } }, required: ["run_id"], additionalProperties: false } },
+      { name: "flow.status", group: "flow", description: "Inspect", mutating: false, parameters: { type: "object", properties: { run_id: { type: "string" } }, required: ["run_id"], additionalProperties: false } },
+      { name: "flow.suspend", group: "flow", description: "Suspend", mutating: true, parameters: { type: "object", properties: { run_id: { type: "string" } }, required: ["run_id"], additionalProperties: false } },
       { name: "content.read", group: "content", description: "Read content", mutating: false, parameters: { type: "object", properties: {} } },
       { name: "workspace.list", group: "workspace", description: "List workspaces", mutating: false, parameters: { type: "object", properties: {} } },
       ...["session.context", "session.conversation", "session.preferences", "session.create", "terminal.graph", "server.stop"].map((name) => ({
@@ -69,7 +69,7 @@ function fixture() {
       } else if (operation === "session.preferences") {
         state.groups = [...(args.preferences as { tool_groups: string[] }).tool_groups];
         result = { preferences: { tool_groups: [...state.groups] } };
-      } else if (operation === "run.inspect" || operation === "run.suspend") {
+      } else if (operation === "flow.status" || operation === "flow.suspend") {
         if (args.run_id !== undefined && args.run_id !== state.run) throw new BridgeError("foreign_run", "This manager owns another run");
         result = { run_id: state.run };
       }
@@ -77,7 +77,6 @@ function fixture() {
     };
     const binding = new SessionBinding(client, sessionId);
     const tools = new ManagementTools(pi, client, binding);
-    tools.registerBootstrap();
     registerSessionHooks(pi, client, tools, binding);
     const context = (conversation = state.active) => ({
       hasUI: true,
@@ -90,20 +89,20 @@ function fixture() {
   return { state, requests, membership, hello, load };
 }
 
-test("native new, resume, fork, and reload retain the app graph while session-wide preferences survive replacement", async () => {
+test("native new, resume, fork, and reload retain the graph and fixed workflow tool surface", async () => {
   const server = fixture();
   let runtime = server.load();
   await runtime.fire("session_start", { reason: "startup" });
-  assert.ok(runtime.activeTools().includes("ontography_content_read"));
-  await runtime.definitions.get(BOOTSTRAP_TOOL)!.execute("choose", { groups: ["workspace"] }, undefined, undefined, {} as never);
-  assert.ok(server.state.groups.includes("workspace"));
+  assert.ok(runtime.activeTools().includes("ontography_flow_status"));
+  assert.equal(runtime.definitions.has("ontography_content_read"), false);
   assert.equal(runtime.entries.some((entry) => entry.type === "ontography_tool_groups"), false);
   for (const reason of ["new", "resume", "fork", "reload"]) {
     await runtime.fire("session_shutdown", { reason });
     assert.equal(runtime.disconnects(), 1);
     runtime = server.load();
     await runtime.fire("session_start", { reason }, reason === "reload" ? server.state.active : `conversation-${reason}`);
-    assert.ok(runtime.activeTools().includes("ontography_workspace_list"));
+    assert.ok(runtime.activeTools().includes("ontography_flow_status"));
+    assert.equal(runtime.definitions.has("ontography_workspace_list"), false);
     assert.equal(server.state.run, "run-1");
   }
   assert.equal(server.requests.some(({ operation }) => operation === "run.start" || operation === "run.close" || operation === "session.close"), false);
@@ -126,23 +125,23 @@ test("failed registration and lost context keep graph tools closed until associa
   const runtime = server.load();
   await runtime.fire("session_start");
   await runtime.tools.refresh();
-  const suspend = runtime.definitions.get("ontography_run_suspend")!;
+  const suspend = runtime.definitions.get("ontography_flow_suspend")!;
   await assert.rejects(suspend.execute("suspend", {}, undefined, undefined, {} as never), /Registration rejected/);
-  assert.equal(server.requests.some(({ operation }) => operation === "run.suspend"), false);
+  assert.equal(server.requests.some(({ operation }) => operation === "flow.suspend"), false);
   server.state.failRegistration = false;
-  await runtime.definitions.get(BOOTSTRAP_TOOL)!.execute("reconnect", {}, undefined, undefined, {} as never);
-  assert.ok(runtime.activeTools().includes("ontography_content_read"));
+  await runtime.fire("before_agent_start", { systemPrompt: "Base prompt" });
+  assert.ok(runtime.activeTools().includes("ontography_flow_status"));
   server.state.failContext = true;
   await runtime.fire("before_agent_start", { systemPrompt: "Base prompt" });
   await assert.rejects(suspend.execute("suspend", {}, undefined, undefined, {} as never), /Context unavailable/);
-  assert.equal(server.requests.some(({ operation }) => operation === "run.suspend"), false);
+  assert.equal(server.requests.some(({ operation }) => operation === "flow.suspend"), false);
 });
 
 test("bound tools default the current run but preserve explicit mismatches for rejection; internal operations are hidden", async () => {
   const server = fixture();
   const runtime = server.load();
   await runtime.fire("session_start");
-  const inspect = runtime.definitions.get("ontography_run_inspect")!;
+  const inspect = runtime.definitions.get("ontography_flow_status")!;
   assert.equal(Check(inspect.parameters, {}), true);
   assert.equal(Check(inspect.parameters, { run_id: 12 }), false);
   assert.equal(Check(server.hello.operations[0]!.parameters as never, {}), false, "the published core schema remains unchanged");
@@ -174,8 +173,8 @@ test("server replacement re-registers the current conversation before continuing
   await runtime.fire("session_start");
   const count = server.requests.length;
   server.hello.server_id = "server-2";
-  await runtime.definitions.get("ontography_run_inspect")!.execute("inspect", {}, undefined, undefined, {} as never);
-  assert.deepEqual(server.requests.slice(count).map(({ operation }) => operation), ["session.conversation", "session.context", "run.inspect"]);
+  await runtime.definitions.get("ontography_flow_status")!.execute("inspect", {}, undefined, undefined, {} as never);
+  assert.deepEqual(server.requests.slice(count).map(({ operation }) => operation), ["session.conversation", "session.context", "flow.status"]);
 });
 
 test("completed agent turns report newly saved histories without resetting the graph or tool readiness", async () => {
@@ -189,8 +188,8 @@ test("completed agent turns report newly saved histories without resetting the g
   assert.equal(server.state.run, "run-1");
   assert.deepEqual(server.state.groups, ["content"]);
   const count = server.requests.length;
-  await runtime.definitions.get("ontography_run_inspect")!.execute("inspect", {}, undefined, undefined, {} as never);
-  assert.deepEqual(server.requests.slice(count).map(({ operation }) => operation), ["run.inspect"]);
+  await runtime.definitions.get("ontography_flow_status")!.execute("inspect", {}, undefined, undefined, {} as never);
+  assert.deepEqual(server.requests.slice(count).map(({ operation }) => operation), ["flow.status"]);
   assert.equal(server.requests.some(({ operation }) => operation === "run.start" || operation === "run.close"), false);
 });
 
@@ -198,7 +197,7 @@ test("retained tools and late events from a replaced runtime cannot reactivate i
   const server = fixture();
   const old = server.load();
   await old.fire("session_start");
-  const staleTool = old.definitions.get("ontography_run_suspend")!;
+  const staleTool = old.definitions.get("ontography_flow_suspend")!;
   await old.fire("session_shutdown", { reason: "new" });
   const current = server.load();
   await current.fire("session_start", { reason: "new" }, "conversation-2");
@@ -213,9 +212,9 @@ test("failed reactivation revokes readiness of tools already registered in that 
   const server = fixture();
   const runtime = server.load();
   await runtime.fire("session_start");
-  const tool = runtime.definitions.get("ontography_run_suspend")!;
+  const tool = runtime.definitions.get("ontography_flow_suspend")!;
   server.state.failRegistration = true;
   await runtime.fire("session_start", { reason: "reload" });
   await assert.rejects(tool.execute("suspend", {}, undefined, undefined, {} as never), /Registration rejected/);
-  assert.equal(server.requests.some(({ operation }) => operation === "run.suspend"), false);
+  assert.equal(server.requests.some(({ operation }) => operation === "flow.suspend"), false);
 });

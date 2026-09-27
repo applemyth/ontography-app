@@ -2751,6 +2751,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "regex",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",
@@ -2763,20 +2764,84 @@ dependencies = [
 ]
 
 [[package]]
-name = "ontography-core"
+name = "ontography-application"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ontography-calculus",
+ "ontography-content",
+ "ontography-runtime",
+ "ontography-workspace",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ontography-calculus"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "ontography-content"
 version = "0.1.0"
 dependencies = [
  "bao-tree",
  "bytes",
  "futures-lite",
  "iroh-blobs",
- "reflink-copy",
- "rusqlite",
+ "ontography-calculus",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ontography-core"
+version = "0.1.0"
+dependencies = [
+ "ontography-application",
+ "ontography-calculus",
+ "ontography-content",
+ "ontography-runtime",
+ "ontography-workspace",
+]
+
+[[package]]
+name = "ontography-runtime"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "iroh-blobs",
+ "ontography-calculus",
+ "ontography-content",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ontography-workspace"
+version = "0.1.0"
+dependencies = [
+ "ontography-content",
+ "reflink-copy",
+ "thiserror 2.0.20",
+ "tokio",
+ "unicode-normalization",
  "uuid",
 ]
 
@@ -4619,6 +4684,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

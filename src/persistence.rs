@@ -67,6 +67,16 @@ impl Paths {
             .join("definitions")
             .join(format!("{fingerprint}.json")))
     }
+
+    pub fn workflow_definition(&self, fingerprint: &str) -> Result<PathBuf> {
+        // Reuse revision validation while keeping documents separate from raw
+        // graph declarations, whose listing has a different schema.
+        self.definition(fingerprint)?;
+        Ok(self
+            .root
+            .join("definitions/workflows")
+            .join(format!("{fingerprint}.json")))
+    }
 }
 
 pub fn default_data_dir() -> Result<PathBuf> {

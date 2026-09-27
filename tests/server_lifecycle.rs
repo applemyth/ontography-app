@@ -477,23 +477,10 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
         .call("run.inspect", json!({"run_id":run_id}))
         .await
         .unwrap();
-    let package_id = before["frontier"]["received"][0]["package_id"].clone();
     assert_eq!(
         before["frontier"]["received"][0]["producer"],
         accepted["activation_id"]
     );
-    let invocation = client.call("invocation.begin", json!({"run_id":run_id,"node_id":"B","trigger":{"kind":"packages","package_ids":[package_id]}})).await.unwrap();
-    let invocation_id = invocation["invocation_id"].clone();
-    client.call("context.record",json!({"run_id":run_id,"invocation_id":invocation_id,"payload":"prepared before crash"})).await.unwrap();
-    let open_records = client
-        .call("invocation.list", json!({"run_id":run_id}))
-        .await
-        .unwrap();
-    assert_eq!(
-        open_records["invocations"][0]["invocation_id"],
-        invocation_id
-    );
-    assert_eq!(open_records["invocations"][0]["status"], "open");
     let plan = client.call("rewrite.prepare", json!({"run_id":run_id,"request":{"production_id":"remove_receiver","nodes":{"A":"A","B":"B"},"edges":{"A_to_B":"A_to_B"}}})).await.unwrap();
     assert_eq!(plan["revision"], before["revision"]);
 
@@ -574,28 +561,6 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
     assert_eq!(resumed["revision"], before["revision"]);
     assert_eq!(resumed["graph"], before["graph"]);
     assert_eq!(resumed["frontier"], before["frontier"]);
-    let records = restarted
-        .call("invocation.list", json!({"run_id":run_id}))
-        .await
-        .unwrap();
-    let record = records["invocations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|record| record["invocation_id"] == invocation_id)
-        .unwrap();
-    assert_eq!(record["status"], "interrupted");
-    assert_eq!(
-        restarted
-            .call(
-                "invocation.inspect",
-                json!({"run_id":run_id,"invocation_id":invocation_id})
-            )
-            .await
-            .unwrap_err()
-            .code,
-        "unknown_handle"
-    );
     assert_eq!(
         restarted
             .call(
@@ -607,14 +572,6 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
             .code,
         "unknown_handle"
     );
-    let events = restarted
-        .call(
-            "context.events",
-            json!({"run_id":run_id,"invocation_id":invocation_id}),
-        )
-        .await
-        .unwrap();
-    assert!(!events["events"].as_array().unwrap().is_empty());
     assert_eq!(
         restarted
             .call("run.inspect", json!({"run_id":run_id}))
@@ -623,4 +580,109 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
         before["frontier"]
     );
     fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killed_server_stops_worker_and_resumes_its_durable_invocation_input() {
+    let fixture = Fixture::new();
+    let client = fixture.start().await;
+    let document = json!({"name":"worker-crash","entry":"worker","nodes":[{
+        "id":"worker","kind":"command","config":{"argv":["/bin/sh","-c",
+            "printf '%s' \"$$\" > started; while [ ! -f proceed ]; do sleep 0.05; done; printf finished"]}
+    }]});
+    let started = client
+        .call(
+            "flow.start",
+            json!({"document":document,"project":fixture.directory.path(),"message":"work"}),
+        )
+        .await
+        .unwrap();
+    let run_id = started["run_id"].as_str().unwrap();
+    let worker_pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(fixture.directory.path().join("started"))
+                .ok()
+                .and_then(|text| text.parse().ok())
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = client.call("system.status", json!({})).await.unwrap();
+    assert_eq!(status["server_id"], client.server_id());
+    assert_eq!(
+        status["data_dir"],
+        serde_json::to_value(&fixture.paths.root).unwrap()
+    );
+    let server_pid = i32::try_from(status["process_id"].as_u64().unwrap()).unwrap();
+    assert!(server_pid > 1 && server_pid != std::process::id() as i32);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(server_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while UnixStream::connect(&fixture.paths.socket).await.is_ok()
+            || nix::sys::signal::kill(nix::unistd::Pid::from_raw(worker_pid), None).is_ok()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("server death must close the worker's lifetime pipe and stop its process");
+    let restarted = fixture.start().await;
+    let dormant = restarted
+        .call("flow.status", json!({"run_id":run_id}))
+        .await
+        .unwrap();
+    assert_eq!(dormant["status"], "recoverable");
+    assert!(dormant["nodes"][0]["execution"].is_null());
+    std::fs::write(fixture.directory.path().join("proceed"), "").unwrap();
+    restarted
+        .call("flow.resume", json!({"run_id":run_id}))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let output = restarted
+                .call("flow.output", json!({"run_id":run_id,"node":"worker"}))
+                .await
+                .unwrap();
+            if output["publication_status"] == "committed" {
+                assert_eq!(output["result"], json!({"message":"finished"}));
+                break;
+            }
+            assert_ne!(output["publication_status"], "failed", "{output}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.stop().await;
+    // The harness uses core's invocation API directly; inspect durable evidence
+    // through that same API instead of retaining manager invocation wrappers.
+    let run_path = fixture.paths.run(run_id).unwrap();
+    let manifest: ontography_app::state::RunManifest =
+        ontography_app::persistence::read_json(&run_path.join("manifest.json")).unwrap();
+    let core_path = run_path.join(&manifest.core_path);
+    let workflow = manifest.workflow.unwrap();
+    let node = &workflow.state.identities.nodes["worker"];
+    let records = ontography::context::read_invocations(&core_path, Some(node), None, 100).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].status, ontography::InvocationStatus::Interrupted);
+    assert_eq!(records[1].status, ontography::InvocationStatus::Accepted);
+    let events = ontography::context::read_events(&core_path, records[0].id, 0, 100).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.operation == "initial_input")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state == ontography::ReceiptState::Sent)
+    );
 }

@@ -6,23 +6,16 @@ use crate::{AppError, Result, views};
 use serde_json::{Value, json};
 
 pub mod content;
-pub mod context;
 pub mod execution;
-pub mod facts;
-pub mod network;
-pub mod project;
 pub mod workflow;
 pub mod workspace;
 
 pub fn operations() -> Vec<Operation> {
     let mut operations = workflow::operations();
-    operations.extend(context::operations());
-    operations.extend(network::operations());
     operations.extend(execution::operations());
-    operations.extend(project::operations());
     operations.extend(content::operations());
     operations.extend(workspace::operations());
-    operations.extend(facts::operations());
+    operations.extend(crate::workflow::tools::operations());
     operations.extend(crate::sessions::operations());
     operations.extend(crate::session_runtime::operations());
     operations
@@ -35,7 +28,13 @@ pub async fn dispatch_scoped(
     args: &Value,
 ) -> Result<Value> {
     match app_session_id {
-        Some(id) => crate::sessions::dispatch_scoped(service, id, operation, args).await,
+        Some(id) => {
+            let mut result = crate::sessions::dispatch_scoped(service, id, operation, args).await?;
+            if operation == "system.hello" {
+                result["operations"] = serde_json::to_value(crate::catalog::manager_operations())?;
+            }
+            Ok(result)
+        }
         None => dispatch(service, operation, args).await,
     }
 }
@@ -45,15 +44,13 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         name if name.starts_with("session.") => {
             crate::sessions::dispatch(service, operation, args).await
         }
-        "network.wait" => network::wait(service, args).await,
         "inspect.wait_frontier" => workflow::dispatch_wait(service, args).await,
-        "run.export_facts" | "run.restore_facts" | "run.verify" => {
-            facts::dispatch(service, operation, args).await
+        name if name.starts_with("flow.") => {
+            crate::workflow::tools::dispatch(service, operation, args).await
         }
         name if name.starts_with("execution.") => {
             execution::dispatch(service, operation, args).await
         }
-        name if name.starts_with("project.") => project::dispatch(service, operation, args).await,
         "system.hello" => Ok(
             json!({"protocol_version":crate::protocol::VERSION,"server_id":service.server_id,"app_version":env!("CARGO_PKG_VERSION"),"core_version":ontography::VERSION,"app_build":crate::APP_BUILD,"core_build":crate::CORE_BUILD,"operations":crate::catalog::operations()}),
         ),
@@ -62,12 +59,8 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         ),
         "catalog.list" => {
             let mut catalog = service.registry.catalog();
-            catalog["validators"] = json!([{"id":"opaque_bytes","version":1,"description":"Accepts arbitrary bytes"},{"id":"utf8","version":1,"description":"Accepts valid UTF-8 bytes"}]);
-            catalog["deferred"] = json!([
-                "Codex worker executable adapter",
-                "semantic Message and Workspace union contracts",
-                "node MCP and worker transport receipts"
-            ]);
+            catalog["validators"] = json!([{"id":"opaque_bytes","version":1,"description":"Accepts arbitrary bytes"},{"id":"utf8","version":1,"description":"Accepts valid UTF-8 bytes"},{"id":"workflow_payload","version":1,"description":"Accepts a workflow message or native workspace package envelope"}]);
+            catalog["deferred"] = json!(["node MCP and worker transport receipts"]);
             Ok(catalog)
         }
         "graph.validate" | "graph.save" => {
@@ -95,7 +88,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         "graph.get" => Ok(serde_json::to_value(read_json::<GraphDeclaration>(
             &service.paths.definition(views::field(args, "revision")?)?,
         )?)?),
-        "graph.import" | "graph.export" => {
+        "graph.export" => {
             let project = std::path::Path::new(views::field(args, "project")?);
             if !project.is_absolute() || !project.is_dir() {
                 return Err(AppError::invalid(
@@ -108,21 +101,10 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             } else {
                 project.join(path)
             };
-            if operation == "graph.import" {
-                if std::fs::metadata(&path)?.len() > 16 * 1024 * 1024 {
-                    return Err(AppError::invalid("declaration file exceeds 16MiB"));
-                }
-                let declaration = GraphDeclaration::parse(&std::fs::read_to_string(&path)?)
-                    .map_err(|e| AppError::invalid(e.to_string()))?;
-                let revision = declaration.fingerprint().map_err(AppError::core)?;
-                write_json(&service.paths.definition(&revision)?, &declaration)?;
-                Ok(json!({"definition_id":declaration.id,"revision":revision,"validated":false}))
-            } else {
-                let declaration: GraphDeclaration =
-                    read_json(&service.paths.definition(views::field(args, "revision")?)?)?;
-                write_json(&path, &declaration)?;
-                Ok(json!({"path":path,"revision":views::field(args,"revision")?}))
-            }
+            let declaration: GraphDeclaration =
+                read_json(&service.paths.definition(views::field(args, "revision")?)?)?;
+            write_json(&path, &declaration)?;
+            Ok(json!({"path":path,"revision":views::field(args,"revision")?}))
         }
         "graph.list" => {
             let limit = views::limit(args)?;
@@ -205,16 +187,9 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
 }
 
 async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Result<Value> {
+    require_legacy_mutation(run, operation)?;
     match operation {
         "run.inspect" => run.inspect(views::limit(args)?).await,
-        "run.extend" => {
-            let extension = serde_json::from_value(
-                args.get("extension")
-                    .cloned()
-                    .ok_or_else(|| AppError::invalid("extension is required"))?,
-            )?;
-            run.extend_vocabulary(extension).await
-        }
         "run.resume" => {
             run.resume().await?;
             run.inspect(100).await
@@ -223,7 +198,6 @@ async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
             run.suspend(operation == "run.close").await?;
             Ok(run.summary())
         }
-        "rewrite.list" => Ok(json!({"productions":run.manifest.declaration.rewrites()})),
         "rewrite.prepare" => {
             let run_id = run.manifest.run_id.clone();
             let request: RewriteRequestDeclaration = serde_json::from_value(
@@ -237,28 +211,12 @@ async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .session
                 .prepare_rewrite(&request.compile())
                 .await
-                .map_err(transition_error)?;
+                .map_err(AppError::core)?
+                .map_err(rewrite_error)?;
             let summary = json!({"run_id":run_id,"plan_id":id,"revision":plan.revision().to_string(),"base_revision":plan.revision().to_string(),"graph":views::graph(plan.next_kernel()),"retirements":plan.retirements().iter().map(|(id,reason)|json!({"package_id":id.to_string(),"reason":format!("{reason:?}"),"reason_code":views::retirement_reason(*reason)})).collect::<Vec<_>>()});
-            live.rewrites.insert(
-                id,
-                RewriteHandle {
-                    plan,
-                    summary: summary.clone(),
-                },
-            );
+            live.rewrites.insert(id, RewriteHandle { plan });
             Ok(summary)
         }
-        "rewrite.inspect" => run
-            .live()?
-            .rewrites
-            .get(views::field(args, "plan_id")?)
-            .map(|p| p.summary.clone())
-            .ok_or_else(|| {
-                AppError::new(
-                    "unknown_handle",
-                    "rewrite plan is absent, consumed, expired, or belongs to another run",
-                )
-            }),
         "rewrite.discard" | "rewrite.commit" => {
             let live = run.live_mut()?;
             let handle = live
@@ -277,7 +235,8 @@ async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .session
                 .commit_rewrite(handle.plan)
                 .await
-                .map_err(transition_error)?;
+                .map_err(AppError::core)?
+                .map_err(rewrite_error)?;
             Ok(
                 json!({"revision":result.revision().to_string(),"retirements":result.retirements().iter().map(|(id,reason)|json!({"package_id":id.to_string(),"reason":format!("{reason:?}"),"reason_code":views::retirement_reason(*reason)})).collect::<Vec<_>>()}),
             )
@@ -285,25 +244,33 @@ async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         name if name.starts_with("workflow.") || name.starts_with("inspect.") => {
             workflow::dispatch(run, operation, args).await
         }
-        name if name.starts_with("context.") || name.starts_with("invocation.") => {
-            context::dispatch(run, operation, args).await
-        }
-        name if name.starts_with("network.") => network::dispatch(run, operation, args).await,
-        name if name.starts_with("content.") || name.starts_with("package.") => {
-            content::dispatch(run, operation, args).await
-        }
+        name if name.starts_with("content.") => content::dispatch(run, operation, args).await,
         name if name.starts_with("workspace.") => workspace::dispatch(run, operation, args).await,
         _ => Err(AppError::new("unknown_operation", operation)),
     }
 }
 
-fn transition_error(error: ontography::SessionTransitionError) -> AppError {
-    use ontography::SessionTransitionError as E;
+pub(crate) fn require_legacy_mutation(run: &ManagedRun, operation: &str) -> Result<()> {
+    if run.is_workflow()
+        && !matches!(operation, "run.resume" | "run.suspend" | "run.close")
+        && crate::catalog::operations()
+            .iter()
+            .any(|entry| entry.name == operation && entry.mutating)
+    {
+        return Err(AppError::new(
+            "workflow_owned",
+            "Change this run through its workflow document and flow tools.",
+        ));
+    }
+    Ok(())
+}
+
+fn rewrite_error(error: ontography::RewriteError) -> AppError {
+    use ontography::RewriteError as E;
     let code = match &error {
         E::Stale => "stale",
-        E::ForeignSession => "foreign_session",
-        E::Rewrite(_) | E::Transfer(_) | E::Retire(_) | E::Extension(_) => "rejected",
-        _ => "core_error",
+        E::StateMismatch => "foreign_session",
+        _ => "rejected",
     };
     AppError::new(code, error.to_string())
 }

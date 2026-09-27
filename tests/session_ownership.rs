@@ -59,13 +59,7 @@ async fn sessions_bind_once_and_scope_every_run_dispatch_path() {
             .len(),
         1
     );
-    for operation in [
-        "run.inspect",
-        "execution.list",
-        "run.export_facts",
-        "network.wait",
-        "inspect.wait_frontier",
-    ] {
+    for operation in ["run.inspect", "execution.list", "inspect.wait_frontier"] {
         let error = scoped(
             &service,
             &first,
@@ -91,7 +85,7 @@ async fn sessions_bind_once_and_scope_every_run_dispatch_path() {
         scoped(
             &service,
             &first,
-            "project.start",
+            "flow.start",
             json!({"project":other_project})
         )
         .await
@@ -155,6 +149,7 @@ async fn graph_initialization_recovers_reserved_identity_before_and_after_run_cr
                     serde_json::from_value(declaration()).unwrap(),
                 ),
                 input: None,
+                workflow: None,
             });
             service.sessions.save(&record).unwrap();
         }
@@ -627,4 +622,29 @@ async fn relocated_store_keeps_native_histories_owned_through_its_old_alias() {
         .code,
         "conversation_missing"
     );
+}
+
+#[tokio::test]
+async fn scoped_handshake_advertises_workflow_tools_without_raw_graph_operations() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
+    let session = create(&service, directory.path()).await;
+    let hello = scoped(&service, &session, "system.hello", json!({}))
+        .await
+        .unwrap();
+    let names = hello["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operation| operation["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"flow.start"));
+    assert!(names.contains(&"flow.edit"));
+    assert!(names.contains(&"session.conversation"));
+    assert!(!names.contains(&"graph.save"));
+    assert!(!names.contains(&"rewrite.commit"));
+    assert!(!names.contains(&"workflow.submit"));
+    assert!(!names.contains(&"invocation.begin"));
+    assert!(!names.contains(&"content.import_bytes"));
+    service.shutdown().await.unwrap();
 }

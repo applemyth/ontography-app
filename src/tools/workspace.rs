@@ -28,11 +28,6 @@ struct CheckoutInput {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HandleInput {
-    checkout_id: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CaptureInput {
     checkout_id: String,
     base: ContentId,
@@ -48,29 +43,6 @@ struct ReleaseInput {
     checkout_id: String,
     #[serde(default)]
     discard_changes: bool,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DiffInput {
-    base: ContentId,
-    new: ContentId,
-    #[serde(default)]
-    offset: usize,
-    #[serde(default = "default_limit")]
-    limit: usize,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GitDiffInput {
-    base: ContentId,
-    new: ContentId,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MergeInput {
-    base: ContentId,
-    ours: ContentId,
-    theirs: ContentId,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,14 +95,11 @@ async fn checkout_destination(run: &ManagedRun) -> Result<(String, PathBuf)> {
 }
 
 async fn retain_package(content: &ContentStore, package: &ResolvedPackage) -> Result<()> {
-    for id in package.dependencies() {
-        content.retain(id).await.map_err(AppError::core)?;
-    }
-    Ok(())
+    super::content::retain(content, &package.dependencies()).await
 }
 
 /// Persist roots only after the complete closure is retained. Replacing metadata
-/// never releases shared core tags: incidental pins can be released explicitly.
+/// never releases shared core tags that may belong to another checkpoint.
 async fn checkpoint(
     run: &mut ManagedRun,
     id: &str,
@@ -173,21 +142,7 @@ pub async fn dispatch(run: &mut ManagedRun, name: &str, args: &Value) -> Result<
                 json!({"checkouts":page(&checkouts,input.checkout_offset,input.limit)?,"checkpoints":page(&checkpoints,input.checkpoint_offset,input.limit)?}),
             )
         }
-        "workspace.checkpoint_delete" => {
-            let input: CheckpointInput = parse_args(run, args)?;
-            let checkpoint = run
-                .manifest
-                .checkpoints
-                .remove(&input.checkpoint_id)
-                .ok_or_else(|| AppError::new("not_found", "checkpoint does not exist"))?;
-            if let Err(error) = run.save() {
-                run.manifest
-                    .checkpoints
-                    .insert(input.checkpoint_id.clone(), checkpoint);
-                return Err(error);
-            }
-            Ok(json!({"deleted":input.checkpoint_id,"content_tags_released":false}))
-        }
+        // Internal workflow artifact paths; neither operation is registered.
         "workspace.import" => {
             let input: ImportInput = parse_args(run, args)?;
             let (content, workspace) = stores(run).await?;
@@ -225,19 +180,9 @@ pub async fn dispatch(run: &mut ManagedRun, name: &str, args: &Value) -> Result<
                     base: input.root,
                 },
             );
-            let stats = workspace.cache_stats().await;
             Ok(
-                json!({"checkout_id":id,"path":path,"base":input.root,"read_only_permissions":input.read_only,"materialization":{"file_exports":stats.file_exports.to_string(),"cloned_files":stats.cloned_files.to_string()}}),
+                json!({"checkout_id":id,"path":path,"base":input.root,"read_only_permissions":input.read_only}),
             )
-        }
-        "workspace.read_only" => {
-            let input: HandleInput = parse_args(run, args)?;
-            handle(run, &input.checkout_id)?
-                .checkout
-                .set_read_only()
-                .await
-                .map_err(workspace_error)?;
-            Ok(json!({"checkout_id":input.checkout_id,"read_only_permissions":true}))
         }
         "workspace.capture" | "workspace.checkpoint" => {
             let input: CaptureInput = parse_args(run, args)?;
@@ -309,81 +254,6 @@ pub async fn dispatch(run: &mut ManagedRun, name: &str, args: &Value) -> Result<
                 json!({"released":input.checkout_id,"checkpoint":saved,"discarded_changes":input.discard_changes}),
             )
         }
-        "workspace.diff" => {
-            let input: DiffInput = parse_args(run, args)?;
-            check_limit(input.limit)?;
-            let (_, workspace) = stores(run).await?;
-            let base = workspace.open(input.base).await.map_err(workspace_error)?;
-            let new = workspace.open(input.new).await.map_err(workspace_error)?;
-            let changes = workspace
-                .diff(&base, &new)
-                .into_iter()
-                .map(|c| json!({"path":c.path,"before":c.before,"after":c.after}))
-                .collect::<Vec<_>>();
-            page(&changes, input.offset, input.limit)
-        }
-        "workspace.git_diff" => {
-            let input: GitDiffInput = parse_args(run, args)?;
-            let (content, workspace) = stores(run).await?;
-            let base = workspace.open(input.base).await.map_err(workspace_error)?;
-            let new = workspace.open(input.new).await.map_err(workspace_error)?;
-            let diff = workspace
-                .git_diff(&base, &new)
-                .await
-                .map_err(workspace_error)?;
-            let content_id = content
-                .import_bytes(diff.as_bytes().to_vec())
-                .await
-                .map_err(AppError::core)?;
-            let mut end = diff.len().min(65536);
-            while !diff.is_char_boundary(end) {
-                end -= 1;
-            }
-            Ok(json!({"content_id":content_id,"text":&diff[..end],"truncated":end<diff.len()}))
-        }
-        "workspace.git_merge" => {
-            let input: MergeInput = parse_args(run, args)?;
-            let (content, workspace) = stores(run).await?;
-            let base = workspace.open(input.base).await.map_err(workspace_error)?;
-            let ours = workspace.open(input.ours).await.map_err(workspace_error)?;
-            let theirs = workspace
-                .open(input.theirs)
-                .await
-                .map_err(workspace_error)?;
-            retain_package(&content, &ours).await?;
-            let (id, path) = checkout_destination(run).await?;
-            let merged = workspace
-                .git_merge(&base, &ours, &theirs, &path)
-                .await
-                .map_err(workspace_error)?;
-            if let Some(package) = &merged.package {
-                retain_package(&content, package).await?;
-            }
-            let conflicts = merged
-                .conflicts
-                .iter()
-                .map(|c| json!({"path":c.path,"reason":c.reason}))
-                .collect::<Vec<_>>();
-            let conflict_count = conflicts.len();
-            let conflict_page = page(&conflicts, 0, default_limit())?;
-            let conflicts_content_id = content
-                .import_bytes(serde_json::to_vec(&conflicts)?)
-                .await
-                .map_err(AppError::core)?;
-            let root = merged.package.as_ref().map(ResolvedPackage::root);
-            // Core captures any later resolution relative to ours. A conflicted
-            // merge is a retained editing surface, never an accepted package.
-            run.live_mut()?.checkouts.insert(
-                id.clone(),
-                WorkspaceHandle {
-                    checkout: merged.checkout,
-                    base: input.ours,
-                },
-            );
-            Ok(
-                json!({"checkout_id":id,"path":path,"base":input.ours,"root":root,"conflict_count":conflict_count,"conflicts":conflict_page,"conflicts_content_id":conflicts_content_id,"clean":conflict_count==0}),
-            )
-        }
         _ => Err(AppError::new("unknown_operation", name)),
     }
 }
@@ -394,13 +264,6 @@ pub fn operations() -> Vec<Operation> {
     let limits = json!({"type":"integer","minimum":1,"maximum":1000});
     let offset = json!({"type":"integer","minimum":0});
     vec![
-        operation(
-            "workspace.import",
-            "Capture and retain a local directory as core packages. Stop its writers first; paths are absolute or relative to the run's project.",
-            json!({"path":text}),
-            &["path"],
-            true,
-        ),
         operation(
             "workspace.open",
             "Validate a package as a filesystem workspace and page its resolved entries.",
@@ -423,13 +286,6 @@ pub fn operations() -> Vec<Operation> {
             false,
         ),
         operation(
-            "workspace.read_only",
-            "Apply advisory read-only filesystem permissions. This is not an execution sandbox or publication policy.",
-            json!({"checkout_id":text}),
-            &["checkout_id"],
-            true,
-        ),
-        operation(
             "workspace.capture",
             "Capture edits against the explicit immutable base, retaining the entire package closure. Stop checkout writers first. Publication is a separate workflow operation.",
             json!({"checkout_id":text,"base":id}),
@@ -444,45 +300,10 @@ pub fn operations() -> Vec<Operation> {
             true,
         ),
         operation(
-            "workspace.restore",
-            "Materialize a saved checkpoint as a new retained checkout whose baseline is the checkpoint root.",
-            json!({"checkpoint_id":text}),
-            &["checkpoint_id"],
-            true,
-        ),
-        operation(
-            "workspace.checkpoint_delete",
-            "Remove saved checkpoint metadata and protection; existing content tags remain until explicitly released.",
-            json!({"checkpoint_id":text}),
-            &["checkpoint_id"],
-            true,
-        ),
-        operation(
             "workspace.release",
             "Remove a stopped checkout, saving a checkpoint first by default. discard_changes=true explicitly discards uncheckpointed edits.",
             json!({"checkout_id":text,"discard_changes":{"type":"boolean"}}),
             &["checkout_id"],
-            true,
-        ),
-        operation(
-            "workspace.diff",
-            "Page semantic file, directory, executable-bit, and symlink changes between immutable roots.",
-            json!({"base":id,"new":id,"offset":offset,"limit":limits}),
-            &["base", "new"],
-            false,
-        ),
-        operation(
-            "workspace.git_diff",
-            "Compute Git's textual diff, return a bounded preview and retain its complete bytes as content.",
-            json!({"base":id,"new":id}),
-            &["base", "new"],
-            true,
-        ),
-        operation(
-            "workspace.git_merge",
-            "Merge three immutable workspaces into a retained checkout. Conflicts return a null root; resolve them before explicit capture and publication.",
-            json!({"base":id,"ours":id,"theirs":id}),
-            &["base", "ours", "theirs"],
             true,
         ),
     ]
@@ -491,7 +312,7 @@ pub fn operations() -> Vec<Operation> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{content, workflow::tests::test_run};
+    use crate::tools::workflow::tests::test_run;
 
     #[tokio::test]
     async fn changed_workspaces_checkpoint_gc_suspend_and_restore() {
@@ -531,30 +352,6 @@ mod tests {
         std::fs::write(path.join("edit"), "after").unwrap();
         std::fs::remove_file(path.join("remove")).unwrap();
         std::fs::write(path.join("added"), "new").unwrap();
-        assert_eq!(
-            content::dispatch(
-                &mut run,
-                "content.release",
-                &json!({"run_id":run_id,"content_id":base})
-            )
-            .await
-            .unwrap_err()
-            .code,
-            "resource_in_use"
-        );
-        let mut forged_size = base.clone();
-        forged_size["size"] = json!(0);
-        assert_eq!(
-            content::dispatch(
-                &mut run,
-                "content.release",
-                &json!({"run_id":run_id,"content_id":forged_size})
-            )
-            .await
-            .unwrap_err()
-            .code,
-            "resource_in_use"
-        );
         let captured = dispatch(
             &mut run,
             "workspace.checkpoint",
@@ -571,32 +368,19 @@ mod tests {
             .unwrap()["package"]
             .clone();
         assert_eq!(keep_before, keep_after);
-        let changes = dispatch(
-            &mut run,
-            "workspace.diff",
-            &json!({"run_id":run_id,"base":base,"new":captured["root"]}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(changes["total"], 3);
-        let incidental = content::dispatch(
-            &mut run,
-            "content.import_bytes",
-            &json!({"run_id":run_id,"payload":"incidental"}),
-        )
-        .await
-        .unwrap()["content_id"]
-            .clone();
-        content::dispatch(
-            &mut run,
-            "content.release",
-            &json!({"run_id":run_id,"content_id":incidental}),
-        )
-        .await
-        .unwrap();
-        content::dispatch(&mut run, "content.gc", &json!({"run_id":run_id}))
-            .await
-            .unwrap();
+        let paths = captured["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"added"));
+        assert!(!paths.contains(&"remove"));
+        let store = run.live().unwrap().session.content_store().await.unwrap();
+        let incidental = store.import_bytes(b"incidental".to_vec()).await.unwrap();
+        store.release(incidental).await.unwrap();
+        store.collect_garbage().await.unwrap();
+        drop(store);
         run.suspend(false).await.unwrap();
         assert!(!path.exists());
         run.resume().await.unwrap();
@@ -610,6 +394,7 @@ mod tests {
             manifest,
             directory: dir.path().to_owned(),
             live: None,
+            recovery_checkouts: std::collections::BTreeMap::new(),
             registry: std::sync::Arc::new(crate::registry::ImplementationRegistry::default()),
         };
         run.resume().await.unwrap();
@@ -633,62 +418,6 @@ mod tests {
         assert_eq!(
             std::fs::read_link(restored.join("link")).unwrap(),
             PathBuf::from("keep")
-        );
-        assert_eq!(
-            content::dispatch(
-                &mut run,
-                "content.release",
-                &json!({"run_id":run_id,"content_id":captured["root"]})
-            )
-            .await
-            .unwrap_err()
-            .code,
-            "resource_in_use"
-        );
-    }
-
-    #[tokio::test]
-    async fn conflicting_git_merge_retains_editing_surface_without_a_package() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        std::fs::create_dir(&source).unwrap();
-        let mut run = test_run(dir.path());
-        let run_id = run.manifest.run_id.clone();
-        let mut roots = Vec::new();
-        for text in ["base\n", "ours\n", "theirs\n"] {
-            std::fs::write(source.join("file"), text).unwrap();
-            roots.push(
-                dispatch(
-                    &mut run,
-                    "workspace.import",
-                    &json!({"run_id":run_id,"path":"source"}),
-                )
-                .await
-                .unwrap()["root"]
-                    .clone(),
-            );
-        }
-        let merged = dispatch(
-            &mut run,
-            "workspace.git_merge",
-            &json!({"run_id":run_id,"base":roots[0],"ours":roots[1],"theirs":roots[2]}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(merged["clean"], false);
-        assert!(merged["root"].is_null());
-        assert_eq!(merged["conflicts"]["items"][0]["path"], "file");
-        let path = PathBuf::from(merged["path"].as_str().unwrap());
-        assert!(
-            std::fs::read_to_string(path.join("file"))
-                .unwrap()
-                .contains("<<<<<<<")
-        );
-        assert!(
-            run.live()
-                .unwrap()
-                .checkouts
-                .contains_key(merged["checkout_id"].as_str().unwrap())
         );
     }
 }

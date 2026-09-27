@@ -1,32 +1,27 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type, type TSchema } from "typebox";
+import type { TSchema } from "typebox";
 import { BridgeClient, BridgeError, object, type Arguments, type CallResult, type Hello, type Receipt } from "./client.ts";
 
-export const DEFAULT_GROUPS = ["system", "catalog", "graph", "run", "rewrite", "operation"];
-export const BOOTSTRAP_TOOL = "ontography_tools";
 const MAX_MODEL_RESULT = 20_000;
 
 export interface ManagementScope {
   sessionId: string;
   ensureReady(): Promise<void>;
-  saveGroups(groups: string[]): Promise<void>;
-  toolGroups?(): string[];
 }
 
-/** Native lifecycle/view operations are invoked by hooks, never by the model. */
-function visibleInSession(operation: string): boolean {
-  if (operation.startsWith("terminal.") || operation.startsWith("server.")) return false;
-  if (operation.startsWith("session.")) return operation === "session.context" || operation === "session.inspect";
-  return true;
+/** The manager has one workflow language; native hooks own lifecycle transport. */
+function visibleToManager(operation: string): boolean {
+  return operation.startsWith("flow.") || operation === "session.context" ||
+    operation === "session.inspect" || operation === "operation.get";
 }
 
 function scopedParameters(parameters: Arguments): TSchema {
   const result = structuredClone(parameters);
   if (object(result.properties) && object(result.properties.run_id)) {
     result.properties.run_id.description = "Defaults to this Ontography session's graph run. An explicit run ID must match that run.";
-    if (Array.isArray(result.required)) result.required = result.required.filter((key) => key !== "run_id");
   }
+  if (Array.isArray(result.required)) result.required = result.required.filter((key) => !["run_id", "project", "session_id"].includes(String(key)));
   return result as unknown as TSchema;
 }
 
@@ -57,63 +52,23 @@ export class ManagementTools {
   private readonly client: BridgeClient;
   private readonly scope: ManagementScope | undefined;
   private hello: Hello | undefined;
-  private groups = new Set(DEFAULT_GROUPS);
-  private registered = new Set<string>();
 
   constructor(pi: ExtensionAPI, client: BridgeClient, scope?: ManagementScope) {
     this.pi = pi;
     this.client = client;
     this.scope = scope;
-    if (scope !== undefined) this.groups.add("session");
   }
 
-  registerBootstrap(): void {
-    this.pi.registerTool({
-      name: BOOTSTRAP_TOOL,
-      label: "Ontography capabilities",
-      description: "List Ontography server capabilities and activate their typed tool groups. Call without groups to inspect; supply groups to make their tools available. Does not execute graph operations.",
-      promptSnippet: "Discover graph/run, vocabulary extension, workflow retirement, inspection, content, and context tools; activate their groups when needed.",
-      parameters: Type.Object({ groups: Type.Optional(Type.Array(Type.String(), { description: "Capability groups to activate, added to the current selection." })) }, { additionalProperties: false }),
-      executionMode: "sequential",
-      execute: async (_callId, args) => {
-        try {
-          await this.scope?.ensureReady();
-          await this.refresh(this.scope?.toolGroups?.());
-          if (args.groups !== undefined) {
-            const available = new Set(this.hello!.operations.map((operation) => operation.group));
-            for (const group of args.groups) if (!available.has(group)) throw new Error(`Unknown capability group ${JSON.stringify(group)}. Available: ${[...available].sort().join(", ")}`);
-            const groups = [...new Set([...this.groups, ...args.groups])];
-            await this.scope?.saveGroups(groups);
-            this.groups = new Set(groups);
-            this.activate();
-            // Legacy clients retain conversation-local preferences. Bound managers use
-            // app-session preferences so /new does not reset their tool selection.
-            if (this.scope === undefined) this.pi.appendEntry("ontography_tool_groups", { groups: [...this.groups] });
-          }
-          return modelResult({
-            server_id: this.hello!.server_id,
-            groups: [...new Set(this.hello!.operations.map((operation) => operation.group))].sort().map((group) => ({
-              name: group,
-              active: this.groups.has(group),
-              tools: this.hello!.operations.filter((operation) => operation.group === group).map((operation) => ({ name: toolName(operation.name), operation: operation.name, description: operation.description })),
-            })),
-          });
-        } catch (error) { throw toolError(error); }
-      },
-    });
-  }
-
-  async refresh(groups?: string[]): Promise<Hello> {
+  async refresh(): Promise<Hello> {
     const connected = await this.client.connect();
-    const hello = this.scope === undefined ? connected : { ...connected, operations: connected.operations.filter((operation) => visibleInSession(operation.name)) };
-    if (groups !== undefined) this.groups = new Set([...DEFAULT_GROUPS, ...(this.scope === undefined ? [] : ["session"]), ...groups]);
-    const names = new Set<string>([BOOTSTRAP_TOOL]);
+    const hello = { ...connected, operations: connected.operations.filter((operation) => visibleToManager(operation.name)) };
+    const names = new Set<string>();
     for (const operation of hello.operations) {
       const name = toolName(operation.name);
       if (names.has(name)) throw new BridgeError("protocol_error", `Operation ${operation.name} collides with another Pi tool name.`);
       names.add(name);
     }
-    const nativeSelection = this.pi.getActiveTools().filter((name) => !this.registered.has(name) && name !== BOOTSTRAP_TOOL);
+    const nativeSelection = this.pi.getActiveTools().filter((name) => !name.startsWith("ontography_"));
     for (const operation of hello.operations) {
       const name = toolName(operation.name);
       this.pi.registerTool({
@@ -146,16 +101,15 @@ export class ManagementTools {
       });
     }
     this.hello = hello;
-    this.registered = new Set([...this.registered, ...names]);
     this.activate(nativeSelection);
     return hello;
   }
 
   private activate(nativeSelection?: string[]): void {
-    const native = nativeSelection ?? this.pi.getActiveTools().filter((name) => !this.registered.has(name));
+    const native = nativeSelection ?? this.pi.getActiveTools().filter((name) => !name.startsWith("ontography_"));
     this.pi.setActiveTools([...new Set([
-      ...native, BOOTSTRAP_TOOL,
-      ...(this.hello?.operations.filter((operation) => this.groups.has(operation.group)).map((operation) => toolName(operation.name)) ?? []),
+      ...native,
+      ...(this.hello?.operations.map((operation) => toolName(operation.name)) ?? []),
     ])]);
   }
 }

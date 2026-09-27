@@ -83,7 +83,8 @@ async fn foreground_signals_and_lost_launcher_lease_preserve_shell_and_reap_pi()
     let server = Server::new(Paths::initialize(directory.path().join("store")).unwrap()).unwrap();
     let pi = directory.path().join("pi-fixture");
     let interrupted = directory.path().join("interrupted");
-    std::fs::write(&pi,format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.85.1; exit; fi\ntrap 'printf interrupted > {}' INT\nprintf 'ready\\n'\nwhile :; do IFS= read -r line || continue; [ \"$line\" = /quit ] && exit 0; done\n",interrupted.display())).unwrap();
+    let ready = directory.path().join("ready");
+    std::fs::write(&pi,format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.85.1; exit; fi\ntrap 'printf interrupted > {}' INT\nprintf ready > {}\nprintf 'ready\\n'\nwhile :; do IFS= read -r line || continue; [ \"$line\" = /quit ] && exit 0; done\n",interrupted.display(),ready.display())).unwrap();
     std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o700)).unwrap();
     let session = call(
         &server,
@@ -99,6 +100,14 @@ async fn foreground_signals_and_lost_launcher_lease_preserve_shell_and_reap_pi()
         .unwrap();
     let running = wait_mode(&server, id, "pi").await;
     let (mut writer, drain) = attach_terminal(&server, id, &running).await;
+    // Process registration precedes the fixture installing its signal handler.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !ready.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     input(&mut writer, &running, b"\x03").await;
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while !interrupted.exists() {

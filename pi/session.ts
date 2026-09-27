@@ -132,20 +132,6 @@ export class SessionBinding implements ManagementScope {
     await this.register();
   }
 
-  async saveGroups(groups: string[]): Promise<void> {
-    await this.ensureReady();
-    const result = (await this.client.call("session.preferences", { session_id: this.sessionId, preferences: { tool_groups: groups } })).result;
-    if (!object(result) || !object(result.preferences) || !Array.isArray(result.preferences.tool_groups) ||
-        result.preferences.tool_groups.some((group) => typeof group !== "string")) {
-      throw new BridgeError("session_binding", "The server did not confirm saved management tool preferences.");
-    }
-    if (this.context !== undefined) this.context.session.pi.preferences = result.preferences;
-  }
-
-  toolGroups(): string[] {
-    return (this.context?.session.pi.preferences.tool_groups as string[] | undefined) ?? [];
-  }
-
   disconnect(): void {
     this.disposed = true;
     this.readyServer = undefined;
@@ -166,7 +152,6 @@ function graphContext(context: SessionContext): string {
     (context.session.run_id === null ? "Graph initialization is pending. Starting a run binds it to this session." : `Bound graph run: ${context.session.run_id}.`) +
     " Pi /new, /resume, /fork, /clone, and /tree change conversation context within this same app session. They do not create, copy, or rewind the graph. " +
     "Graph tools default to the bound run; explicit targets must match it. Current server state supersedes older conversation descriptions. " +
-    "Ontography tool-group preferences belong to the app session; native Pi model/thinking history retains its conversation semantics. " +
     `Do not replay past mutations when resuming.\nCurrent graph inspection: ${preview}`;
 }
 
@@ -174,8 +159,8 @@ export function registerSessionHooks(pi: ExtensionAPI, client: BridgeClient, too
   pi.on("session_start", async (_event, ctx) => {
     try {
       registerTerminalPresentation(ctx);
-      const context = await binding.activate(ctx);
-      await tools.refresh((context.session.pi.preferences.tool_groups as string[] | undefined) ?? []);
+      await binding.activate(ctx);
+      await tools.refresh();
       if (ctx.hasUI) ctx.ui.setStatus("ontography", `Ontography · ${binding.sessionId.slice(0, 8)}`);
     } catch (error) { notify(ctx, error); }
   });
@@ -197,10 +182,14 @@ export function registerSessionHooks(pi: ExtensionAPI, client: BridgeClient, too
 
   pi.on("before_agent_start", async (event, ctx) => {
     applyTerminalCapabilities();
-    try { return { systemPrompt: event.systemPrompt + graphContext(await binding.refreshContext()) }; }
+    try {
+      const context = await binding.refreshContext();
+      await tools.refresh();
+      return { systemPrompt: event.systemPrompt + graphContext(context) };
+    }
     catch (error) {
       notify(ctx, error);
-      return { systemPrompt: `${event.systemPrompt}\n\nOntography session context is unavailable. Do not infer a current run from conversation history. Use ontography_tools to reconnect before any graph action.` };
+      return { systemPrompt: `${event.systemPrompt}\n\nOntography session context is unavailable. Do not infer a current run from conversation history. Reattach the session if reconnection continues to fail.` };
     }
   });
 

@@ -6,7 +6,6 @@ pub mod client;
 pub mod declarations;
 pub mod definition;
 pub mod error;
-pub mod extensions;
 pub mod launcher;
 pub mod logging;
 pub mod managed_shell;
@@ -23,6 +22,7 @@ pub mod terminal_client;
 pub mod tools;
 pub mod ui;
 pub mod views;
+pub mod workflow;
 
 pub use error::{AppError, Result};
 

@@ -5,7 +5,7 @@ use crate::state::{ManagedRun, Service};
 use crate::{AppError, Result, persistence, views};
 use ontography::{
     Activation, ActivationId, ActivationProposal, ContentId, Emission, OutputAuthority,
-    PendingFrontier, SessionSnapshot, Trigger,
+    PackageRecord, PendingFrontier, Retirement, SessionSnapshot, Trigger,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -277,9 +277,10 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .session
                 .transfer(package_id, &input.edge_id)
                 .await
-                .map_err(transition_error)?;
+                .map_err(AppError::core)?
+                .map_err(|error| AppError::new("rejected", error.to_string()))?;
             Ok(
-                json!({"package_id":package_id.to_string(),"edge_id":delivery.edge_id(),"source":delivery.source(),"receiver":delivery.receiver()}),
+                json!({"package_id":package_id.to_string(),"edge_id":delivery.edge_id(),"receiver":delivery.receiver()}),
             )
         }
         "workflow.retire" => {
@@ -295,9 +296,19 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .session
                 .retire(id, evidence)
                 .await
-                .map_err(transition_error)?;
+                .map_err(AppError::core)?
+                .map_err(|error| AppError::new("rejected", error.to_string()))?;
+            let history = run
+                .live()?
+                .session
+                .package_history(id)
+                .await
+                .map_err(AppError::core)?
+                .ok_or_else(|| {
+                    AppError::new("invalid_state", "Retired package history is missing")
+                })?;
             Ok(
-                json!({"package_id":id.to_string(),"disposition":"retired","revision":retirement.revision().to_string(),"retirement":views::retirement(&retirement)}),
+                json!({"package_id":id.to_string(),"disposition":"retired","revision":retirement.revision().to_string(),"retirement":retirement_view(&retirement,history.package())}),
             )
         }
         "inspect.frontier" => {
@@ -380,20 +391,22 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .try_snapshot()
                 .await
                 .map_err(AppError::core)?;
-            let mut records = snapshot
-                .state()
-                .retirements()
+            let all_retirements = snapshot.state().retirements();
+            let mut records = all_retirements
                 .iter()
                 .filter(|(id, _)| after.is_none_or(|after| **id > after));
             let retirements = records
                 .by_ref()
                 .take(input.limit)
                 .map(|(id, record)| {
-                    let mut value = views::retirement(record);
+                    let package = snapshot.state().package(*id).ok_or_else(|| {
+                        AppError::new("invalid_state", "Retired package history is missing")
+                    })?;
+                    let mut value = retirement_view(record, package);
                     value["package_id"] = json!(id.to_string());
-                    value
+                    Ok(value)
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             let next_after = if records.next().is_some() {
                 retirements
                     .last()
@@ -464,24 +477,15 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
     }
 }
 
-fn transition_error(error: ontography::SessionTransitionError) -> AppError {
-    match error {
-        ontography::SessionTransitionError::Transfer(_)
-        | ontography::SessionTransitionError::Rewrite(_)
-        | ontography::SessionTransitionError::Retire(_)
-        | ontography::SessionTransitionError::Extension(_) => {
-            AppError::new("rejected", error.to_string())
-        }
-        ontography::SessionTransitionError::Stale => AppError::new("stale", error.to_string()),
-        ontography::SessionTransitionError::ForeignSession => {
-            AppError::new("foreign_handle", error.to_string())
-        }
-        _ => AppError::core(error),
-    }
-}
-
 fn frontier_view(frontier: &PendingFrontier) -> Value {
     json!({"revision":frontier.revision().to_string(),"packages":frontier.packages().iter().map(|(id,p)|views::package(*id,p)).collect::<Vec<_>>()})
+}
+
+fn retirement_view(retirement: &Retirement, package: &PackageRecord) -> Value {
+    let mut view = views::retirement(retirement);
+    view["holder"] = json!(package.holder());
+    view["phase"] = json!(views::phase(package.phase()));
+    view
 }
 
 fn activation_view(id: ActivationId, activation: &Activation, preview_bytes: usize) -> Value {
@@ -507,15 +511,30 @@ fn snapshot_view(run: &ManagedRun, snapshot: &SessionSnapshot) -> Result<Value> 
         .iter()
         .map(|(id, p)| views::package_state(state, *id, p))
         .collect::<Result<Vec<_>>>()?;
+    let retirements = state
+        .retirements()
+        .iter()
+        .map(|(id, record)| {
+            let package = state.package(*id).ok_or_else(|| {
+                AppError::new("invalid_state", "Retired package history is missing")
+            })?;
+            let mut value = retirement_view(record, package);
+            value["package_id"] = json!(id.to_string());
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(
         json!({"format":"ontography.workflow_snapshot","version":1,"run_id":run.manifest.run_id,
         "declaration":run.manifest.declaration,"revision":snapshot.revision().to_string(),"admission":views::status(snapshot.status()),
-        "current_vocabulary":crate::extensions::vocabulary(kernel),"extensions":run.extension_summary(),
-        "current_graph":views::graph(kernel),"current_node_definitions":kernel.node_definitions(),"current_edge_definitions":kernel.edge_definitions(),
-        "current_roots":kernel.roots(),"current_authority_transitions":kernel.authority_transitions(),"current_fingerprint":kernel.fingerprint().to_string(),
+        "current_graph":views::graph(kernel),
+        "current_node_definitions":kernel.node_definitions().iter().map(|n|json!({"node_id":n.node_id(),"types":n.types(),"result_contract":n.result_contract(),"ingress_mode":match n.ingress_mode(){ontography::IngressMode::Any=>"any",ontography::IngressMode::All=>"all"}})).collect::<Vec<_>>(),
+        "current_edge_definitions":kernel.edge_definitions().iter().map(|e|json!({"edge_id":e.edge_id(),"types":e.types(),"source_requirements":e.source_requirements(),"target_requirements":e.target_requirements(),"package_contract":e.package_contract(),"authority_tags":e.authority_tags().iter().map(|t|t.id()).collect::<Vec<_>>(),"authority_match":match e.authority_match(){ontography::AuthorityMatch::AnyOf=>"any_of",ontography::AuthorityMatch::AllOf=>"all_of"}})).collect::<Vec<_>>(),
+        "current_roots":kernel.roots().iter().map(|r|json!({"node_id":r.node_id(),"ceiling":r.ceiling().tags().map(|t|t.id()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+        "current_authority_transitions":kernel.authority_transitions().iter().map(|r|json!({"node_id":r.node_id(),"from":r.from().tags().map(|t|t.id()).collect::<Vec<_>>(),"to":r.to().tags().map(|t|t.id()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+        "current_fingerprint":kernel.fingerprint().to_string(),
         "activations":state.activations().iter().map(|(id,a)|activation_view(*id,a,usize::MAX)).collect::<Vec<_>>(),
         "packages":packages,
-        "retirements":state.retirements().iter().map(|(id,record)|{let mut value=views::retirement(record);value["package_id"]=json!(id.to_string());value}).collect::<Vec<_>>(),
+        "retirements":retirements,
         "activation_content":snapshot.activation_content().iter().map(|(id,contents)|json!({"activation_id":id.to_string(),"contents":contents})).collect::<Vec<_>>(),
         "artifact_bytes_included":false,"context_records_included":false}),
     )
@@ -695,9 +714,11 @@ pub(crate) mod tests {
                 status: "active".into(),
                 created_at: 0,
                 checkpoints: BTreeMap::new(),
+                workflow: None,
             },
             directory: directory.to_owned(),
             live: Some(LiveRun::new(runtime, session)),
+            recovery_checkouts: BTreeMap::new(),
             registry: std::sync::Arc::new(crate::registry::ImplementationRegistry::default()),
         }
     }

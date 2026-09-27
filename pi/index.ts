@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { BridgeClient, object } from "./client.ts";
+import { BridgeClient } from "./client.ts";
 import { ManagementTools } from "./tools.ts";
 import { registerSessionHooks, SessionBinding } from "./session.ts";
 import { applyTerminalCapabilities } from "./terminal.ts";
@@ -19,7 +19,6 @@ export default function ontography(pi: ExtensionAPI): void {
     ...(sessionId === undefined ? {} : { appSessionId: sessionId }) });
   const binding = sessionId === undefined ? undefined : new SessionBinding(client, sessionId);
   const tools = new ManagementTools(pi, client, binding);
-  tools.registerBootstrap();
 
   if (binding !== undefined) {
     registerSessionHooks(pi, client, tools, binding);
@@ -27,20 +26,11 @@ export default function ontography(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    const entries = ctx.sessionManager.getBranch();
-    let groups: string[] | undefined;
-    for (const entry of entries) {
-      if (entry.type === "custom" && entry.customType === "ontography_tool_groups" && object(entry.data) &&
-          Array.isArray(entry.data.groups) && entry.data.groups.every((value: unknown) => typeof value === "string")) {
-        groups = entry.data.groups as string[];
-      }
-    }
     try {
-      const hello = await tools.refresh(groups);
+      const hello = await tools.refresh();
       if (ctx.hasUI) ctx.ui.setStatus("ontography", `Ontography · ${hello.server_id.slice(0, 8)}`);
     } catch (error) {
-      if (ctx.hasUI) ctx.ui.notify(`Ontography connection failed: ${String(error)}. Use ontography_tools to reconnect.`, "error");
-      // Bootstrap remains available in interactive, RPC, JSON, and print modes.
+      if (ctx.hasUI) ctx.ui.notify(`Ontography connection failed: ${String(error)}. Reattach the session to reconnect.`, "error");
     }
   });
 

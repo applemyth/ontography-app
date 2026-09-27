@@ -152,6 +152,8 @@ pub enum ValidatorKind {
     OpaqueBytes,
     /// Accept precisely byte sequences that are valid UTF-8, including empty text.
     Utf8,
+    /// The app's explicit message or native workspace package envelope.
+    WorkflowPayload,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -182,6 +184,9 @@ impl ContractDeclaration {
                     ValidatorKind::Utf8 => std::str::from_utf8(bytes)
                         .map(|_| ())
                         .map_err(|error| ContractViolation::new(format!("invalid UTF-8: {error}"))),
+                    ValidatorKind::WorkflowPayload => {
+                        crate::workflow::document::validate_payload(bytes)
+                    }
                 },
             ),
         )

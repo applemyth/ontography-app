@@ -66,6 +66,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
     let run_id = views::field(args, "run_id")?;
     let run = service.run(run_id).await?;
     let mut run = run.lock().await;
+    super::require_legacy_mutation(&run, operation)?;
     if operation == "execution.launch" {
         let implementation = views::field(args, "implementation")?;
         let version = views::field(args, "version")?;

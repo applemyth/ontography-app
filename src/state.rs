@@ -4,8 +4,8 @@ use crate::definition::RunDefinition;
 use crate::persistence::{Paths, read_json, write_json};
 use crate::{AppError, Result, views};
 use ontography::{
-    ContentId, ExecutionHandle, ExecutionHost, InvocationHandle, ProposalRuntime, SessionHandle,
-    SessionRewrite, SessionStatus,
+    ContentId, ExecutionHandle, ExecutionHost, ProposalRuntime, SessionHandle, SessionRewrite,
+    SessionStatus,
     workspace::{Checkout, WorkspaceStore},
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,9 @@ pub struct RunManifest {
     pub created_at: u64,
     #[serde(default)]
     pub checkpoints: BTreeMap<String, Checkpoint>,
+    /// Original workflow and input, pinned before creating core storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<crate::workflow::runtime::InitialWorkflow>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,7 +53,6 @@ pub struct WorkspaceHandle {
 
 pub struct RewriteHandle {
     pub plan: SessionRewrite,
-    pub summary: Value,
 }
 
 pub struct LiveRun {
@@ -60,12 +62,10 @@ pub struct LiveRun {
     pub host: ExecutionHost,
     pub executions: BTreeMap<String, ExecutionHandle>,
     pub rewrites: BTreeMap<String, RewriteHandle>,
-    pub invocations: BTreeMap<String, InvocationHandle>,
     pub checkouts: BTreeMap<String, WorkspaceHandle>,
-    pub providers: BTreeMap<String, crate::tools::network::Provider>,
-    pub downloads: BTreeMap<String, crate::tools::network::Download>,
     pub bindings: Vec<Value>,
     pub suspension_error: Option<AppError>,
+    pub workers: BTreeMap<String, crate::workflow::runtime::Worker>,
 }
 
 impl LiveRun {
@@ -77,12 +77,10 @@ impl LiveRun {
             session,
             executions: BTreeMap::new(),
             rewrites: BTreeMap::new(),
-            invocations: BTreeMap::new(),
             checkouts: BTreeMap::new(),
-            providers: BTreeMap::new(),
-            downloads: BTreeMap::new(),
             bindings: Vec::new(),
             suspension_error: None,
+            workers: BTreeMap::new(),
         }
     }
 
@@ -102,11 +100,9 @@ impl LiveRun {
             executions,
             bindings,
             rewrites: BTreeMap::new(),
-            invocations: BTreeMap::new(),
             checkouts: BTreeMap::new(),
-            providers: BTreeMap::new(),
-            downloads: BTreeMap::new(),
             suspension_error: None,
+            workers: BTreeMap::new(),
         }
     }
 
@@ -127,6 +123,7 @@ impl LiveRun {
             application.suspend().await;
         }
         self.executions.clear();
+        self.workers.clear();
         for binding in &mut self.bindings {
             binding["status"] = json!("stopped");
         }
@@ -138,9 +135,15 @@ pub struct ManagedRun {
     pub directory: PathBuf,
     pub live: Option<LiveRun>,
     pub registry: Arc<crate::registry::ImplementationRegistry>,
+    /// Preserve user checkouts while a faulted core owner is reopened.
+    pub recovery_checkouts: BTreeMap<String, WorkspaceHandle>,
 }
 
 impl ManagedRun {
+    pub fn is_workflow(&self) -> bool {
+        self.manifest.workflow.is_some()
+    }
+
     pub fn live(&self) -> Result<&LiveRun> {
         self.live.as_ref().ok_or_else(|| {
             AppError::new(
@@ -208,7 +211,6 @@ impl ManagedRun {
 
     pub async fn inspect(&self, limit: usize) -> Result<Value> {
         let mut result = self.summary();
-        result["extensions"] = self.extension_summary();
         if let Some(live) = &self.live {
             let overview = live
                 .session
@@ -227,37 +229,38 @@ impl ManagedRun {
                 .collect();
             result["revision"] = json!(overview.revision().to_string());
             result["graph"] = views::graph(overview.kernel());
-            result["vocabulary"] = crate::extensions::vocabulary(overview.kernel());
             result["frontier"] = json!({"counts":counts,
                 "received":overview.received().iter().map(|(id,p)|views::package(*id,p)).collect::<Vec<_>>(),
                 "outbound":overview.outbound().iter().map(|(id,p)|views::package(*id,p)).collect::<Vec<_>>()});
             result["executions"] = json!(live.executions.iter().map(|(id,h)|json!({"execution_id":id,"node_id":h.node_id(),"status":format!("{:?}",h.status()).to_lowercase()})).collect::<Vec<_>>());
             result["bindings"] = json!(live.bindings);
             result["suspension_error"] = json!(live.suspension_error);
-            result["resources"] = json!({"rewrites":live.rewrites.keys().collect::<Vec<_>>(),"invocations":live.invocations.keys().collect::<Vec<_>>(),"checkouts":live.checkouts.iter().map(|(id,h)|json!({"checkout_id":id,"path":h.checkout.path(),"base":h.base})).collect::<Vec<_>>()});
+            result["resources"] = json!({"rewrites":live.rewrites.keys().collect::<Vec<_>>(),"checkouts":live.checkouts.iter().map(|(id,h)|json!({"checkout_id":id,"path":h.checkout.path(),"base":h.base})).collect::<Vec<_>>()});
         }
         Ok(result)
     }
 
     pub async fn resume(&mut self) -> Result<()> {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.session.status() == SessionStatus::Faulted)
+        {
+            let live = self.live.as_mut().expect("faulted owner exists");
+            live.stop_executions().await;
+            self.recovery_checkouts.append(&mut live.checkouts);
+            self.live = None;
+        }
         if self.live.is_some() {
+            if self.is_workflow() {
+                return crate::workflow::runtime::resume(self).await;
+            }
             return Ok(());
         }
         self.validate_metadata()?;
         if let RunDefinition::Application(declaration) = &self.manifest.declaration {
-            self.recover_extension_intent()?;
             let compiled = declaration.compile(&self.registry, &self.manifest.project)?;
-            let kernel = self.extend_compiled_kernel(compiled.kernel)?;
-            let application = if kernel.fingerprint() == compiled.application.kernel().fingerprint()
-            {
-                compiled.application
-            } else {
-                compiled
-                    .application
-                    .with_vocabulary_extension(kernel)
-                    .map_err(AppError::core)?
-            };
-            match application.resume(self.core_path()?).await {
+            match compiled.application.resume(self.core_path()?).await {
                 Ok(application) => {
                     self.live = Some(LiveRun::from_application(application));
                     self.manifest.status = "active".into();
@@ -300,13 +303,34 @@ impl ManagedRun {
             return Ok(());
         }
         self.validate_metadata()?;
-        let (runtime, session) = self.open_extended()?;
+        let compiled = self
+            .manifest
+            .declaration
+            .compile(&self.registry, &self.manifest.project)?;
+        if !self.is_workflow() {
+            self.registry.validate_bindings(
+                self.manifest.declaration.execution_bindings(),
+                &compiled.kernel,
+            )?;
+        }
+        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let session = runtime
+            .open_persistent(self.core_path()?)
+            .map_err(AppError::core)?;
         self.live = Some(LiveRun::new(runtime, session));
+        self.live
+            .as_mut()
+            .expect("opened")
+            .checkouts
+            .append(&mut self.recovery_checkouts);
         self.manifest.status = "active".into();
         self.save()
     }
 
     async fn launch_bindings(&mut self) -> Result<()> {
+        if self.is_workflow() {
+            return crate::workflow::runtime::resume(self).await;
+        }
         let launched = self
             .registry
             .launch_bindings(
@@ -343,16 +367,6 @@ impl ManagedRun {
         }
         let live = self.live.as_mut().expect("resume established ownership");
         live.stop_executions().await;
-        for download in live.downloads.values() {
-            download.handle.cancel();
-        }
-        for (_, download) in std::mem::take(&mut live.downloads) {
-            let _ = download.handle.finish().await;
-            download.endpoint.close().await;
-        }
-        for (_, provider) in std::mem::take(&mut live.providers) {
-            provider.handle.shutdown().await.map_err(AppError::core)?;
-        }
         let content = live.session.content_store().await.map_err(AppError::core)?;
         let workspace =
             WorkspaceStore::new(content.clone(), self.directory.join("workspace-cache"));
@@ -363,9 +377,12 @@ impl ManagedRun {
                 .await
                 .map_err(AppError::core)?;
             let dependencies = captured.dependencies();
-            for &id in &dependencies {
-                content.retain(id).await.map_err(AppError::core)?;
-            }
+            let staged = content.stage_imports();
+            staged
+                .protect(&dependencies)
+                .await
+                .map_err(AppError::core)?;
+            staged.retain().await.map_err(AppError::core)?;
             checkpoints.insert(
                 id.clone(),
                 Checkpoint {
@@ -388,10 +405,6 @@ impl ManagedRun {
         }
         .into();
         write_json(&self.directory.join("manifest.json"), &self.manifest)?;
-        for handle in live.invocations.values() {
-            let _ = handle.interrupt("run suspended").await;
-        }
-        live.invocations.clear();
         live.rewrites.clear();
         let checkouts = std::mem::take(&mut live.checkouts);
         for (_, handle) in checkouts {
@@ -401,14 +414,6 @@ impl ManagedRun {
         drop(content);
         self.live = None;
         Ok(())
-    }
-
-    pub fn protected(&self, content: ContentId) -> bool {
-        let same = |id: ContentId| id.hash() == content.hash() && id.format() == content.format();
-        self.manifest
-            .checkpoints
-            .values()
-            .any(|c| same(c.base) || same(c.root) || c.dependencies.iter().copied().any(same))
     }
 }
 
@@ -475,6 +480,7 @@ impl Service {
                             directory: entry.path(),
                             live: None,
                             registry: registry.clone(),
+                            recovery_checkouts: BTreeMap::new(),
                         })),
                     );
                 }
@@ -515,9 +521,33 @@ impl Service {
         declaration: GraphDeclaration,
         project: PathBuf,
     ) -> Result<Value> {
+        self.start_reserved_inner(id, declaration, project, None)
+            .await
+    }
+
+    pub async fn start_workflow_reserved(
+        &self,
+        id: &str,
+        declaration: GraphDeclaration,
+        project: PathBuf,
+        workflow: crate::workflow::runtime::InitialWorkflow,
+    ) -> Result<Value> {
+        self.start_reserved_inner(id, declaration, project, Some(workflow))
+            .await
+    }
+
+    async fn start_reserved_inner(
+        &self,
+        id: &str,
+        declaration: GraphDeclaration,
+        project: PathBuf,
+        workflow: Option<crate::workflow::runtime::InitialWorkflow>,
+    ) -> Result<Value> {
         let compiled = declaration.compile().map_err(AppError::core)?;
-        self.registry
-            .validate_bindings(&declaration.execution_bindings, &compiled.kernel)?;
+        if workflow.is_none() {
+            self.registry
+                .validate_bindings(&declaration.execution_bindings, &compiled.kernel)?;
+        }
         let declaration_revision = declaration.fingerprint().map_err(AppError::core)?;
         let project = std::fs::canonicalize(project)?;
         if !project.is_dir() {
@@ -527,6 +557,7 @@ impl Service {
             let mut run = run.lock().await;
             if run.manifest.declaration_revision != declaration_revision
                 || run.manifest.project != project
+                || serde_json::to_value(&run.manifest.workflow)? != serde_json::to_value(&workflow)?
             {
                 return Err(AppError::new(
                     "initialization_conflict",
@@ -547,6 +578,11 @@ impl Service {
                 run.launch_bindings().await?;
             } else if run.live.is_none() {
                 run.resume().await?;
+            } else if run.is_workflow() {
+                let workflow = crate::workflow::runtime::load(&run)?;
+                if workflow.pending.is_none() {
+                    crate::workflow::runtime::reconcile(&mut run, &workflow, false).await?;
+                }
             }
             return run.inspect(100).await;
         }
@@ -567,6 +603,7 @@ impl Service {
                 .unwrap_or_default()
                 .as_secs(),
             checkpoints: BTreeMap::new(),
+            workflow,
         };
         write_json(&directory.join("manifest.json"), &manifest)?;
         let run = Arc::new(Mutex::new(ManagedRun {
@@ -574,6 +611,7 @@ impl Service {
             directory,
             live: None,
             registry: self.registry.clone(),
+            recovery_checkouts: BTreeMap::new(),
         }));
         self.runs.lock().await.insert(id.into(), run.clone());
         let mut run = run.lock().await;
@@ -680,6 +718,7 @@ impl Service {
                 .unwrap_or_default()
                 .as_secs(),
             checkpoints: BTreeMap::new(),
+            workflow: None,
         };
         write_json(&directory.join("manifest.json"), &manifest)?;
         let run = Arc::new(Mutex::new(ManagedRun {
@@ -687,6 +726,7 @@ impl Service {
             directory,
             live: None,
             registry: self.registry.clone(),
+            recovery_checkouts: BTreeMap::new(),
         }));
         self.runs.lock().await.insert(id.into(), run.clone());
         let mut run = run.lock().await;

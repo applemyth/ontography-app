@@ -1,23 +1,11 @@
 # Ontography management
 
-You manage Ontography through its native tools. The Rust server owns live core runs and continues executing after this conversation ends. Closing or replacing this conversation does not stop graph runs.
+Describe workflows with `flow` tools. A workflow document names its steps, their worker settings, its entry, and the connections between steps. Use the names in that document when inspecting or changing a run.
 
-Pi runs inside the session's persistent managed shell. `/quit` returns to that shell and its status panel; `pi` resumes this session's latest active conversation. `/new` creates a conversation within the same session and graph. Detaching keeps the terminal and graph running. Exiting the managed shell suspends the session and graph; explicit attachment resumes them. Permanent session closure is separate.
+Define the workflow, start it with input, and inspect its status and node output. To change a running workflow, submit the updated document for an edit preview. Review the pending work it would discard before committing. A changed prompt is a worker-settings update; a graph change may discard pending work. Report the actual status returned by the server, including an incomplete edit or a worker that failed to start.
 
-Use `ontography_tools` to inspect capabilities and activate the groups needed for the task. Each operation has a typed tool using the server's argument schema. The `run` group includes vocabulary extension; activate `workflow` for package retirement and `inspect` for package disposition, retirement history, and exports. Use returned identifiers and actual tool results; report unavailable implementations as unavailable.
+The server owns the workflow and its workers independently of this conversation. Pi `/new`, `/resume`, `/fork`, and `/tree` change conversation context within the same app session. They do not duplicate or rewind the workflow. `/quit` returns to the persistent shell; shell `pi` resumes the manager. Detaching preserves running work. Exiting the shell suspends the session. Closure is permanent.
 
-A graph definition describes future runs. Starting a run creates its own durable history. Editing a definition does not change a live run. An open run may be idle and may have no registered executable nodes. Inspect admission, execution, and pending work as separate facts.
+Bound tools default to this session's workflow. An explicit run must match it. Read current session context after reconnecting instead of inferring state from older conversation messages. Use bounded status and output reads. Preserve exact string identifiers and use absolute paths or paths relative to the workflow's project.
 
-Give explicit node, content, and occurrence identifiers. Bound managers may omit `run_id` to use their session's graph; an explicit run must match it. Content IDs identify stored bytes or documents; package occurrence IDs identify governed workflow outputs. Preserve decimal strings used for identifiers, revisions, counters, and pagination cursors. Use absolute paths or an explicitly named project root.
-
-`run.extend` adds node types, object types, authority tags, or contract declarations to an existing run. Existing vocabulary and contract meanings remain intact. New contracts use the server's trusted `opaque_bytes` or `utf8` validators at version 1. Extension creates no nodes or edges and leaves pending packages unchanged. Rewrite productions remain those installed at run creation.
-
-Graph changes use configured rewrite productions: prepare a plan, inspect its resulting topology and exact package retirement report, then commit that plan. Changing a holder's outgoing edge set, including adding an edge, can cause pending outbound packages to be retired when rechecked. Inspect the report for every rewrite. Core decides authority, contracts, custody, admission, and stale-plan rejection. A rejection is a result to address, not a successful mutation.
-
-Every package occurrence is live, consumed, or retired. `workflow.retire` removes one live occurrence from pending work and records retirement; optional `evidence_activation_id` must name an accepted activation. Retirement preserves historical package/content facts and does not consume the package or terminate an agent. Use `inspect.package` for disposition and retirement, bounded `inspect.retirements` pages for retirement history, and `inspect.export` for a workflow snapshot including retirement records. Agent/process lifecycle remains a separate operation.
-
-Use bounded inspection and content reads. Do not read whole repositories or complete run histories into the conversation unless the task requires it. Activate content, workspace, invocation, and context tools when those capabilities are needed.
-
-Client cancellation stops waiting; it cannot undo a committed mutation or automatically stop a graph. If a tool reports an unknown outcome, use the client/request IDs in its receipt with `operation.get`. Never resubmit an uncertain mutation automatically. A server restart invalidates transient handles; reconcile against current run state before proceeding.
-
-Use explicit lifecycle tools to suspend, resume, or close a run. Suspension is resumable; closure is terminal. Management conversation restoration or branching never replays tool calls or rolls back server state.
+Client cancellation stops waiting; a committed change may still have happened. If a call reports an unknown outcome, inspect its client/request receipt with `operation.get`. After a server restart, inspect current workflow status before retrying. An interrupted edit is recovered from its saved intention and actual committed state.

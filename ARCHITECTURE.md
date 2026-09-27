@@ -1,34 +1,143 @@
-# App implementation todo
+# Architecture
 
-The app builds on `../ontography-core`. These are the eight agreed pieces to implement or integrate. Their numbers identify the pieces; they do not prescribe implementation order.
+The app builds on `../ontography-core`. This document separates the agreed
+implementation scope from [Tentative ideas](#tentative-ideas). Item numbers
+preserve references from other documents; build order is stated separately.
+
+## Goal
+
+Run Codex nodes in managed terminals, exchange message and workspace packages
+through governed edges, and edit the live graph through core's rewrite rules.
+Pi manages the graph using Ontography tools. Core supplies admission, contracts,
+authority, package/workflow state, and persistence.
+
+## Current scope
+
+- The original pieces 1–8: Codex node, workspace/message/union definitions,
+  edges, node harness, node MCP, and the Pi management/session foundation.
+- A document and compiler to assemble those pieces, with the app edit grammar
+  and a diff/retirement preview.
+- Process reconciliation and node terminal views.
+
+The document/compiler, edit recovery, and task harness are implemented. The
+harness runs noninteractive Codex or command tasks, waits for human decisions,
+and holds results in inboxes. Worker terminals, node MCP, and node panes remain
+unfinished parts of the agreed scope. Pi remains the management harness. Core
+is unchanged by this work.
+
+## The picture
+
+```text
+manager (Pi)
+ └─ workflow document          named nodes, settings, joins, connections
+     ├─ translator → core      graph declaration + fixed rewrite grammar
+     ├─ bindings → harness     run tasks, deliver inputs, publish results
+     └─ editor → core          preview changes, save target, apply/recover
+
+core commits graph and package state; the harness reconciles worker processes
+```
+
+| Piece | Job | Items | Status |
+| --- | --- | --- | --- |
+| Shell + UI | Where you sit. Attach, detach, look at the graph and the panes. | 8, 12 | Manager terminal and graph view exist. Node panes missing. |
+| Manager | Creates documents, starts runs, reads status, and requests edits. | 8, 11 | Document tools and Pi allowlist implemented. |
+| Workflow document | Named nodes, kind/config, joins, directed edges, and entry. | 10 | Implemented. |
+| Compiler + library | Fixed vocabulary, declaration expansion, edit grammar, and diff. | 2–5, 9 | Implemented using existing core APIs. |
+| Core | Enforces graph and package/workflow semantics. | — | Existing dependency; no additions in scope. |
+| Nodes | Execute tasks, deliver inputs, and publish outputs. | 1, 6, 7 | Task harness implemented; interactive worker terminals and node MCP remain. |
+
+## Workflow document
+
+The manager writes it. The compiler checks it and returns errors in these terms.
+
+```json
+{
+  "name": "review-and-fix",
+  "entry": "triage",
+  "nodes": [
+    {"id": "triage", "kind": "agent", "config": {"prompt": "Review the input and describe the changes needed."}},
+    {"id": "fix", "kind": "agent", "config": {"prompt": "Apply the requested changes and report the result."}},
+    {"id": "result", "kind": "inbox"}
+  ],
+  "edges": [
+    {"from": "triage", "to": "fix"},
+    {"from": "fix", "to": "result"}
+  ]
+}
+```
+
+Fields: `name`, `entry`, `nodes` (`id`, `kind`, `config`, `join`), and directed
+`edges` (`from`, `to`). Join belongs to the receiving node: `any` (the default)
+takes one available input; `all` waits for one from every incoming edge. There
+is one entry. Cycles and self loops are supported; duplicate connections are
+rejected. Kinds are `agent`, `command`, `human`, and `inbox`. See
+[WORKFLOWS.md](docs/WORKFLOWS.md) for configuration and a working example.
+
+## Library
+
+The app supplies the initial vocabulary and defaults.
+
+- Worker kinds: `agent` (Codex), `command`, `human`, and `inbox`.
+- Package types: `workspace` (item 2), `message` (item 3), `union` (item 4).
+- One edge rule accepting `union` (item 5).
+- One implicit authority tag on every edge and root.
+- One fixed grammar installed on every document run: add/remove nodes and
+  add/remove connections, including self loops. Replacement uses removal and
+  addition (item 9).
+
+Every kind uses the same core node type, result contract, edge rule, and tag.
+Kind and worker config live only in app execution bindings. The four core
+variants come from join (`any`/`all`) and root status, not worker kind. The
+generated grammar has 40 productions: eight node rules, 24 connection rules,
+and eight self-loop rules.
+
+Config changes take effect on the next task. Changing kind stops and waits for
+the old worker before launching its replacement. These are harness operations;
+a prompt or kind change alone does not rewrite the core graph.
+
+## Process
+
+Define, compile, run, inspect, edit.
+
+1. **Describe.** Say what the workflow should do. The manager writes the document.
+2. **Compile.** The document becomes a definition, or plain errors.
+3. **Run.** Start with an input. Each node runs when its inputs arrive.
+4. **Watch.** Read graph status, pending tasks, and committed outputs. Node
+   terminal panes remain future work.
+5. **Edit.** Change the document, inspect the edit steps and retirement preview,
+   and commit. Reconcile node processes with the committed graph.
+
+## Pieces
+
+Checkboxes indicate implementation, not completion of final release gates.
 
 - [ ] **1. Codex node definition**
 
-   An Ontography node whose app implementation hosts a Codex session in a server-owned terminal using `portable-pty`. Core supplies the node's identity and workflow rules. The node's identity persists across terminal or Codex restarts. A graph change admits the node; the app supervisor provisions its execution. A pane displays that execution, and opening or closing the pane preserves graph topology. This replaces the earlier proposed tmux backend; implementation is pending.
+   Partially implemented: an `agent` binding launches noninteractive `codex exec` for each task, using the configured prompt and delivered messages. Core supplies the node's identity and workflow rules. A persistent interactive Codex session in a server-owned `portable-pty` terminal, and its node pane, remain unimplemented. The manager already uses this terminal backend; the worker task runner does not.
 
-- [ ] **2. Workspace package**
+- [x] **2. Workspace package**
 
-   Uses core's existing package format: collections, files, symlinks, and changes against a base. Core resolves a complete directory view, prepares a private copy-on-write checkout, and captures edits as a changes package. The app defines the semantic layout of its contents.
+   Uses core's existing package format: collections, files, symlinks, and changes against a base. Core resolves a complete directory view, prepares a private copy-on-write checkout, and captures edits as a changes package. The app supports manager checkouts/checkpoints and export to a new directory. A task can receive at most one workspace.
 
-- [ ] **3. Message package definition**
+- [x] **3. Message package definition**
 
-   Defines message content and its delivery behavior. Once Ontography accepts the delivery, the receiving harness inserts the text directly into Codex's conversation input, as though pasted to the agent. Receiving the message requires no separate package lookup. The contract validates the payload; the harness performs and records delivery.
+   A message is `{"message":"text"}`. The contract validates it; the task harness supplies its text on stdin and records delivery receipts. Agent tasks include their configured prompt. Injecting messages into a continuing interactive Codex conversation remains part of item 1.
 
-- [ ] **4. Union package definition**
+- [x] **4. Union package definition**
 
-   An app-level package type permitting `Message | WorkspaceEnvelope`. It uses one core `Contract` with one associated object type; the validator accepts either payload form. Each delivery carries one package. A handoff containing both a message and a workspace can use one composed content package.
+   One core `Contract` and object type accept either `Message` or core's native `WorkspaceEnvelope`. Each delivery carries one of these forms. There is no combined message/workspace payload form; a joining node may receive separate messages and one workspace.
 
-- [ ] **5. Edge definitions**
+- [x] **5. Edge definitions**
 
-   Specify permitted endpoint types, authority requirements, and the accepted package contract. Concrete edges connect a source node to a target node. Connections are directed; replies require a corresponding reverse connection.
+   One shared directed edge rule accepts the union contract with the fixed authority tag. A successful task broadcasts its result through every outgoing connection. Replies require a reverse connection. Worker kinds introduce no additional routing or authority rules.
 
-- [ ] **6. Node harness**
+- [x] **6. Node harness**
 
-   Prepares context and workspaces, delivers messages, captures outputs, and submits operations through core. Agent requests are bound to the node and its active invocation. Core validates and commits workflow operations.
+   Prepares invocation context and private workspaces, delivers messages, runs agent/command tasks, captures outputs, and publishes through core. Human nodes wait for `flow.decide`; inboxes hold input without executing. Core validates publication and input consumption. The harness reconciles workers after edits and restart: stop, keep, update settings, or launch. Failed workers require an explicit resume or changed configuration to retry. Worker PTYs and node MCP remain separate unfinished items.
 
 - [ ] **7. Node-scoped MCP interface**
 
-   Implemented by the node's harness. Exposes the node's identity, outgoing connections, accepted package definitions, received inputs, and permitted context. Provides operations to read packages, construct messages or artifact packages, and request publication through an edge.
+   Implemented by the node's harness. Exposes the node's identity, outgoing connections, accepted package definitions, received inputs, and permitted context. Initial surface: `me`, `inputs`, `read`, `emit`, `done`, `fail`. Requests are bound to the node and invocation; core governs publication and accepted results.
 
 - [x] **8. Graph TUI and native management harness**
 
@@ -44,20 +153,46 @@ The app builds on `../ontography-core`. These are the eight agreed pieces to imp
 
    The initial implementation's separate Rust/Pi RPC conversation UI remains in source for its earlier tests; it is no longer the CLI's `--ui` path. Current graph display reuses the existing Ratatui graph widget, which supports cycles, self loops, and parallel edges. The [renderer decision](src/ui/README.md#renderer-decision) records that evaluation.
 
-   Core capability groups already bound to management tools:
+   The workflow layer reuses these internal core capabilities:
 
-   | Core capability | Operations |
+   | Core capability | Responsibility |
    | --- | --- |
-   | Definitions/admission | Validate schemas, graphs, contracts, authority rules, and rewrite grammars; save/import/export reusable declarations. |
-   | Run lifecycle | Create/open, inspect, suspend, resume, and terminally close runs; manage registered executable implementations. |
-   | Graph rewriting | Prepare, inspect, commit, and discard configured productions. |
-   | Workflow | Submit activations/emissions, transfer packages through permitted edges, and retire pending work with recorded reasons. |
-   | Vocabulary | Add node/object types, authority tags, and trusted contracts to live runs; persist accepted extensions across restart. |
-   | Content/packages/workspaces | Import/read/retain, compose/resolve, checkout/capture, diff/merge, transfer through iroh. |
+   | Definitions/admission | Validate the generated schema, graph, contracts, authority rules, and rewrite grammar. |
+   | Run lifecycle | Create/open, inspect, suspend, resume, and terminally close runs; supervise executable tasks. |
+   | Graph rewriting | Prepare and commit configured productions with revision checks and retirement evidence. |
+   | Workflow | Commit results and governed deliveries; consume or retire pending work with recorded reasons. |
+   | Content/packages/workspaces | Import/read/retain, compose/resolve, checkout/capture, and export artifacts. |
    | Invocation/context | Issue scoped invocations, prepare grants, enforce budgets, and record observed exposure/delivery evidence. |
    | Inspection | Inspect topology, frontier, package history, executions, and revision notifications. |
 
-   Concrete worker definitions remain items 1–7. The production executable registry has no Codex worker. A logical graph node currently does not create an agent process or terminal.
+   The workflow harness launches concrete workers from app bindings. These internal content, package, workspace, and context capabilities remain necessary even though Pi no longer sees their raw tool families.
+
+- [x] **9. Vocabulary and compiler**
+
+   Expands the document into the existing `GraphDeclaration` with app-owned `ExecutionBinding` settings and the fixed grammar. It does not add another graph representation or depend on native `ApplicationDeclaration` factories. The workflow harness owns initial input, workspace setup, and process reconciliation. Existing non-document runs retain their original declarations and grammar.
+
+   The editor compares documents and previews ordered rewrites against cloned core state. It saves the target document, allocated identities, and the exact approved retirements before applying changes. Stable names map to persisted core identities; removed identities are never reused. The last completed document and any pending target are explicit app metadata; core's actual graph records which transitions committed.
+
+   Each rewrite is atomic; a whole edit can span several transitions. Workers continue during that edit. Recovery reads the actual graph, prepares the next step at the current revision, and proceeds toward the saved target. It stops if a step would retire work absent from the preview. The manager must review that same target again before continuing; recovery never rolls back committed transitions or silently approves additional retirements. Process reconciliation follows successful completion.
+
+- [x] **10. Workflow document**
+
+   The schema in [Workflow document](#workflow-document) and its validation. Defines named nodes, worker kinds/settings, per-node joins, connections, and one entry.
+
+- [x] **11. Manager surface**
+
+   Pi exposes `flow.define`, `flow.start`, `flow.status`, `flow.output`, `flow.edit`, `flow.commit`, `flow.resume`, `flow.decide`, `flow.workspace`, `flow.promote`, and `flow.export`, plus `session.context`, `session.inspect`, and `operation.get`. There is no capability-group activation tool. The session handshake also advertises session/terminal lifecycle and system controls for CLI/extension use.
+
+   Unused raw package, invocation, context, project, network, and fact tool wrappers are deleted, along with content mutation/export tools and unused rewrite/workspace operations. Remaining declaration, lifecycle, inspection, execution, and workspace adapters serve existing infrastructure and tests. Raw mutations reject document-owned runs, including through unscoped calls. The manager uses document names, task IDs, and workspace handles rather than core incarnations or content roots. Core package/context/workspace APIs still provide necessary internal plumbing; deletion of their tool wrappers does not mean deletion of those capabilities. No total code-size reduction is claimed here.
+
+- [ ] **12. Node panes**
+
+   Attach a client to a node's terminal the way the manager terminal works today. Opening or closing a pane has no graph effect.
+
+**Build status.** The document, fixed vocabulary, translator/editor, task
+harness, and Pi surface are implemented. The remaining execution/UI work is
+interactive worker terminals (1), node-scoped MCP (7), and node panes (12).
+Core remains an existing dependency; no composite-production API was added.
 
 ## Session foundation
 
@@ -73,13 +208,11 @@ A new session can start Pi before the graph exists. The first scoped start opera
 
 Bare `ontography` always creates an independent app session. `attach NAME_OR_ID` (or `--session NAME_OR_ID`) explicitly attaches; persisted selection is metadata and never an implicit launch target. Pi `/new`, `/resume`, `/fork`, `/clone`, and `/tree` preserve its graph. One controlling client owns the manager terminal's input/dimensions. Ctrl-B, then D detaches while manager and graph continue. Pi `/quit` returns to the managed shell and session panel. Shell `pi` resolves the latest saved active conversation and launches it with the same graph binding. Shell `exit` suspends the session and graph even while detached. Explicit suspension also stops the terminal; closure is terminal. Server restart loads records; attachment explicitly resumes the named session's graph and native history.
 
-`portable-pty` hosts processes; `vt100` maintains terminal state; the Rust client renders native Pi, shell + session status, or the bound graph. The manager terminal is implemented. Worker terminal provisioning, views, package delivery, and execution reconciliation remain subsequent work.
+`portable-pty` hosts manager processes; `vt100` maintains terminal state; the Rust client renders native Pi, shell + session status, or the bound graph. Worker package delivery and execution reconciliation now run through the task harness. Worker terminal provisioning and node views remain subsequent work.
 
 The [session guide](docs/SESSIONS.md) documents commands and storage. [SESSION_DESIGN.md](docs/SESSION_DESIGN.md) records ownership and recovery details. [CORE_BINDINGS.md](docs/CORE_BINDINGS.md) maps the existing core API. [PLAN.md](PLAN.md) is the original item-8 implementation plan.
 
-## Follow-up status
-
-Checkboxes indicate implementation, not completion of final release gates.
+## Management status
 
 - [x] **Per-user app-home support.** Default storage is `~/.ontography/`, with existing explicit/environment/XDG overrides. A journaled migration archives legacy home contents, moves the stopped previous store, and leaves an alias at its old path. It preserves existing run identities; storage migration does not replace a core build or grammar.
 - [x] **Live home migration and final rollout verification.** Automated gates and native Pi/terminal checks passed. The legacy home was archived, the current store moved to `~/.ontography`, and all three prior runs preserved and resumed. [VERIFICATION.md](docs/VERIFICATION.md) records the evidence.
@@ -87,9 +220,54 @@ Checkboxes indicate implementation, not completion of final release gates.
 - [x] **Unified Ontography session.** Durable manager state, graph initialization/adoption, conversation ownership, selection, lifecycle commands, and scoped dispatch are implemented. App-session fork/archive/delete remain deferred.
 - [x] **Rust manager terminal backend.** Server-owned PTY, terminal parsing, attachment snapshots, input/resize ownership, detach/reconnect, and manager supervision are implemented. This replaces the proposed tmux backend.
 - [x] **Persistent session shell.** Launch into Pi, return to shell + session status on `/quit`, resume the active conversation with shell `pi`, and suspend the session when its shell exits. Structured process leases distinguish manager state from terminal state.
-- [ ] **Concrete worker layer.** Implement items 1–7, then connect admitted graph nodes to supervised executions and node terminal views. Worker package delivery remains a governed core/harness operation.
-- [ ] **Default app rewrite grammar.** Define versioned productions alongside the concrete node/edge/package definitions. Cover supported add/remove/connect/disconnect/rewire operations with core validation. Existing runtimes keep their original grammar; editing a saved declaration does not retrofit an empty-grammar run.
 
-Live `run.extend` admits additional vocabulary and trusted contracts while preserving existing meanings and graph structure. It does not replace the configured rewrite grammar. Core schema version 9 requires fresh runs in this WIP update; [CORE_UPDATE.md](docs/CORE_UPDATE.md) describes the integration.
+The app's dynamic vocabulary extension adapter is removed. Document workflows keep their vocabulary and grammar fixed. Previously extended runs are not supported by the fixed-definition reopening path; stored runs must match the selected core build and declaration. This layer adds no storage migration. [CORE_UPDATE.md](docs/CORE_UPDATE.md) records earlier integration work, including operations that are no longer exposed.
 
-A definition is reusable configuration; starting it creates a run. Rewriting changes that run's current graph and preserves its history under the configured grammar. Core commits graph/package state; the future worker supervisor reconciles external processes separately and exposes partial failures. Opening or closing a terminal view has no graph-topology effect.
+A definition is reusable configuration; starting it creates a run. Rewriting changes that run's current graph and preserves its history under the configured grammar. Core commits graph/package state; the worker supervisor reconciles external processes separately and exposes partial failures. Opening or closing a terminal view has no graph-topology effect.
+
+## Policies and remaining work
+
+The app now makes explicit choices: broadcast each result to all successors,
+allow one workspace per task, retry failed work only on resume/config change,
+and apply new config at the next task boundary. Workspace workers currently
+need an outgoing edge; an inbox provides a terminal result holder. These are
+app policies, not restrictions imposed by worker kinds or new core semantics.
+
+Remaining within the agreed scope: interactive Codex conversation delivery,
+worker terminal lifecycle, concrete node MCP signatures, and node panes.
+[WORKFLOWS.md](docs/WORKFLOWS.md) describes current behavior and recovery limits.
+
+## Tentative ideas
+
+Retained for discussion. These are not implementation commitments or
+prerequisites for the current scope; each needs a separate decision before
+being added to the plan.
+
+- **More worker implementations:** additional agent harnesses beyond Codex.
+- **Workflow conveniences:** skills delivered as content packages, dynamic
+  fan-out/collectors, and nested or child workflows.
+- **Portable runs:** complete run backup/import. Promoting a document revision
+  and exporting a result file/workspace are already implemented.
+- **Interchangeable managers:** a standalone management MCP server, other
+  harnesses holding the manager seat, and generic manager-kind/launch/resume
+  records. The node-scoped MCP in item 7 remains in the current scope.
+- **Additional policy:** human-gate authority tags, restrictions between new
+  node kinds, and a dedicated operator node for manager messages.
+- **Session conveniences:** app-session fork/archive/delete, shared viewers,
+  and controller takeover.
+- **Core investigation:** verified replay across rewrites/transfers/retirements,
+  frontier-local rewrite preparation, retention after failed commits,
+  tag-free edges, and schema-parameterised validators. None is required by
+  this app scope.
+
+## Proof
+
+Automated coverage exercises document validation, all grammar variants,
+preview/recovery, command → human → inbox execution, workspace capture/export,
+config changes, and worker reconciliation. See
+[CORE_BINDINGS.md](docs/CORE_BINDINGS.md#verification-evidence).
+
+The remaining full acceptance flow is interactive: create two Codex nodes,
+deliver messages and workspaces through core, edit with a retirement preview,
+and attach to each worker terminal. Verify detach/restart and resumed execution.
+The current noninteractive runner and fixture tests do not complete that gate.

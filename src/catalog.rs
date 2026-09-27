@@ -33,6 +33,24 @@ pub fn operations() -> &'static [Operation] {
     OPERATIONS.get_or_init(build_operations)
 }
 
+/// Session clients discover the workflow language and their lifecycle transport.
+/// Legacy declarations remain an internal compatibility path, never manager tools.
+pub fn manager_operations() -> Vec<Operation> {
+    operations()
+        .iter()
+        .filter(|operation| {
+            operation.name.starts_with("flow.")
+                || operation.name.starts_with("session.")
+                || operation.name.starts_with("terminal.")
+                || matches!(
+                    operation.name.as_str(),
+                    "system.hello" | "system.status" | "operation.get"
+                )
+        })
+        .cloned()
+        .collect()
+}
+
 fn build_operations() -> Vec<Operation> {
     let text = json!({"type":"string"});
     let declaration = schema::<crate::declarations::GraphDeclaration>();
@@ -95,13 +113,6 @@ fn build_operations() -> Vec<Operation> {
             false,
         ),
         Operation::new(
-            "graph.import",
-            "Import a declaration file as a saved draft. Relative paths use the explicitly named absolute project directory.",
-            json!({"path":text,"project":text}),
-            &["path", "project"],
-            true,
-        ),
-        Operation::new(
             "graph.export",
             "Export an exact saved declaration revision to a file.",
             json!({"revision":text,"path":text,"project":text}),
@@ -131,16 +142,9 @@ fn build_operations() -> Vec<Operation> {
         ),
         Operation::new(
             "run.resume",
-            "Reopen the stored current graph with its accepted vocabulary extensions and original grammar.",
+            "Reopen the stored current graph with its original vocabulary and grammar.",
             json!({"run_id":text}),
             &["run_id"],
-            true,
-        ),
-        Operation::new(
-            "run.extend",
-            "Add node types, object types, authority tags, or trusted contracts to the live run. Existing contracts, graph, roots, authority rules, and rewrite grammar remain fixed. Accepted additions persist across restart; this does not create nodes or launch workers.",
-            json!({"run_id":text,"extension":schema::<crate::extensions::VocabularyExtension>()}),
-            &["run_id", "extension"],
             true,
         ),
         Operation::new(
@@ -158,25 +162,11 @@ fn build_operations() -> Vec<Operation> {
             true,
         ),
         Operation::new(
-            "rewrite.list",
-            "List the fixed rewrite productions configured for this run.",
-            json!({"run_id":text}),
-            &["run_id"],
-            false,
-        ),
-        Operation::new(
             "rewrite.prepare",
             "Prepare a configured rewrite and report its exact graph and package retirements without changing the run.",
             json!({"run_id":text,"request":rewrite}),
             &["run_id", "request"],
             true,
-        ),
-        Operation::new(
-            "rewrite.inspect",
-            "Read a retained prepared rewrite and its predecessor revision.",
-            json!({"run_id":text,"plan_id":text}),
-            &["run_id", "plan_id"],
-            false,
         ),
         Operation::new(
             "rewrite.commit",
@@ -208,4 +198,62 @@ pub fn schema<T: schemars::JsonSchema>() -> Value {
         object.remove("$schema");
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn manager_catalog_has_one_workflow_language_and_transport_operations() {
+        let manager = super::manager_operations();
+        assert!(
+            manager
+                .iter()
+                .any(|operation| operation.name == "flow.start")
+        );
+        assert!(
+            manager
+                .iter()
+                .any(|operation| operation.name == "operation.get")
+        );
+        assert!(
+            manager
+                .iter()
+                .any(|operation| operation.name == "session.conversation")
+        );
+        assert!(
+            manager
+                .iter()
+                .any(|operation| operation.name == "terminal.graph")
+        );
+        assert!(manager.iter().all(|operation| {
+            matches!(
+                operation.group.as_str(),
+                "flow" | "system" | "operation" | "session" | "terminal"
+            )
+        }));
+        assert!(!super::operations().iter().any(|operation| {
+            matches!(
+                operation.group.as_str(),
+                "network" | "package" | "invocation" | "context" | "project"
+            ) || (operation.group == "content"
+                && !matches!(operation.name.as_str(), "content.read" | "content.metadata"))
+                || matches!(
+                    operation.name.as_str(),
+                    "run.export_facts"
+                        | "run.restore_facts"
+                        | "run.verify"
+                        | "run.extend"
+                        | "graph.import"
+                        | "rewrite.list"
+                        | "rewrite.inspect"
+                        | "workspace.import"
+                        | "workspace.restore"
+                        | "workspace.read_only"
+                        | "workspace.checkpoint_delete"
+                        | "workspace.diff"
+                        | "workspace.git_diff"
+                        | "workspace.git_merge"
+                )
+        }));
+    }
 }
