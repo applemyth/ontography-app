@@ -7,9 +7,10 @@ pub mod grammar;
 pub mod harness;
 mod output;
 pub mod runtime;
+pub mod tasks;
 pub mod tools;
 
 pub use document::{
-    Document, DocumentEdge, DocumentNode, IdentityMap, JoinMode, NodeKind, WorkflowPayload,
+    Document, DocumentEdge, DocumentNode, Grant, IdentityMap, JoinMode, NodeKind, WorkflowPayload,
     edge_key, expand,
 };

@@ -33,7 +33,7 @@ stored core build and declaration/catalog identities.
 
 ## Workflow surface
 
-Pi exposes the following eleven workflow tools. Bound requests default to the
+Pi exposes the following thirteen workflow tools. Bound requests default to the
 session's run and project; explicit targets must agree with that binding.
 Schemas are available through the session-scoped `system.hello` handshake.
 
@@ -41,13 +41,15 @@ Schemas are available through the session-scoped `system.hello` handshake.
 | --- | --- | --- |
 | `flow.define` | Document → reusable revision | App validation and immutable document storage; declaration admission checks on start. |
 | `flow.start` | Document or revision, message or workspace directory → run | `GraphDeclaration`, persistent runtime/session, reserved initialization, app worker bindings. |
-| `flow.status` | Run → document, named graph, pending edit, worker state, tasks | Current kernel/frontier, app edit state, hosted execution status. |
+| `flow.status` | Run → document, named graph, pending edit, worker state, tasks, failures | Current kernel/frontier, app edit state, hosted execution status, per-node retry ledgers. |
 | `flow.output` | Node and optional task/work selection → ready input, last result, or inbox page | Accepted invocation/publication evidence, bounded pending queries, and content reads. |
 | `flow.edit` | Updated document → plan and exact retirement preview | Cloned state and configured core rewrite preparation. |
 | `flow.commit` | Plan ID → completed or recoverable edit | Revision-fenced `SessionHandle::prepare_rewrite` / `commit_rewrite`, persisted target and identities. |
 | `flow.resume` | Run → recovered edit and restarted workers | Core reopening, saved target recovery, worker reconciliation. |
 | `flow.decide` | Human node/task ID, message or saved workspace → publication | Node-bound invocation, accepted result and outgoing emissions. |
-| `flow.workspace` | Open/capture/release; node, path, or workspace handle | `WorkspaceStore`, retained checkouts, durable checkpoints/dependency retention. |
+| `flow.retry` | Worker node, optional failed task ID → fresh attempts | App retry ledger, which wakes the worker. |
+| `flow.discard` | Worker node/parked task ID → discarded input | Package retirement through `SessionHandle::retire`; initial input completion. |
+| `flow.workspace` | Open/capture/release; node, path, or workspace handle | The app's `WorkspaceStore`, retained checkouts, durable checkpoints/dependency retention. |
 | `flow.promote` | Run → reusable document revision | Save the current document after any pending edit completes. |
 | `flow.export` | Node and new destination → exported file/directory | Message bytes or resolved native package entries and content export. |
 
@@ -82,9 +84,11 @@ existing infrastructure and tests. Raw mutations reject document-owned runs,
 so they cannot bypass a saved edit or publish outside the workflow harness.
 
 Package resolution/retention, workspace checkout/capture, invocation context,
-and execution supervision remain necessary capabilities. The harness calls
-core directly; manager workspace actions also reuse internal workspace
-helpers. Their continued use should not be counted as deleted functionality.
+and execution supervision remain necessary capabilities. Checkout/capture is
+the app's own workspace store ([`src/workspace`](../src/workspace)); the rest
+is core's. The harness calls core and that store directly; manager workspace
+actions also reuse internal workspace helpers. Their continued use should not
+be counted as deleted functionality.
 The native application module also remains available internally; its project
 tool wrappers do not.
 
@@ -152,10 +156,27 @@ result is the captured checkout. Each result broadcasts to every outgoing
 connection. Human tasks wait for an explicit decision; inboxes keep work pending.
 
 Config changes are sampled before the next task. A kind change stops and
-waits for the previous worker before launching the new kind. Failures stop the
-worker without automatically retrying; resume or changed config enables a
-retry. One task may receive at most one workspace, and a workspace worker
-currently requires an outgoing connection (an inbox can hold its result).
+waits for the previous worker before launching the new kind. A failed task
+retries with capped backoff while the worker continues with other tasks, then
+parks until `flow.retry` or `flow.discard`. Counts persist beside the node's
+state, with the definition they were counted under; core's invocation records
+remain the audit trail. A change to the node's definition grants fresh
+attempts. One task may receive at most one
+workspace, and a workspace worker currently requires an outgoing connection
+(an inbox can hold its result). The harness checks out a task's workspace only
+if it is a directory the attempt received, under the same rules as node tools'
+checkouts ([`src/workspace/attempt.rs`](../src/workspace/attempt.rs)). The
+attempt's receipts record the checkout's `root`, `path`, `writable`, and input
+`handle` as a `workspace_exposure` tool response. The command is given the
+checkout as its working directory rather than those bytes, and the receipt is
+marked sent when it starts there. A worker that starts removes the checkouts a
+crash left behind, as node tools do; one it cannot remove stays and is never
+reused.
+
+Node tools ([NODE_TOOLS.md](NODE_TOOLS.md)) bind a worker to its own node:
+execution-bound invocations with explorable context, core's package reads and
+receipts, staged content, private workspaces, and, when granted, transfer and
+retirement through the session. No transport exposes them yet.
 
 Worker PTYs, continuing interactive Codex conversations, node-scoped MCP, and
 node panes remain unimplemented. Manager PTYs are already implemented. The
@@ -188,6 +209,8 @@ Other existing limits remain:
 | Command → human → inbox, config changes, added workers, repeated commits | [workflow flow](../tests/workflow_flow.rs) |
 | Repeated reviews, exact inbox selection, pagination, structured failure status | [workflow outputs](../tests/workflow_outputs.rs) |
 | Task execution, cancellation, failures, process supervision, workspace constraints | [harness tests](../src/workflow/harness.rs) |
+| Retry backoff, parking, join sets, manager retry/discard, definition changes, durability | [task tests](../src/workflow/tasks.rs), [workflow retry](../tests/workflow_retry.rs) |
+| Node tools: receipts equal sent bytes, metadata-only views, attempts, retries, grants, content and checkouts | [node tool tests](../src/node_tool/tests.rs), [content](../src/node_tool/outputs.rs), [workspaces](../src/node_tool/workspace.rs) |
 | Workspace capture/reopen/export and no-clobber/path validation | [artifact tests](../src/workflow/artifacts.rs), [workspace flow](../tests/workflow_artifacts.rs) |
 | Session ownership, scoped targets, manager catalog, initialization recovery | [session ownership](../tests/session_ownership.rs), [catalog tests](../src/catalog.rs) |
 | Detached server lifetime, abrupt death, receipts, stale instances, multiplexing | [server process tests](../tests/server_lifecycle.rs) |

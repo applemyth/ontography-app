@@ -4,12 +4,9 @@ use super::content::{RootPage, local_path, page, resolved_view};
 use super::workflow::{check_limit, content_id_schema, default_limit, operation, parse_args};
 use crate::catalog::Operation;
 use crate::state::{Checkpoint, ManagedRun, WorkspaceHandle};
+use crate::workspace::{WorkspaceError, WorkspaceStore};
 use crate::{AppError, Result};
-use ontography::{
-    ContentId, ContentStore,
-    package::ResolvedPackage,
-    workspace::{WorkspaceError, WorkspaceStore},
-};
+use ontography::{ContentId, ContentStore, PackageError, package::ResolvedPackage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -55,13 +52,22 @@ struct ListInput {
     limit: usize,
 }
 
-fn workspace_error(error: WorkspaceError) -> AppError {
+/// Classifies the workspace store's refusal of a view, checkout, or capture;
+/// anything else is core's own failure.
+pub(crate) fn workspace_error(error: impl Into<WorkspaceError>) -> AppError {
+    let error = error.into();
     let code = match &error {
         WorkspaceError::UnsupportedCopyOnWrite { .. } => "unsupported_copy_on_write",
         WorkspaceError::Changed(_) => "workspace_changed",
-        WorkspaceError::Limit(_) => "workspace_limit",
-        WorkspaceError::Invalid(_) => "invalid_workspace",
+        WorkspaceError::ReadOnly(_) => "workspace_read_only",
+        WorkspaceError::Limit(_) | WorkspaceError::Package(PackageError::Limit(_)) => {
+            "workspace_limit"
+        }
+        WorkspaceError::Invalid(_) | WorkspaceError::Package(PackageError::Invalid(_)) => {
+            "invalid_workspace"
+        }
         WorkspaceError::Git(_) => "git_error",
+        WorkspaceError::Io(_) => "io_error",
         _ => "core_error",
     };
     AppError::new(code, error.to_string())

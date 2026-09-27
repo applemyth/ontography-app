@@ -2750,6 +2750,7 @@ dependencies = [
  "ontography-core",
  "portable-pty",
  "ratatui",
+ "reflink-copy",
  "regex",
  "rustix",
  "schemars",
@@ -2759,6 +2760,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "unicode-normalization",
  "uuid",
  "vt100",
 ]

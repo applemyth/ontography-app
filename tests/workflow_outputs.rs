@@ -472,29 +472,49 @@ async fn failed_command_exposes_structured_error_without_changing_case() {
         json!({"document":document,"project":directory.path(),"message":"seed"}),
     )
     .await;
-    let failed = tokio::time::timeout(Duration::from_secs(10), async {
+    let run_id = &started["run_id"];
+    // The failure is counted before this output is written.
+    let output = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let status = call(&service, "flow.status", json!({"run_id":started["run_id"]})).await;
-            let execution = &status["nodes"][0]["execution"];
-            if execution["state"] == "failed" {
-                break execution.clone();
+            let output = call(
+                &service,
+                "flow.output",
+                json!({"run_id":run_id,"node":"fail"}),
+            )
+            .await;
+            if output["publication_status"] == "failed" {
+                break output;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .expect("command did not report its failure");
-    assert_eq!(failed["error"]["class"], "workflow_worker");
     assert_eq!(
-        failed["error"]["message"],
+        output["error"],
+        "Worker exited with status 7: MiXeD Failure"
+    );
+    // By default a failed task waits five seconds before its next attempt,
+    // while the worker keeps running.
+    let status = call(&service, "flow.status", json!({"run_id":run_id})).await;
+    assert_eq!(status["nodes"][0]["execution"]["state"], "running");
+    assert_eq!(status["tasks"], json!([]));
+    let failure = &status["failures"][0];
+    assert_eq!(failure["node"], "fail");
+    assert_eq!(failure["state"], "retrying");
+    assert_eq!(failure["attempts"], 1);
+    assert!((1..=5).contains(&failure["retry_in_secs"].as_u64().unwrap()));
+    assert_eq!(
+        failure["error"],
         "Worker exited with status 7: MiXeD Failure"
     );
     let pending = call(
         &service,
         "flow.output",
-        json!({"run_id":started["run_id"],"node":"fail","source":"pending"}),
+        json!({"run_id":run_id,"node":"fail","source":"pending"}),
     )
     .await;
     assert_eq!(pending["input"]["message"], "seed");
+    assert_eq!(pending["task_id"], failure["task_id"]);
     service.shutdown().await.unwrap();
 }

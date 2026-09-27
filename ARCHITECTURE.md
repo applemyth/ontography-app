@@ -44,7 +44,7 @@ core commits graph and package state; the harness reconciles worker processes
 | Workflow document | Named nodes, kind/config, joins, directed edges, and entry. | 10 | Implemented. |
 | Compiler + library | Fixed vocabulary, declaration expansion, edit grammar, and diff. | 2–5, 9 | Implemented using existing core APIs. |
 | Core | Enforces graph and package/workflow semantics. | — | Existing dependency; no additions in scope. |
-| Nodes | Execute tasks, deliver inputs, and publish outputs. | 1, 6, 7 | Task harness implemented; interactive worker terminals and node MCP remain. |
+| Nodes | Execute tasks, deliver inputs, and publish outputs. | 1, 6, 7 | Task harness and node tools implemented; interactive worker terminals and the node MCP transport remain. |
 
 ## Workflow document
 
@@ -117,7 +117,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **2. Workspace package**
 
-   Uses core's existing package format: collections, files, symlinks, and changes against a base. Core resolves a complete directory view, prepares a private copy-on-write checkout, and captures edits as a changes package. The app supports manager checkouts/checkpoints and export to a new directory. A task can receive at most one workspace.
+   Uses core's existing package format: collections, files, symlinks, and changes against a base. Core resolves a complete directory view; the app's workspace store ([`src/workspace`](src/workspace)) prepares a private copy-on-write checkout and captures edits as a changes package. The app supports manager checkouts/checkpoints and export to a new directory. A task can receive at most one workspace.
 
 - [x] **3. Message package definition**
 
@@ -133,11 +133,11 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **6. Node harness**
 
-   Prepares invocation context and private workspaces, delivers messages, runs agent/command tasks, captures outputs, and publishes through core. Human nodes wait for `flow.decide`; inboxes hold input without executing. Core validates publication and input consumption. The harness reconciles workers after edits and restart: stop, keep, update settings, or launch. Failed workers require an explicit resume or changed configuration to retry. Worker PTYs and node MCP remain separate unfinished items.
+   Prepares invocation context and private workspaces, delivers messages, runs agent/command tasks, captures outputs, and publishes through core. Human nodes wait for `flow.decide`; inboxes hold input without executing. Core validates publication and input consumption. The harness reconciles workers after edits and restart: stop, keep, update settings, or launch. A failed task retries with capped backoff while other tasks proceed, then parks until the manager retries or discards it; failure counts are durable. A change to the node's definition grants fresh attempts. Worker PTYs and node MCP remain separate unfinished items.
 
 - [ ] **7. Node-scoped MCP interface**
 
-   Implemented by the node's harness. Exposes the node's identity, outgoing connections, accepted package definitions, received inputs, and permitted context. Initial surface: `me`, `inputs`, `read`, `emit`, `done`, `fail`. Requests are bound to the node and invocation; core governs publication and accepted results.
+   Partially implemented: the node tools behind it exist in [`src/node_tool`](src/node_tool), as described in [NODE_TOOLS.md](docs/NODE_TOOLS.md). One context serves one execution at one node. It exposes the node's identity and neighbors by name, its waiting inputs and retry-aware next task, attempts that begin, read, compose, check out, submit, or fail, and grant-gated origination, deferred sending, and retirement. While an attempt stays open, its successful replies are exactly the bytes core recorded as receipts; core governs publication and accepted results. The MCP transport that relays calls, and a worker kind that hosts the tools, remain.
 
 - [x] **8. Graph TUI and native management harness**
 
@@ -161,11 +161,11 @@ Checkboxes indicate implementation, not completion of final release gates.
    | Run lifecycle | Create/open, inspect, suspend, resume, and terminally close runs; supervise executable tasks. |
    | Graph rewriting | Prepare and commit configured productions with revision checks and retirement evidence. |
    | Workflow | Commit results and governed deliveries; consume or retire pending work with recorded reasons. |
-   | Content/packages/workspaces | Import/read/retain, compose/resolve, checkout/capture, and export artifacts. |
+   | Content/packages | Import/read/retain, compose/resolve, and export artifacts. |
    | Invocation/context | Issue scoped invocations, prepare grants, enforce budgets, and record observed exposure/delivery evidence. |
    | Inspection | Inspect topology, frontier, package history, executions, and revision notifications. |
 
-   The workflow harness launches concrete workers from app bindings. These internal content, package, workspace, and context capabilities remain necessary even though Pi no longer sees their raw tool families.
+   Workspace checkout and capture are the app's own, in [`src/workspace`](src/workspace), built on core's content and packages. The workflow harness launches concrete workers from app bindings. These internal content, package, workspace, and context capabilities remain necessary even though Pi no longer sees their raw tool families.
 
 - [x] **9. Vocabulary and compiler**
 
@@ -181,9 +181,9 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **11. Manager surface**
 
-   Pi exposes `flow.define`, `flow.start`, `flow.status`, `flow.output`, `flow.edit`, `flow.commit`, `flow.resume`, `flow.decide`, `flow.workspace`, `flow.promote`, and `flow.export`, plus `session.context`, `session.inspect`, and `operation.get`. There is no capability-group activation tool. The session handshake also advertises session/terminal lifecycle and system controls for CLI/extension use.
+   Pi exposes `flow.define`, `flow.start`, `flow.status`, `flow.output`, `flow.edit`, `flow.commit`, `flow.resume`, `flow.decide`, `flow.retry`, `flow.discard`, `flow.workspace`, `flow.promote`, and `flow.export`, plus `session.context`, `session.inspect`, and `operation.get`. There is no capability-group activation tool. The session handshake also advertises session/terminal lifecycle and system controls for CLI/extension use.
 
-   Unused raw package, invocation, context, project, network, and fact tool wrappers are deleted, along with content mutation/export tools and unused rewrite/workspace operations. Remaining declaration, lifecycle, inspection, execution, and workspace adapters serve existing infrastructure and tests. Raw mutations reject document-owned runs, including through unscoped calls. The manager uses document names, task IDs, and workspace handles rather than core incarnations or content roots. Core package/context/workspace APIs still provide necessary internal plumbing; deletion of their tool wrappers does not mean deletion of those capabilities. No total code-size reduction is claimed here.
+   Unused raw package, invocation, context, project, network, and fact tool wrappers are deleted, along with content mutation/export tools and unused rewrite/workspace operations. Remaining declaration, lifecycle, inspection, execution, and workspace adapters serve existing infrastructure and tests. Raw mutations reject document-owned runs, including through unscoped calls. The manager uses document names, task IDs, and workspace handles rather than core incarnations or content roots. Core package/context APIs and the app's workspace store still provide necessary internal plumbing; deletion of their tool wrappers does not mean deletion of those capabilities. No total code-size reduction is claimed here.
 
 - [ ] **12. Node panes**
 
@@ -228,13 +228,15 @@ A definition is reusable configuration; starting it creates a run. Rewriting cha
 ## Policies and remaining work
 
 The app now makes explicit choices: broadcast each result to all successors,
-allow one workspace per task, retry failed work only on resume/config change,
-and apply new config at the next task boundary. Workspace workers currently
-need an outgoing edge; an inbox provides a terminal result holder. These are
-app policies, not restrictions imposed by worker kinds or new core semantics.
+allow one workspace per task, retry a failed task with capped backoff and then
+park it for the manager, and apply new config at the next task boundary.
+Workspace workers currently need an outgoing edge; an inbox provides a terminal
+result holder. These are app policies, not restrictions imposed by worker kinds
+or new core semantics.
 
 Remaining within the agreed scope: interactive Codex conversation delivery,
-worker terminal lifecycle, concrete node MCP signatures, and node panes.
+worker terminal lifecycle, the node MCP transport over the node tools, and node
+panes.
 [WORKFLOWS.md](docs/WORKFLOWS.md) describes current behavior and recovery limits.
 
 ## Tentative ideas

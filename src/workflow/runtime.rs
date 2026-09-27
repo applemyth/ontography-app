@@ -4,6 +4,7 @@ use super::{
     DocumentNode, WorkflowPayload,
     edit::{self, WorkflowState},
     harness,
+    tasks::RetryLedger,
 };
 use crate::{AppError, Result, persistence, state::ManagedRun};
 use ontography::{ExecutionStatus, InvocationStatus};
@@ -12,6 +13,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::sync::watch;
 
@@ -27,6 +29,9 @@ pub struct InitialWorkflow {
 pub struct Worker {
     pub execution_id: String,
     pub settings: watch::Sender<DocumentNode>,
+    /// Shared with the harness and flow tools. A relaunched worker keeps its
+    /// predecessor's instance, so a node never has two writers.
+    pub ledger: Arc<RetryLedger>,
 }
 
 pub fn state_path(run: &ManagedRun) -> PathBuf {
@@ -73,7 +78,7 @@ pub async fn initial_pending(run: &ManagedRun) -> Result<bool> {
         .as_ref()
         .ok_or_else(|| AppError::invalid("Workflow required"))?;
     let id = &initial.state.identities.nodes[&initial.state.current.entry];
-    let marker = node_directory(run, id).join("initial-complete.json");
+    let marker = initial_marker(&node_directory(run, id));
     if marker.exists() {
         return persistence::read_json::<bool>(&marker).map(|complete| !complete);
     }
@@ -99,7 +104,18 @@ pub async fn initial_pending(run: &ManagedRun) -> Result<bool> {
 }
 
 pub fn complete_initial(node_directory: &Path) -> Result<()> {
-    persistence::write_json(&node_directory.join("initial-complete.json"), &true)
+    persistence::write_json(&initial_marker(node_directory), &true)
+}
+
+/// Whether the entry's initial input is known to be done: accepted, or
+/// discarded by the manager. Workers re-read this before offering it again.
+pub fn initial_complete(node_directory: &Path) -> Result<bool> {
+    let marker = initial_marker(node_directory);
+    Ok(marker.exists() && persistence::read_json::<bool>(&marker)?)
+}
+
+fn initial_marker(node_directory: &Path) -> PathBuf {
+    node_directory.join("initial-complete.json")
 }
 
 pub async fn initial_payload(run: &ManagedRun) -> Result<ontography::Payload> {
@@ -122,7 +138,7 @@ pub async fn initial_payload(run: &ManagedRun) -> Result<ontography::Payload> {
             .content_store()
             .await
             .map_err(AppError::core)?;
-        let store = ontography::workspace::WorkspaceStore::new(content, run.workspace()?);
+        let store = crate::workspace::WorkspaceStore::new(content, run.workspace()?);
         let package = store
             .import_directory(directory)
             .await
@@ -166,11 +182,16 @@ pub async fn reconcile(
         })
         .map(|(id, _)| id.clone())
         .collect();
+    // A replacement of another kind continues its node's retry ledger.
+    // Each ledger is renewed below with its node's definition, so a changed
+    // node gets fresh attempts even if this reconcile stops early.
+    let mut ledgers = BTreeMap::new();
     for id in removed {
         let live = run.live_mut()?;
-        if let Some(worker) = live.workers.remove(&id)
-            && let Some(handle) = live.executions.remove(&worker.execution_id)
-        {
+        let Some(worker) = live.workers.remove(&id) else {
+            continue;
+        };
+        if let Some(handle) = live.executions.remove(&worker.execution_id) {
             handle.request_stop();
             if tokio::time::timeout(std::time::Duration::from_secs(3), handle.wait())
                 .await
@@ -180,6 +201,7 @@ pub async fn reconcile(
                 handle.wait().await;
             }
         }
+        ledgers.insert(id, worker.ledger);
     }
     let pending_initial = initial_pending(run).await?;
     let initial = run
@@ -191,39 +213,51 @@ pub async fn reconcile(
     let original_entry = &initial.state.identities.nodes[&initial.state.current.entry];
     for node in &state.current.nodes {
         let id = &state.identities.nodes[&node.id];
-        let existing = run
-            .live()?
-            .workers
-            .get(id)
-            .map(|worker| worker.execution_id.clone());
-        if let Some(execution_id) = existing {
-            let active = run
-                .live()?
+        let definition = node.digest();
+        let mut ledger = ledgers.remove(id);
+        let existing = run.live()?.workers.get(id).map(|worker| {
+            (
+                worker.execution_id.clone(),
+                *worker.settings.borrow() != *node,
+            )
+        });
+        if let Some((execution_id, changed)) = existing {
+            let live = run.live_mut()?;
+            let active = live
                 .executions
                 .get(&execution_id)
                 .is_some_and(|execution| matches!(execution.status(), ExecutionStatus::Running));
-            if active {
-                let worker = &run.live()?.workers[id];
-                if *worker.settings.borrow() != *node {
+            // A running worker takes new settings in place; a stopped one is
+            // relaunched only for a change or a resume.
+            if active || !(changed || retry_failed) {
+                let worker = &live.workers[id];
+                if changed {
                     worker.settings.send_replace(node.clone());
                 }
+                // After the new settings, so no retried task starts with the old ones.
+                worker.ledger.renew(&definition)?;
                 continue;
             }
-            if !retry_failed && *run.live()?.workers[id].settings.borrow() == *node {
-                continue;
-            }
-            run.live_mut()?.workers.remove(id);
-            run.live_mut()?.executions.remove(&execution_id);
+            live.executions.remove(&execution_id);
+            ledger = live.workers.remove(id).map(|worker| worker.ledger);
         }
+        let directory = node_directory(run, id);
+        let ledger = match ledger {
+            Some(ledger) => ledger,
+            // Parked tasks stay parked across suspension and restart.
+            None => RetryLedger::open(directory.join("retry.json"))?,
+        };
+        ledger.renew(&definition)?;
         let (settings, receiver) = watch::channel(node.clone());
         let input = if pending_initial && id == original_entry {
             Some(initial_payload(run).await?)
         } else {
             None
         };
-        let directory = node_directory(run, id);
         std::fs::create_dir_all(&directory)?;
         let project = run.manifest.project.clone();
+        let session = run.live()?.session.clone();
+        let worker_ledger = ledger.clone();
         let executable = move |context| {
             harness::run(
                 context,
@@ -231,6 +265,8 @@ pub async fn reconcile(
                 project.clone(),
                 directory.clone(),
                 input.clone(),
+                session.clone(),
+                worker_ledger.clone(),
             )
         };
         let handle = run
@@ -247,6 +283,7 @@ pub async fn reconcile(
             Worker {
                 execution_id,
                 settings,
+                ledger,
             },
         );
     }

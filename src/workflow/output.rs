@@ -1,7 +1,7 @@
 //! Select task inputs and node results without confusing scheduling order with
 //! result order. Inbox items are paged by stable identity, never called latest.
 
-use super::{NodeKind, WorkflowPayload, edit::WorkflowState, runtime, tools};
+use super::{NodeKind, WorkflowPayload, edit::WorkflowState, runtime, tasks, tools};
 use crate::{AppError, Result, persistence, state::ManagedRun, views};
 use ontography::{PackageId, PackageRecord};
 use serde_json::{Value, json};
@@ -118,15 +118,17 @@ async fn read(run: &ManagedRun, state: &WorkflowState, args: &Value) -> Result<V
         run.live()?;
     }
     if let Some(expected) = task_id {
-        let task = ready_task(run, state, node)
+        let candidate = tools::node_tasks(run, state, node)
             .await?
-            .filter(|task| task.task_id == expected)
+            .into_iter()
+            .find(|candidate| candidate.task.key.as_str() == expected)
             .ok_or_else(|| {
                 AppError::new(
                     "stale_task",
                     "This task is no longer ready; read status again",
                 )
             })?;
+        let task = tools::task_view(run, candidate).await?;
         if let Some(work) = work_id {
             let index = task
                 .work_ids
@@ -156,12 +158,16 @@ async fn read(run: &ManagedRun, state: &WorkflowState, args: &Value) -> Result<V
         );
     }
     if source != "output" {
+        // A worker's pending initial input shows even while it fails; it is
+        // not a package, so the pending page cannot list it.
         if !paging
             && (definition.kind == NodeKind::Human || source == "pending")
-            && let Some(task) = ready_task(run, state, node).await?
-            && (definition.kind == NodeKind::Human || task.work_ids.is_empty())
+            && let Some(candidate) = tools::node_tasks(run, state, node)
+                .await?
+                .into_iter()
+                .find(|candidate| definition.kind == NodeKind::Human || candidate.task.is_initial())
         {
-            return Ok(task_record(task));
+            return Ok(task_record(tools::task_view(run, candidate).await?));
         }
         if definition.kind == NodeKind::Inbox || source == "pending" || paging {
             let page = pending(run, node, id, args).await?;
@@ -179,26 +185,21 @@ async fn read(run: &ManagedRun, state: &WorkflowState, args: &Value) -> Result<V
         return Ok(record);
     }
     if source != "output"
-        && let Some(task) = ready_task(run, state, node).await?
+        && let Some(candidate) = tools::node_tasks(run, state, node)
+            .await?
+            .into_iter()
+            .next()
     {
-        return Ok(task_record(task));
+        return Ok(task_record(tools::task_view(run, candidate).await?));
     }
     Ok(json!({"node":node,"input":null,"publication_status":"waiting"}))
 }
 
-async fn ready_task(
-    run: &ManagedRun,
-    state: &WorkflowState,
-    node: &str,
-) -> Result<Option<tools::Task>> {
-    tools::ready_task(run, state, node).await
-}
-
-fn task_record(task: tools::Task) -> Value {
+fn task_record(task: tools::TaskView) -> Value {
     json!({"node":task.node,"task_id":task.task_id,"work_ids":task.work_ids,"input":task.raw_input,"publication_status":"waiting"})
 }
 
-async fn input(run: &ManagedRun, package: &PackageRecord) -> Result<Value> {
+pub(super) async fn input(run: &ManagedRun, package: &PackageRecord) -> Result<Value> {
     let bytes = run
         .live()?
         .session
@@ -227,12 +228,7 @@ async fn find_work(
     work: &str,
     mut revision: Option<u64>,
 ) -> Result<(PackageId, PackageRecord, u64)> {
-    if !work
-        .strip_prefix("work_")
-        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
-        return Err(AppError::invalid("Invalid work_id"));
-    }
+    tasks::parse_work_id(work)?;
     let session = &run.live()?.session;
     let mut after = None;
     loop {
@@ -245,7 +241,7 @@ async fn find_work(
         if let Some((id, package)) = page
             .packages()
             .iter()
-            .find(|(id, _)| tools::work_id(&id.to_string()) == work)
+            .find(|(id, _)| tasks::work_id(id) == work)
         {
             return Ok((*id, package.clone(), page.revision()));
         }
@@ -299,7 +295,7 @@ async fn pending(run: &ManagedRun, node: &str, id: &str, args: &Value) -> Result
         } else {
             tools::payload_view(&input)
         };
-        items.push(json!({"work_id":tools::work_id(&package_id.to_string()),"input":input}));
+        items.push(json!({"work_id":tasks::work_id(package_id),"input":input}));
     }
     let next_after = more.then(|| items.last().expect("nonempty page")["work_id"].clone());
     let mut result = json!({"node":node,"publication_status":"waiting","revision":page.revision().to_string(),"items":items,"next_after":next_after});

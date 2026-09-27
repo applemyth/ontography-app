@@ -2,11 +2,11 @@
 use crate::declarations::GraphDeclaration;
 use crate::definition::RunDefinition;
 use crate::persistence::{Paths, read_json, write_json};
+use crate::workspace::{Checkout, WorkspaceStore};
 use crate::{AppError, Result, views};
 use ontography::{
     ContentId, ExecutionHandle, ExecutionHost, ProposalRuntime, SessionHandle, SessionRewrite,
     SessionStatus,
-    workspace::{Checkout, WorkspaceStore},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

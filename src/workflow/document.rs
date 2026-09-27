@@ -1,6 +1,6 @@
 //! The manager's workflow language and its expansion into existing declarations.
 
-use super::grammar;
+use super::{grammar, tasks::RetryPolicy};
 use crate::declarations::{
     ContractDeclaration, DECLARATION_VERSION, GraphDeclaration, IngressDeclaration,
     SchemaDeclaration, VALIDATOR_VERSION, ValidatorKind,
@@ -10,6 +10,7 @@ use crate::{AppError, Result};
 use ontography::{ContractViolation, PackageEnvelope, Payload, content::BlobFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const NODE_TYPE: &str = "WorkflowNode";
@@ -37,10 +38,57 @@ pub struct DocumentNode {
     pub config: Value,
     #[serde(default)]
     pub join: JoinMode,
+    /// Retries for failed tasks; the defaults apply when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
+    /// Node-tool operations beyond the base set.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub grants: BTreeSet<Grant>,
+}
+
+impl DocumentNode {
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry.unwrap_or_default()
+    }
+
+    /// Agent and command nodes run tasks; human and inbox nodes do not.
+    pub const fn runs_tasks(&self) -> bool {
+        matches!(self.kind, NodeKind::Agent | NodeKind::Command)
+    }
+
+    /// Names this exact definition; any change to the node changes it.
+    pub fn digest(&self) -> String {
+        let encoded = serde_json::to_vec(self).unwrap_or_default();
+        format!("{:x}", Sha256::digest(encoded))
+    }
 }
 
 fn empty_config() -> Value {
     json!({})
+}
+
+/// A node-tool power beyond the base set, given to a node explicitly.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Grant {
+    /// Start new work with input the node chooses.
+    Originate,
+    /// Create packages to send later, list them, and send them.
+    SendLater,
+    /// Retire packages held at this node.
+    Retire,
+}
+
+impl Grant {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Originate => "originate",
+            Self::SendLater => "send_later",
+            Self::Retire => "retire",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -111,7 +159,7 @@ impl Document {
                     node.id
                 )));
             }
-            validate_config(node)?;
+            validate_node(node)?;
         }
         if !names.contains(self.entry.as_str()) {
             return Err(invalid(format!("Entry {:?} must name a node", self.entry)));
@@ -138,7 +186,7 @@ impl Document {
     }
 }
 
-fn validate_config(node: &DocumentNode) -> Result<()> {
+fn validate_node(node: &DocumentNode) -> Result<()> {
     let error = |message: &str| invalid(format!("Node {:?}: {message}", node.id));
     let config = node
         .config
@@ -190,6 +238,14 @@ fn validate_config(node: &DocumentNode) -> Result<()> {
         .is_some_and(|value| value.as_u64().is_none_or(|n| n == 0))
     {
         return Err(error("timeout_secs must be a positive integer"));
+    }
+    if !node.runs_tasks() && (node.retry.is_some() || !node.grants.is_empty()) {
+        return Err(error(
+            "retry and grants apply only to agent and command nodes",
+        ));
+    }
+    if let Some(retry) = &node.retry {
+        retry.validate().map_err(error)?;
     }
     Ok(())
 }
@@ -427,6 +483,41 @@ mod tests {
         assert!(expand(&original, "example", &IdentityMap::default()).is_err());
         assert!(Document::parse(r#"{"name":"a","name":"b","entry":"n","nodes":[]}"#).is_err());
         assert_ne!(edge_key("a:b", "c"), edge_key("a", "b:c"));
+    }
+
+    #[test]
+    fn retry_and_grants_are_optional_validated_and_omitted_when_unset() {
+        let original = document();
+        let serialized = serde_json::to_value(&original).unwrap();
+        assert!(serialized["nodes"][0].get("retry").is_none());
+        assert!(serialized["nodes"][0].get("grants").is_none());
+        assert_eq!(original.nodes[0].retry_policy(), RetryPolicy::default());
+
+        let configured = Document::parse(r#"{"name":"example","entry":"write","nodes":[{"id":"write","kind":"agent","config":{"prompt":"Write"},"retry":{"max_attempts":5},"grants":["send_later","originate"]}]}"#).unwrap();
+        let node = &configured.nodes[0];
+        assert_eq!(node.retry_policy().max_attempts, 5);
+        assert_eq!(
+            node.retry_policy().initial_delay_secs,
+            RetryPolicy::default().initial_delay_secs
+        );
+        assert_eq!(
+            node.grants.iter().copied().collect::<Vec<_>>(),
+            [Grant::Originate, Grant::SendLater]
+        );
+
+        for invalid in [
+            r#"{"id":"write","kind":"agent","config":{"prompt":"Write"},"retry":{"max_attempts":0}}"#,
+            r#"{"id":"write","kind":"agent","config":{"prompt":"Write"},"retry":{"typo":1}}"#,
+            r#"{"id":"write","kind":"agent","config":{"prompt":"Write"},"grants":["everything"]}"#,
+            r#"{"id":"write","kind":"human","retry":{"max_attempts":2}}"#,
+            r#"{"id":"write","kind":"inbox","grants":["retire"]}"#,
+        ] {
+            let text = format!(r#"{{"name":"example","entry":"write","nodes":[{invalid}]}}"#);
+            assert!(
+                Document::parse(&text).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 
     #[test]

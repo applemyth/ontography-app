@@ -1,27 +1,34 @@
 //! Builtin workers consume scoped inputs and publish through core admission.
 
-use super::document::{DocumentNode, NodeKind, WorkflowPayload};
+use super::{
+    document::{DocumentNode, NodeKind, WorkflowPayload},
+    tasks::{self, RetryLedger, Task},
+};
 use crate::persistence::write_json;
+use crate::workspace::{AttemptCheckout, WorkspaceStore};
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
 use ontography::{
-    ContentId, ContextPolicy, Emission, ExecutionContext, ExecutionFailure, ExecutionSignal,
-    InvocationHandle, InvocationTrigger, OutputAuthority, PackageEnvelope, PackageStore, Payload,
-    ProposalDecision, WorkspacePolicy, workspace::WorkspaceStore,
+    ContentId, ContextError, ContextPolicy, Emission, ExecutionContext, ExecutionFailure,
+    ExecutionSignal, InvocationHandle, InvocationTrigger, OutputAuthority, PackageDocument,
+    PackageEnvelope, PackageError, PackageStore, Payload, ProposalDecision, ResolvedEntryKind,
+    SessionHandle,
 };
 use serde_json::json;
 use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::watch,
+    time::Instant,
 };
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -33,27 +40,41 @@ fn failure(error: impl std::fmt::Display) -> ExecutionFailure {
 
 /// Settings are sampled before each task; an in-flight task keeps its settings.
 /// Human and inbox work remains pending for document-level interaction tools.
+/// A failed task is counted in the node's retry ledger and waits out its
+/// backoff, or is parked, while the worker continues with other tasks.
 pub async fn run(
     mut context: ExecutionContext,
     mut settings: watch::Receiver<DocumentNode>,
     project: PathBuf,
     directory: PathBuf,
     mut initial: Option<Payload>,
+    session: SessionHandle,
+    ledger: Arc<RetryLedger>,
 ) -> WorkerResult<()> {
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(failure)?;
     recover_process(&directory).await?;
+    let workspaces = WorkspaceStore::new(
+        context.content_store().await.map_err(failure)?,
+        directory.join("workspaces"),
+    );
+    // Checkouts left by a crash belong to attempts that will never finish.
+    AttemptCheckout::remove_abandoned(&workspaces).await;
+    let mut retries = ledger.subscribe();
     loop {
         if context.stop().is_requested() {
             return Ok(());
         }
         let node = settings.borrow_and_update().clone();
-        if initial.is_some() {
-            let marker = directory.join("initial-complete.json");
-            if marker.exists() && crate::persistence::read_json::<bool>(&marker).map_err(failure)? {
-                initial = None;
-            }
+        let definition = node.digest();
+        // Failures count against the definition they happen under; renewing
+        // here also applies a change that reconcile could not record.
+        ledger.renew(&definition).map_err(failure)?;
+        // Only retry decisions made after this point wake an idle worker.
+        retries.mark_unchanged();
+        if initial.is_some() && super::runtime::initial_complete(&directory).map_err(failure)? {
+            initial = None;
         }
         if node.kind == NodeKind::Inbox
             && let Some(input) = initial.take()
@@ -61,108 +82,171 @@ pub async fn run(
             accept_initial_sink(&context, &node, &directory, input).await?;
         }
         if matches!(node.kind, NodeKind::Human | NodeKind::Inbox) {
-            tokio::select! {
-                changed = settings.changed() => { if changed.is_err() { return Ok(()); } }
-                signal = context.next_signal() => {
-                    if !matches!(signal, ExecutionSignal::FrontierChanged(_)) { return Ok(()); }
-                }
+            if !idle(&mut context, &mut settings, &mut retries, None).await {
+                return Ok(());
             }
             continue;
         }
-        let root_input = initial.take();
-        let is_initial = root_input.is_some();
-        let task = if let Some(input) = root_input {
-            let authority = context
-                .kernel()
-                .await
-                .map_err(failure)?
-                .root_ceiling(context.node_id())
-                .cloned()
-                .ok_or_else(|| failure("The initial worker is no longer the entry node"))?;
-            Some((
-                InvocationTrigger::Root {
-                    authority,
-                    input: input.clone(),
-                },
-                vec![input],
-            ))
-        } else {
-            let pending = context.next_trigger().await.map_err(failure)?;
-            if pending.packages().is_empty() {
-                None
-            } else {
-                let mut payloads = Vec::new();
-                for (_, package) in pending.packages() {
-                    payloads.push(
-                        context
-                            .content(package.content_digest())
-                            .await
-                            .map_err(failure)?
-                            .ok_or_else(|| failure("Pending input content is unavailable"))?,
-                    );
-                }
-                Some((
-                    InvocationTrigger::Packages(
-                        pending.packages().iter().map(|(id, _)| *id).collect(),
-                    ),
-                    payloads,
-                ))
-            }
+        let source = tasks::TaskSource {
+            session: &session,
+            node_id: context.node_id(),
+            initial: initial.is_some(),
+            ledger: &ledger,
+            busy: &[],
         };
-        let Some((trigger, payloads)) = task else {
-            tokio::select! {
-                changed = settings.changed() => { if changed.is_err() { return Ok(()); } }
-                signal = context.next_signal() => {
-                    if !matches!(signal, ExecutionSignal::FrontierChanged(_)) { return Ok(()); }
-                }
+        // Read before choosing, so a backoff that ends meanwhile still wakes us.
+        let wake = ledger.next_wake();
+        let Some(task) = source.next().await.map_err(failure)? else {
+            if !idle(&mut context, &mut settings, &mut retries, wake).await {
+                return Ok(());
             }
             continue;
         };
-        // The frontier read can await; take the latest committed settings at
-        // the task boundary rather than carrying the earlier idle snapshot.
-        let node = settings.borrow_and_update().clone();
-        if matches!(node.kind, NodeKind::Human | NodeKind::Inbox) {
-            if let InvocationTrigger::Root { input, .. } = trigger {
-                initial = Some(input);
-            }
+        // Choosing a task can await: begin it only under the settings it was
+        // chosen with, so the attempt runs under the definition renewed above.
+        if settings.has_changed().unwrap_or(true) {
             continue;
         }
-        let invocation = begin(&context, trigger, &payloads).await?;
+        // The manager may have discarded the initial input since it was offered.
+        if task.is_initial() && super::runtime::initial_complete(&directory).map_err(failure)? {
+            initial = None;
+            continue;
+        }
+        let policy = node.retry_policy();
+        let started = match trigger(&context, &task, initial.as_ref()).await? {
+            Ok((trigger, payloads)) => begin(&context, trigger, &payloads)
+                .await?
+                .map(|invocation| (invocation, payloads)),
+            Err(error) => Err(error),
+        };
+        let (invocation, payloads) = match started {
+            Ok(started) => started,
+            Err(error) => {
+                // The same task on the same graph would fail the same way,
+                // unless an input was taken meanwhile and the task is gone.
+                if source
+                    .current(&task.ids())
+                    .await
+                    .map_err(failure)?
+                    .is_some()
+                {
+                    ledger
+                        .record_failure(&task, &error, false, &policy, &definition)
+                        .map_err(failure)?;
+                }
+                continue;
+            }
+        };
         let outcome = perform(
             &context,
             &invocation,
             &node,
             &project,
             &directory,
+            &workspaces,
             &payloads,
         )
         .await;
         match outcome {
             Ok(()) => {
-                if is_initial {
+                if task.is_initial() {
                     // Core's accepted invocation is authoritative if this
                     // disposable completion marker cannot be written.
-                    let _ = write_json(&directory.join("initial-complete.json"), &true);
+                    let _ = super::runtime::complete_initial(&directory);
+                    initial = None;
                 }
+                // Accepted inputs are consumed, so a record left behind by a
+                // failed write can never select this task again.
+                let _ = ledger.clear(&task.key);
+            }
+            Err(error) if context.stop().is_requested() => {
+                // A stop interrupts the attempt; it is not the task's failure.
+                let _ = invocation.interrupt(error.message()).await;
+                report_failure(&directory, &invocation, &node, &error);
+                return Ok(());
             }
             Err(error) => {
-                let stopped = context.stop().is_requested();
-                if stopped {
-                    let _ = invocation.interrupt(error.message()).await;
-                } else {
-                    let _ = invocation.fail(error.message()).await;
-                }
-                let _ = write_json(
-                    &directory.join("output.json"),
-                    &json!({
-                        "invocation_id":invocation.id().to_string(), "node":node.id,
-                        "publication_status":"failed", "error":error.message(),
-                    }),
-                );
-                return if stopped { Ok(()) } else { Err(error) };
+                // Count the attempt before its failure is visible, so that a
+                // crash in between cannot grant an uncounted retry.
+                let recorded =
+                    ledger.record_failure(&task, error.message(), true, &policy, &definition);
+                let _ = invocation.fail(error.message()).await;
+                report_failure(&directory, &invocation, &node, &error);
+                recorded.map_err(failure)?;
             }
         }
     }
+}
+
+/// Waits until work may have become runnable: new settings, a frontier
+/// change, a retry decision, or the end of a backoff. False means exit.
+async fn idle(
+    context: &mut ExecutionContext,
+    settings: &mut watch::Receiver<DocumentNode>,
+    retries: &mut watch::Receiver<u64>,
+    wake: Option<Instant>,
+) -> bool {
+    tokio::select! {
+        changed = settings.changed() => changed.is_ok(),
+        signal = context.next_signal() => matches!(signal, ExecutionSignal::FrontierChanged(_)),
+        changed = retries.changed() => changed.is_ok(),
+        () = tasks::wake_at(wake) => true,
+    }
+}
+
+/// The node's latest result, as the manager's output view reads it.
+fn report_failure(
+    directory: &Path,
+    invocation: &InvocationHandle,
+    node: &DocumentNode,
+    error: &ExecutionFailure,
+) {
+    let _ = write_json(
+        &directory.join("output.json"),
+        &json!({
+            "invocation_id":invocation.id().to_string(), "node":node.id,
+            "publication_status":"failed", "error":error.message(),
+        }),
+    );
+}
+
+/// The invocation trigger for a task and the payloads its worker receives.
+/// The inner error is the task's own, as in `begin`.
+async fn trigger(
+    context: &ExecutionContext,
+    task: &Task,
+    initial: Option<&Payload>,
+) -> WorkerResult<Result<(InvocationTrigger, Vec<Payload>), String>> {
+    if task.is_initial()
+        && let Some(input) = initial
+    {
+        let authority = context
+            .kernel()
+            .await
+            .map_err(failure)?
+            .root_ceiling(context.node_id())
+            .cloned()
+            .ok_or_else(|| failure("The initial worker is no longer the entry node"))?;
+        return Ok(Ok((
+            InvocationTrigger::Root {
+                authority,
+                input: input.clone(),
+            },
+            vec![input.clone()],
+        )));
+    }
+    let mut payloads = Vec::with_capacity(task.inputs.len());
+    for (_, record) in &task.inputs {
+        match context
+            .content(record.content_digest())
+            .await
+            .map_err(failure)?
+        {
+            Some(payload) => payloads.push(payload),
+            None => return Ok(Err("Pending input content is unavailable".into())),
+        }
+    }
+    Ok(Ok((InvocationTrigger::Packages(task.ids()), payloads)))
 }
 
 async fn accept_initial_sink(
@@ -209,54 +293,73 @@ async fn accept_initial_sink(
         ProposalDecision::Committed(_) => {
             report["publication_status"] = json!("committed");
             let _ = write_json(&directory.join("output.json"), &report);
-            let _ = write_json(&directory.join("initial-complete.json"), &true);
+            let _ = super::runtime::complete_initial(directory);
             Ok(())
         }
-        ProposalDecision::Rejected(error) => Err(failure(error)),
+        ProposalDecision::Rejected(reject) => Err(failure(crate::views::rejection(&reject))),
     }
 }
 
+/// Begins a task's invocation. The inner error is the task's own: it cannot
+/// run as delivered. The outer error stops the worker.
 async fn begin(
     context: &ExecutionContext,
     trigger: InvocationTrigger,
     payloads: &[Payload],
-) -> WorkerResult<InvocationHandle> {
+) -> WorkerResult<Result<InvocationHandle, String>> {
     let mut workspaces = Vec::new();
     for payload in payloads {
-        if let WorkflowPayload::Workspace(envelope) =
-            WorkflowPayload::decode(payload).map_err(failure)?
-        {
-            workspaces.push(envelope.ontography_package);
+        match WorkflowPayload::decode(payload) {
+            Ok(WorkflowPayload::Workspace(envelope)) => {
+                workspaces.push(envelope.ontography_package);
+            }
+            Ok(WorkflowPayload::Message { .. }) => {}
+            Err(error) => return Ok(Err(error.to_string())),
         }
     }
     if workspaces.len() > 1 {
-        return Err(failure(
-            "A task may receive only one workspace; combine workspaces before this node",
+        return Ok(Err(
+            "A task may receive only one workspace; combine workspaces before this node".into(),
         ));
     }
-    let mut policy = ContextPolicy::default();
     let mut contents = Vec::new();
     if let Some(workspace) = workspaces.first() {
         let kernel = context.kernel().await.map_err(failure)?;
-        let output = kernel.graph().edges().iter().find(|edge| edge.source() == context.node_id())
-            .ok_or_else(|| failure("A workspace worker needs an outgoing connection; connect it to an inbox to retain its result"))?;
-        policy.workspace = Some(WorkspacePolicy {
-            input_edge: None,
-            writable: true,
-            output_edge: Some(output.id().into()),
-        });
+        if !kernel
+            .graph()
+            .edges()
+            .iter()
+            .any(|edge| edge.source() == context.node_id())
+        {
+            return Ok(Err("A workspace worker needs an outgoing connection; connect it to an inbox to retain its result".into()));
+        }
+        let packages = PackageStore::new(context.content_store().await.map_err(failure)?);
+        match packages.get(*workspace).await {
+            Ok(PackageDocument::Collection { .. } | PackageDocument::Changes { .. }) => {}
+            Ok(_) => return Ok(Err("A workspace must be a directory".into())),
+            // Storage failing is the worker's problem, not the task's.
+            Err(PackageError::Content(error)) => return Err(failure(error)),
+            Err(error) => return Ok(Err(error.to_string())),
+        }
         if matches!(trigger, InvocationTrigger::Root { .. }) {
-            contents = PackageStore::new(context.content_store().await.map_err(failure)?)
+            contents = packages
                 .resolve(*workspace)
                 .await
                 .map_err(failure)?
                 .dependencies();
         }
     }
-    context
-        .begin_invocation_with_content(trigger, policy, contents)
+    match context
+        .begin_invocation_with_content(trigger, ContextPolicy::default(), contents)
         .await
-        .map_err(failure)
+    {
+        Ok(invocation) => Ok(Ok(invocation)),
+        // Core refused this task as delivered: too large, or no longer here.
+        Err(
+            error @ (ContextError::Denied(_) | ContextError::Budget(_) | ContextError::NotFound),
+        ) => Ok(Err(error.to_string())),
+        Err(error) => Err(failure(error)),
+    }
 }
 
 async fn perform(
@@ -265,36 +368,11 @@ async fn perform(
     node: &DocumentNode,
     project: &Path,
     directory: &Path,
+    workspaces: &WorkspaceStore,
     payloads: &[Payload],
 ) -> WorkerResult<()> {
     // Preparation records the exact source exposure, including resolved package views.
     invocation.prepare_context().await.map_err(failure)?;
-    let workspace_store = WorkspaceStore::new(
-        context.content_store().await.map_err(failure)?,
-        directory.join("workspaces"),
-    );
-    let workspace = if invocation.policy().workspace.is_some() {
-        let (_, base) = invocation.workspace_package().await.map_err(failure)?;
-        tokio::fs::create_dir_all(workspace_store.checkouts_dir())
-            .await
-            .map_err(failure)?;
-        let checkout = workspace_store
-            .checkout(
-                &base,
-                workspace_store
-                    .checkouts_dir()
-                    .join(invocation.id().to_string()),
-            )
-            .await
-            .map_err(failure)?;
-        let exposure = invocation
-            .record_workspace_exposure(base.root())
-            .await
-            .map_err(failure)?;
-        Some((checkout, base.root(), exposure.sequence))
-    } else {
-        None
-    };
     let mut parts = Vec::new();
     if node.kind == NodeKind::Agent {
         parts.push(
@@ -304,13 +382,18 @@ async fn perform(
                 .to_owned(),
         );
     }
+    let mut workspace = None;
     for payload in payloads {
-        if let WorkflowPayload::Message { message } =
-            WorkflowPayload::decode(payload).map_err(failure)?
-        {
-            parts.push(message);
+        match WorkflowPayload::decode(payload).map_err(failure)? {
+            WorkflowPayload::Message { message } => parts.push(message),
+            // `begin` admitted at most one.
+            WorkflowPayload::Workspace(envelope) => workspace = Some(envelope.ontography_package),
         }
     }
+    let workspace = match workspace {
+        Some(root) => Some(open_workspace(invocation, workspaces, root).await?),
+        None => None,
+    };
     let input = parts.join("\n\n");
     let receipt = invocation
         .record_initial_input(input.clone().into_bytes().into())
@@ -318,13 +401,13 @@ async fn perform(
         .map_err(failure)?;
     let cwd = workspace
         .as_ref()
-        .map_or(project, |(checkout, _, _)| checkout.path());
+        .map_or(project, |(checkout, _)| checkout.path());
     let output = process(
         context,
         ProcessInput {
             invocation,
             receipt: receipt.sequence,
-            workspace_receipt: workspace.as_ref().map(|(_, _, sequence)| *sequence),
+            workspace_receipt: workspace.as_ref().map(|(_, exposure)| *exposure),
             node,
             cwd,
             directory,
@@ -333,11 +416,8 @@ async fn perform(
     )
     .await?;
     let mut contents: Vec<ContentId> = Vec::new();
-    let result = if let Some((checkout, base, _)) = &workspace {
-        let capture = workspace_store
-            .capture_staged(checkout.path(), *base)
-            .await
-            .map_err(failure)?;
+    let result = if let Some((checkout, _)) = &workspace {
+        let capture = checkout.capture(workspaces).await.map_err(failure)?;
         let envelope = WorkflowPayload::Workspace(PackageEnvelope::new(capture.package().root()));
         contents = capture.package().dependencies();
         invocation
@@ -378,10 +458,13 @@ async fn perform(
             report["activation_id"] = json!(id.to_string());
         }
         ProposalDecision::Rejected(error) => {
-            return Err(failure(format!("Core rejected worker output: {error}")));
+            return Err(failure(format!(
+                "Core rejected worker output: {}",
+                crate::views::rejection(&error)
+            )));
         }
     }
-    if let Some((checkout, _, _)) = workspace
+    if let Some((checkout, _)) = workspace
         && let Err(error) = checkout.remove().await
     {
         report["cleanup_error"] = json!(error.to_string());
@@ -390,6 +473,42 @@ async fn perform(
     // retry. Status readers can reconcile this cache with the invocation ID.
     let _ = write_json(&directory.join("output.json"), &report);
     Ok(())
+}
+
+/// Checks out a task's workspace as its worker's private, writable directory,
+/// and records what the worker is given, returning the checkout and that
+/// receipt. The workspace must be the root directory of an input core granted
+/// the attempt.
+async fn open_workspace(
+    invocation: &InvocationHandle,
+    store: &WorkspaceStore,
+    root: ContentId,
+) -> WorkerResult<(AttemptCheckout, u64)> {
+    let Some(input) = invocation.members().iter().find(|member| {
+        member.path.is_empty()
+            && matches!(member.kind, ResolvedEntryKind::Directory)
+            && member.package == root
+    }) else {
+        return Err(failure(
+            "The workspace is not a directory the task received",
+        ));
+    };
+    let view = store.open(root).await.map_err(failure)?;
+    let checkout = AttemptCheckout::open(store, &view, &invocation.id().to_string(), true)
+        .await
+        .map_err(failure)?;
+    // The command is given the checkout as its working directory, not these
+    // bytes; the receipt is marked sent when the command starts in it.
+    let mut exposure = checkout.exposure();
+    exposure["handle"] = json!(input.handle);
+    let receipt = invocation
+        .record_tool_response(
+            "workspace_exposure",
+            serde_json::to_vec(&exposure).map_err(failure)?.into(),
+        )
+        .await
+        .map_err(failure)?;
+    Ok((checkout, receipt.sequence))
 }
 
 struct ProcessOutput {
@@ -964,7 +1083,9 @@ fn native_agent_argv(
 mod tests {
     use super::*;
     use crate::workflow::document::{Document, IdentityMap, expand};
-    use ontography::{ExecutionHost, ProposalRuntime};
+    use ontography::{
+        ExecutionHandle, ExecutionHost, InvocationStatus, ProposalRuntime, ReceiptState,
+    };
 
     async fn permit(process: &mut SupervisedProcess) {
         process
@@ -974,6 +1095,36 @@ mod tests {
             .write_all(format!("{}\n", process.token).as_bytes())
             .await
             .unwrap();
+    }
+
+    /// Launches a worker as reconciliation does, with its retry ledger in its
+    /// node directory.
+    async fn launch(
+        host: &ExecutionHost,
+        node: &str,
+        settings: watch::Receiver<DocumentNode>,
+        project: PathBuf,
+        directory: PathBuf,
+        initial: Option<Payload>,
+    ) -> (ExecutionHandle, Arc<RetryLedger>) {
+        let ledger = RetryLedger::open(directory.join("retry.json")).unwrap();
+        let session = host.session().clone();
+        let worker_ledger = ledger.clone();
+        let worker = host
+            .launch(node, move |context| {
+                run(
+                    context,
+                    settings.clone(),
+                    project.clone(),
+                    directory.clone(),
+                    initial.clone(),
+                    session.clone(),
+                    worker_ledger.clone(),
+                )
+            })
+            .await
+            .unwrap();
+        (worker, ledger)
     }
 
     #[tokio::test]
@@ -1306,19 +1457,15 @@ printf changed > artifact.txt
         }
         .encode()
         .unwrap();
-        let project = temporary.path().to_path_buf();
-        let worker = host
-            .launch(ids.nodes["inbox"].clone(), move |context| {
-                run(
-                    context,
-                    settings.clone(),
-                    project.clone(),
-                    directory.clone(),
-                    Some(input.clone()),
-                )
-            })
-            .await
-            .unwrap();
+        let (worker, _) = launch(
+            &host,
+            &ids.nodes["inbox"],
+            settings,
+            temporary.path().to_path_buf(),
+            directory,
+            Some(input),
+        )
+        .await;
         tokio::time::timeout(Duration::from_secs(3), async {
             while !marker.exists() {
                 assert!(!worker.status().is_terminal(), "{:?}", worker.status());
@@ -1363,20 +1510,15 @@ printf changed > artifact.txt
         }
         .encode()
         .unwrap();
-        let directory_for_worker = directory.clone();
-        let worker = host
-            .launch(
-                ids.nodes["command"].clone(),
-                move |context: ExecutionContext| {
-                    let receiver = receiver.clone();
-                    let project = project.clone();
-                    let directory = directory_for_worker.clone();
-                    let first = first.clone();
-                    async move { run(context, receiver, project, directory, Some(first)).await }
-                },
-            )
-            .await
-            .unwrap();
+        let (worker, _) = launch(
+            &host,
+            &ids.nodes["command"],
+            receiver,
+            project,
+            directory.clone(),
+            Some(first),
+        )
+        .await;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if directory.join("initial-complete.json").exists() {
@@ -1473,120 +1615,223 @@ printf changed > artifact.txt
         runtime.shutdown().await;
     }
 
-    async fn command_fixture(
-        config: serde_json::Value,
-    ) -> (
-        tempfile::TempDir,
-        ProposalRuntime,
-        ontography::SessionHandle,
-        ExecutionHost,
-        ontography::ExecutionHandle,
-        IdentityMap,
-    ) {
-        let document: Document = serde_json::from_value(json!({"name":"failure","entry":"source",
-            "nodes":[{"id":"source","kind":"inbox"},{"id":"command","kind":"command","config":config}],
-            "edges":[{"from":"source","to":"command"}]})).unwrap();
-        let ids = IdentityMap::fresh(&document);
-        let compiled = expand(&document, "failure", &ids)
-            .unwrap()
-            .compile()
-            .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
-        let session = runtime.open().unwrap();
-        let host = ExecutionHost::new(session.clone());
-        let temporary = tempfile::tempdir().unwrap();
-        let project = temporary.path().to_path_buf();
-        let node = document
-            .nodes
+    fn strings(packages: &[ontography::PackageId]) -> Vec<String> {
+        packages.iter().map(ToString::to_string).collect()
+    }
+
+    /// Input packages pending at a node, in identity order.
+    async fn pending_inputs(session: &ontography::SessionHandle, node: &str) -> Vec<String> {
+        let page = session.pending_page_at(node, None, 10).await.unwrap();
+        page.packages()
             .iter()
-            .find(|node| node.id == "command")
-            .unwrap()
-            .clone();
-        let (_, settings) = watch::channel(node);
-        let input = WorkflowPayload::Message {
-            message: "input".into(),
-        }
-        .encode()
-        .unwrap();
-        let kernel = session.kernel().await.unwrap();
-        let invocation = session
-            .begin_invocation(
-                ids.nodes["source"].clone(),
-                InvocationTrigger::Root {
-                    authority: kernel.root_ceiling(&ids.nodes["source"]).unwrap().clone(),
-                    input: input.clone(),
-                },
-                ContextPolicy::default(),
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+
+    /// A command worker launched once its inputs are pending.
+    struct CommandFixture {
+        runtime: ProposalRuntime,
+        session: ontography::SessionHandle,
+        worker: ExecutionHandle,
+        ledger: Arc<RetryLedger>,
+        /// The command node's core identity.
+        node: String,
+        /// Inputs pending at launch, in identity order.
+        inputs: Vec<String>,
+        _host: ExecutionHost,
+        // An idle worker exits once its settings sender is gone.
+        _settings: watch::Sender<DocumentNode>,
+        temporary: tempfile::TempDir,
+    }
+
+    impl CommandFixture {
+        /// `command` holds the node's settings, such as config and retry.
+        async fn launch(command: serde_json::Value, messages: &[&str]) -> Self {
+            let mut command = command;
+            command["id"] = json!("command");
+            command["kind"] = json!("command");
+            let document: Document =
+                serde_json::from_value(json!({"name":"failure","entry":"source",
+                "nodes":[{"id":"source","kind":"inbox"},command],
+                "edges":[{"from":"source","to":"command"}]}))
+                .unwrap();
+            let ids = IdentityMap::fresh(&document);
+            let compiled = expand(&document, "failure", &ids)
+                .unwrap()
+                .compile()
+                .unwrap();
+            let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+            let session = runtime.open().unwrap();
+            let host = ExecutionHost::new(session.clone());
+            let temporary = tempfile::tempdir().unwrap();
+            let kernel = session.kernel().await.unwrap();
+            let edge = &ids.edges[&crate::workflow::document::edge_key("source", "command")];
+            for message in messages {
+                let input = WorkflowPayload::Message {
+                    message: (*message).into(),
+                }
+                .encode()
+                .unwrap();
+                let invocation = session
+                    .begin_invocation(
+                        ids.nodes["source"].clone(),
+                        InvocationTrigger::Root {
+                            authority: kernel.root_ceiling(&ids.nodes["source"]).unwrap().clone(),
+                            input: input.clone(),
+                        },
+                        ContextPolicy::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    invocation
+                        .submit(
+                            input.clone(),
+                            vec![Emission::new(edge.as_str(), OutputAuthority::Carry, input)],
+                            vec![]
+                        )
+                        .await
+                        .unwrap(),
+                    ProposalDecision::Committed(_)
+                ));
+            }
+            let node = ids.nodes["command"].clone();
+            let inputs = pending_inputs(&session, &node).await;
+            let settings = document
+                .nodes
+                .iter()
+                .find(|node| node.id == "command")
+                .unwrap()
+                .clone();
+            let (sender, receiver) = watch::channel(settings);
+            let project = temporary.path().to_path_buf();
+            let (worker, ledger) = launch(
+                &host,
+                &node,
+                receiver,
+                project.clone(),
+                project.join("worker"),
+                None,
             )
-            .await
-            .unwrap();
-        let edge = &ids.edges[&crate::workflow::document::edge_key("source", "command")];
-        assert!(matches!(
-            invocation
-                .submit(
-                    input.clone(),
-                    vec![Emission::new(edge.as_str(), OutputAuthority::Carry, input)],
-                    vec![]
-                )
-                .await
-                .unwrap(),
-            ProposalDecision::Committed(_)
-        ));
-        let worker = host
-            .launch(ids.nodes["command"].clone(), move |context| {
-                run(
-                    context,
-                    settings.clone(),
-                    project.clone(),
-                    project.join("worker"),
-                    None,
-                )
+            .await;
+            Self {
+                runtime,
+                session,
+                worker,
+                ledger,
+                node,
+                inputs,
+                _host: host,
+                _settings: sender,
+                temporary,
+            }
+        }
+
+        /// Waits until the node's invocations satisfy `done`.
+        async fn wait_invocations(&self, done: impl Fn(&[ontography::InvocationRecord]) -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let invocations = self
+                        .session
+                        .invocations_page(Some(&self.node), None, 10)
+                        .await
+                        .unwrap();
+                    if done(&invocations) {
+                        break;
+                    }
+                    assert!(
+                        !self.worker.status().is_terminal(),
+                        "{:?}",
+                        self.worker.status()
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             })
             .await
             .unwrap();
-        (temporary, runtime, session, host, worker, ids)
+        }
     }
 
     #[tokio::test]
-    async fn failed_timed_out_and_oversized_commands_preserve_pending_input() {
+    async fn failed_timed_out_and_oversized_commands_park_their_pending_input() {
         for config in [
             json!({"argv":["/bin/sh","-c","exit 7"]}),
             json!({"argv":["/bin/sleep","30"],"timeout_secs":1}),
             json!({"argv":["/usr/bin/yes"]}),
         ] {
-            let (_temporary, runtime, session, _host, worker, ids) = command_fixture(config).await;
-            let status = tokio::time::timeout(Duration::from_secs(5), worker.wait())
-                .await
-                .unwrap();
-            assert!(
-                matches!(status, ontography::ExecutionStatus::Failed(_)),
-                "{status:?}"
-            );
+            let fixture = CommandFixture::launch(
+                json!({"config":config,"retry":{"max_attempts":1}}),
+                &["input"],
+            )
+            .await;
+            // The attempt is counted before its invocation fails.
+            fixture
+                .wait_invocations(|invocations| {
+                    invocations
+                        .first()
+                        .is_some_and(|invocation| invocation.status == InvocationStatus::Failed)
+                })
+                .await;
+            let failed = fixture.ledger.failed();
+            assert_eq!(failed.len(), 1);
+            assert!(failed[0].failures.parked);
+            assert_eq!(failed[0].failures.attempts, 1);
+            assert_eq!(strings(&failed[0].failures.inputs), fixture.inputs);
             assert_eq!(
-                session
-                    .next_trigger_at(ids.nodes["command"].clone())
-                    .await
-                    .unwrap()
-                    .packages()
-                    .len(),
-                1
+                pending_inputs(&fixture.session, &fixture.node).await,
+                fixture.inputs
             );
-            let invocations = session
-                .invocations_page(Some(&ids.nodes["command"]), None, 10)
-                .await
-                .unwrap();
-            assert_eq!(invocations[0].status, ontography::InvocationStatus::Failed);
-            runtime.shutdown().await;
+            // The worker outlives its failed task.
+            assert_eq!(
+                fixture.worker.status(),
+                ontography::ExecutionStatus::Running
+            );
+            fixture.runtime.shutdown().await;
         }
     }
 
     #[tokio::test]
-    async fn stop_terminates_command_group_and_preserves_input() {
-        let (temporary, runtime, session, _host, worker, ids) = command_fixture(
-            json!({"argv":["/bin/sh","-c","sleep 30 & echo $! > child.pid; wait"]}),
+    async fn a_parked_task_does_not_block_later_inputs() {
+        // The first input the command sees always fails. With nothing failed
+        // yet, the worker starts with the first input in identity order.
+        let fixture = CommandFixture::launch(
+            json!({"config":{"argv":["/bin/sh","-c",
+                "read x; [ -e first ] || printf %s \"$x\" > first; [ \"$x\" != \"$(cat first)\" ] || exit 3; printf %s \"$x\""]},
+                "retry":{"max_attempts":2,"initial_delay_secs":0}}),
+            &["one", "two"],
         )
         .await;
-        let pid_file = temporary.path().join("child.pid");
+        fixture
+            .wait_invocations(|invocations| {
+                invocations
+                    .iter()
+                    .any(|invocation| invocation.status == InvocationStatus::Accepted)
+            })
+            .await;
+        let failed = fixture.ledger.failed();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].failures.parked);
+        assert_eq!(failed[0].failures.attempts, 2);
+        assert_eq!(strings(&failed[0].failures.inputs), fixture.inputs[..1]);
+        assert_eq!(
+            pending_inputs(&fixture.session, &fixture.node).await,
+            fixture.inputs[..1]
+        );
+        assert_eq!(
+            fixture.worker.status(),
+            ontography::ExecutionStatus::Running
+        );
+        fixture.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_terminates_command_group_and_preserves_input() {
+        let fixture = CommandFixture::launch(
+            json!({"config":{"argv":["/bin/sh","-c","sleep 30 & echo $! > child.pid; wait"]}}),
+            &["input"],
+        )
+        .await;
+        let pid_file = fixture.temporary.path().join("child.pid");
         let child: i32 = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(pid) = std::fs::read_to_string(&pid_file)
@@ -1600,9 +1845,9 @@ printf changed > artifact.txt
         })
         .await
         .unwrap();
-        worker.request_stop();
+        fixture.worker.request_stop();
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), worker.wait())
+            tokio::time::timeout(Duration::from_secs(3), fixture.worker.wait())
                 .await
                 .unwrap(),
             ontography::ExecutionStatus::Exited
@@ -1615,15 +1860,12 @@ printf changed > artifact.txt
         .await
         .unwrap();
         assert_eq!(
-            session
-                .next_trigger_at(ids.nodes["command"].clone())
-                .await
-                .unwrap()
-                .packages()
-                .len(),
-            1
+            pending_inputs(&fixture.session, &fixture.node).await,
+            fixture.inputs
         );
-        runtime.shutdown().await;
+        // Stopping interrupts the attempt without counting it as a failure.
+        assert!(fixture.ledger.failed().is_empty());
+        fixture.runtime.shutdown().await;
     }
 
     #[tokio::test]
@@ -1656,18 +1898,15 @@ printf changed > artifact.txt
         let (sender, settings) = watch::channel(node);
         let directory = temporary.path().join("worker");
         let complete = directory.join("initial-complete.json");
-        let worker = host
-            .launch(ids.nodes["command"].clone(), move |context| {
-                run(
-                    context,
-                    settings.clone(),
-                    source.clone(),
-                    directory.clone(),
-                    Some(initial.clone()),
-                )
-            })
-            .await
-            .unwrap();
+        let (worker, _) = launch(
+            &host,
+            &ids.nodes["command"],
+            settings,
+            source,
+            directory,
+            Some(initial),
+        )
+        .await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while !complete.exists() {
                 assert!(!worker.status().is_terminal(), "{:?}", worker.status());
@@ -1709,6 +1948,274 @@ printf changed > artifact.txt
             std::fs::read_to_string(temporary.path().join("source/file.txt")).unwrap(),
             "original"
         );
+        // The app owns the checkout: core's policy names no workspace, and the
+        // attempt's evidence records what the command was given.
+        let invocations = session
+            .invocations_page(Some(&ids.nodes["command"]), None, 10)
+            .await
+            .unwrap();
+        let [invocation] = &invocations[..] else {
+            panic!("expected one attempt, got {invocations:?}");
+        };
+        assert_eq!(invocation.policy.workspace, None);
+        let events = session
+            .invocation_events(invocation.id, 0, 100)
+            .await
+            .unwrap();
+        let exposure = events
+            .iter()
+            .find(|event| {
+                event.operation == "tool_response" && event.source["tool"] == "workspace_exposure"
+            })
+            .expect("the checkout's exposure is recorded");
+        let exposed: serde_json::Value = serde_json::from_slice(
+            &session
+                .invocation_content(invocation.id, exposure.sequence, 0..exposure.bytes)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exposed["root"], json!(base.root()));
+        assert_eq!(exposed["writable"], true);
+        let checkout = PathBuf::from(exposed["path"].as_str().unwrap());
+        assert!(checkout.ends_with(invocation.id.to_string()));
+        assert!(!checkout.exists());
+        // It was marked sent once the command started.
+        assert!(events.iter().any(|event| {
+            event.receipt_sequence == exposure.sequence && event.state == ReceiptState::Sent
+        }));
+        worker.request_stop();
+        worker.wait().await;
+        drop(sender);
+        runtime.shutdown().await;
+    }
+
+    /// A file sent as a workspace can never be checked out as a directory, so
+    /// its task parks at once, before any command runs, under the default
+    /// retry policy. The worker keeps running.
+    #[tokio::test]
+    async fn a_file_sent_as_a_workspace_parks_at_once_and_the_worker_keeps_running() {
+        let document = Document::parse(r#"{"name":"file-workspace","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}},{"id":"output","kind":"inbox"}],"edges":[{"from":"command","to":"output"}]}"#).unwrap();
+        let ids = IdentityMap::fresh(&document);
+        let compiled = expand(&document, "file-workspace", &ids)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let session = runtime.open().unwrap();
+        let host = ExecutionHost::new(session.clone());
+        let temporary = tempfile::tempdir().unwrap();
+        let content = session.content_store().await.unwrap();
+        let text = content.import_bytes(b"text".to_vec()).await.unwrap();
+        let file = PackageStore::new(content)
+            .put(&ontography::PackageDocument::File {
+                content: text,
+                executable: false,
+            })
+            .await
+            .unwrap();
+        let initial = WorkflowPayload::Workspace(PackageEnvelope::new(file))
+            .encode()
+            .unwrap();
+        let node = document
+            .nodes
+            .iter()
+            .find(|node| node.id == "command")
+            .unwrap()
+            .clone();
+        let (sender, settings) = watch::channel(node);
+        let (worker, ledger) = launch(
+            &host,
+            &ids.nodes["command"],
+            settings,
+            temporary.path().to_path_buf(),
+            temporary.path().join("worker"),
+            Some(initial),
+        )
+        .await;
+        let failed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(failed) = ledger.failed().pop() {
+                    break failed;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(failed.failures.parked && failed.failures.attempts == 1);
+        assert!(
+            failed.failures.error.contains("must be a directory"),
+            "{}",
+            failed.failures.error
+        );
+        assert_eq!(worker.status(), ontography::ExecutionStatus::Running);
+        assert!(!temporary.path().join("should-not-run").exists());
+        drop(sender);
+        runtime.shutdown().await;
+    }
+
+    /// A symlink sent as a workspace can never be checked out as a directory
+    /// either, so its task parks at once as well.
+    #[tokio::test]
+    async fn a_symlink_sent_as_a_workspace_parks_at_once() {
+        let document = Document::parse(r#"{"name":"symlink-workspace","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}},{"id":"output","kind":"inbox"}],"edges":[{"from":"command","to":"output"}]}"#).unwrap();
+        let ids = IdentityMap::fresh(&document);
+        let compiled = expand(&document, "symlink-workspace", &ids)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let session = runtime.open().unwrap();
+        let host = ExecutionHost::new(session.clone());
+        let temporary = tempfile::tempdir().unwrap();
+        let content = session.content_store().await.unwrap();
+        let link = PackageStore::new(content)
+            .put(&ontography::PackageDocument::Symlink {
+                target: "elsewhere".into(),
+            })
+            .await
+            .unwrap();
+        let initial = WorkflowPayload::Workspace(PackageEnvelope::new(link))
+            .encode()
+            .unwrap();
+        let node = document
+            .nodes
+            .iter()
+            .find(|node| node.id == "command")
+            .unwrap()
+            .clone();
+        let (sender, settings) = watch::channel(node);
+        let (worker, ledger) = launch(
+            &host,
+            &ids.nodes["command"],
+            settings,
+            temporary.path().to_path_buf(),
+            temporary.path().join("worker"),
+            Some(initial),
+        )
+        .await;
+        let failed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(failed) = ledger.failed().pop() {
+                    break failed;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            failed.failures.parked && failed.failures.attempts == 1,
+            "a symlink workspace should park at once like a file, got {:?}",
+            failed.failures
+        );
+        assert!(!temporary.path().join("should-not-run").exists());
+        worker.request_stop();
+        worker.wait().await;
+        drop(sender);
+        runtime.shutdown().await;
+    }
+
+    /// Checkouts a crash left behind are removed when a worker starts, even
+    /// read-only ones: no attempt will ever finish them.
+    #[tokio::test]
+    async fn abandoned_checkouts_are_removed_when_a_worker_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let document = Document::parse(r#"{"name":"abandoned","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/true"]}}]}"#).unwrap();
+        let ids = IdentityMap::fresh(&document);
+        let compiled = expand(&document, "abandoned", &ids)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let session = runtime.open().unwrap();
+        let host = ExecutionHost::new(session.clone());
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("worker");
+        let abandoned = directory.join("workspaces/checkouts/crashed");
+        std::fs::create_dir_all(abandoned.join("nested")).unwrap();
+        std::fs::write(abandoned.join("nested/file.txt"), "left behind").unwrap();
+        for path in [abandoned.join("nested"), abandoned.clone()] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let (sender, settings) = watch::channel(document.nodes[0].clone());
+        let (worker, _) = launch(
+            &host,
+            &ids.nodes["command"],
+            settings,
+            temporary.path().to_path_buf(),
+            directory,
+            None,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while abandoned.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the abandoned checkout is removed");
+        assert_eq!(worker.status(), ontography::ExecutionStatus::Running);
+        worker.request_stop();
+        worker.wait().await;
+        drop(sender);
+        runtime.shutdown().await;
+    }
+
+    /// Startup cleanup is best-effort: a leftover checkout the app cannot
+    /// delete, here holding a file with the user-immutable flag, stays behind,
+    /// and the worker runs anyway.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_worker_starts_even_if_an_abandoned_checkout_cannot_be_removed() {
+        let document = Document::parse(r#"{"name":"undeletable","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/true"]}}]}"#).unwrap();
+        let ids = IdentityMap::fresh(&document);
+        let compiled = expand(&document, "undeletable", &ids)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let session = runtime.open().unwrap();
+        let host = ExecutionHost::new(session.clone());
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("worker");
+        let abandoned = directory.join("workspaces/checkouts/crashed");
+        std::fs::create_dir_all(&abandoned).unwrap();
+        let locked = abandoned.join("locked.txt");
+        std::fs::write(&locked, "cannot be unlinked").unwrap();
+        let chflags = |flag: &str| {
+            std::process::Command::new("/usr/bin/chflags")
+                .arg(flag)
+                .arg(&locked)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(chflags("uchg"));
+        let (sender, settings) = watch::channel(document.nodes[0].clone());
+        let (worker, _) = launch(
+            &host,
+            &ids.nodes["command"],
+            settings,
+            temporary.path().to_path_buf(),
+            directory,
+            None,
+        )
+        .await;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && !worker.status().is_terminal() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let status = worker.status();
+        // Unlock first, so the temporary directory can always be removed.
+        assert!(chflags("nouchg"));
+        assert_eq!(
+            status,
+            ontography::ExecutionStatus::Running,
+            "an undeletable leftover checkout stopped the worker"
+        );
         worker.request_stop();
         worker.wait().await;
         drop(sender);
@@ -1716,7 +2223,7 @@ printf changed > artifact.txt
     }
 
     #[tokio::test]
-    async fn workspace_without_output_route_fails_before_running_a_command() {
+    async fn workspace_without_output_route_parks_its_task_before_running_a_command() {
         let document = Document::parse(r#"{"name":"terminal-workspace","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}}]}"#).unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "terminal-workspace", &ids)
@@ -1738,26 +2245,31 @@ printf changed > artifact.txt
             .encode()
             .unwrap();
         let (sender, settings) = watch::channel(document.nodes[0].clone());
-        let directory = temporary.path().join("worker");
-        let worker = host
-            .launch(ids.nodes["command"].clone(), move |context| {
-                run(
-                    context,
-                    settings.clone(),
-                    source.clone(),
-                    directory.clone(),
-                    Some(initial.clone()),
-                )
-            })
-            .await
-            .unwrap();
-        let status = tokio::time::timeout(Duration::from_secs(3), worker.wait())
-            .await
-            .unwrap();
-        let ontography::ExecutionStatus::Failed(error) = status else {
-            panic!("{status:?}");
-        };
-        assert!(error.message().contains("outgoing connection"));
+        let (worker, ledger) = launch(
+            &host,
+            &ids.nodes["command"],
+            settings,
+            source,
+            temporary.path().join("worker"),
+            Some(initial),
+        )
+        .await;
+        let failed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(failed) = ledger.failed().pop() {
+                    break failed;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Retrying the same input on the same graph cannot succeed.
+        assert!(failed.failures.parked);
+        assert_eq!(failed.failures.attempts, 1);
+        assert!(failed.failures.error.contains("outgoing connection"));
+        assert_eq!(failed.key, Task::initial(&ids.nodes["command"]).key);
+        assert_eq!(worker.status(), ontography::ExecutionStatus::Running);
         assert!(!temporary.path().join("source/should-not-run").exists());
         assert!(
             session
@@ -1768,5 +2280,277 @@ printf changed > artifact.txt
         );
         drop(sender);
         runtime.shutdown().await;
+    }
+
+    /// Submits a root or package-triggered activation at `node` that emits
+    /// `payload` on `edge`, as a finished upstream task would.
+    async fn emit_on(
+        session: &ontography::SessionHandle,
+        node: &str,
+        trigger: Option<ontography::PackageId>,
+        edge: &str,
+        payload: Payload,
+    ) {
+        let kernel = session.kernel().await.unwrap();
+        let mut proposal = match trigger {
+            Some(package) => ontography::ActivationProposal::join([package], payload.clone()),
+            None => ontography::ActivationProposal::root(
+                node,
+                kernel.root_ceiling(node).unwrap().clone(),
+                payload.clone(),
+            ),
+        };
+        proposal.emit(Emission::new(edge, OutputAuthority::Carry, payload));
+        assert!(matches!(
+            session.submit(proposal).await.unwrap(),
+            ProposalDecision::Committed(_)
+        ));
+    }
+
+    fn text(message: &str) -> Payload {
+        WorkflowPayload::Message {
+            message: message.into(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// A task fails "when the task cannot start as delivered", and its worker
+    /// keeps running. Core refuses to begin an input larger than the attempt's
+    /// context budget; that is the task's failure, not the worker's.
+    #[tokio::test]
+    async fn an_input_core_refuses_to_begin_is_recorded_and_the_worker_keeps_running() {
+        let fixture =
+            CommandFixture::launch(json!({"config":{"argv":["/bin/cat"]}}), &["small"]).await;
+        let kernel = fixture.session.kernel().await.unwrap();
+        let edge = kernel
+            .graph()
+            .edges()
+            .iter()
+            .find(|edge| edge.target() == fixture.node)
+            .unwrap()
+            .clone();
+        emit_on(
+            &fixture.session,
+            edge.source(),
+            None,
+            edge.id(),
+            text(&"x".repeat(9 * 1024 * 1024)),
+        )
+        .await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.worker.status().is_terminal() {
+                    break format!("worker stopped: {:?}", fixture.worker.status());
+                }
+                if !fixture.ledger.failed().is_empty() {
+                    break "recorded".to_owned();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome, "recorded",
+            "an input that cannot start must be recorded against its task"
+        );
+        assert_eq!(
+            fixture.worker.status(),
+            ontography::ExecutionStatus::Running
+        );
+        fixture.runtime.shutdown().await;
+    }
+
+    /// A failed task waits while other tasks at the node proceed, at `all`
+    /// nodes too. Core's own next join is the least package on every edge, so
+    /// the parked input stays first on its edge in about half of the trials;
+    /// the node must still run a complete join without it.
+    #[tokio::test]
+    async fn a_parked_join_does_not_block_later_joins_at_an_all_node() {
+        // Joined messages arrive in package order; fail on "bad" anywhere.
+        const JOIN: &str = r#"x=$(cat); case "$x" in *bad*) exit 3;; esac; printf ok"#;
+        for _trial in 0..24 {
+            let document: Document = serde_json::from_value(json!({
+                "name": "join", "entry": "feed",
+                "nodes": [
+                    {"id": "feed", "kind": "inbox"},
+                    {"id": "left", "kind": "inbox"},
+                    {"id": "right", "kind": "inbox"},
+                    {"id": "join", "kind": "command", "join": "all",
+                        "config": {"argv": ["/bin/sh", "-c", JOIN]}, "retry": {"max_attempts": 1}},
+                    {"id": "done", "kind": "inbox"}],
+                "edges": [
+                    {"from": "feed", "to": "left"}, {"from": "feed", "to": "right"},
+                    {"from": "left", "to": "join"}, {"from": "right", "to": "join"},
+                    {"from": "join", "to": "done"}],
+            }))
+            .unwrap();
+            let ids = IdentityMap::fresh(&document);
+            let compiled = expand(&document, "join", &ids).unwrap().compile().unwrap();
+            let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+            let session = runtime.open().unwrap();
+            let host = ExecutionHost::new(session.clone());
+            let temporary = tempfile::tempdir().unwrap();
+            let edge = |from: &str, to: &str| {
+                ids.edges[&crate::workflow::document::edge_key(from, to)].clone()
+            };
+            let node = ids.nodes["join"].clone();
+            // A seed at `feed` reaches `left` and `right`; each forwards its message to `join`.
+            let deliver = async |left: &str, right: &str| {
+                for (side, message) in [("left", left), ("right", right)] {
+                    emit_on(
+                        &session,
+                        &ids.nodes["feed"],
+                        None,
+                        &edge("feed", side),
+                        text("seed"),
+                    )
+                    .await;
+                    let page = session
+                        .pending_page_at(ids.nodes[side].clone(), None, 10)
+                        .await
+                        .unwrap();
+                    let (package, _) = page.packages()[0];
+                    emit_on(
+                        &session,
+                        &ids.nodes[side],
+                        Some(package),
+                        &edge(side, "join"),
+                        text(message),
+                    )
+                    .await;
+                }
+            };
+            deliver("bad", "r1").await;
+            let settings = document
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == "join")
+                .unwrap()
+                .clone();
+            let (sender, receiver) = watch::channel(settings);
+            let project = temporary.path().to_path_buf();
+            let (worker, ledger) = launch(
+                &host,
+                &node,
+                receiver,
+                project.clone(),
+                project.join("worker"),
+                None,
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ledger.failed().iter().any(|failed| failed.failures.parked) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the bad join parks");
+            deliver("good", "r2").await;
+            // Which left input does core pair first now?
+            let head = session.next_trigger_at(node.clone()).await.unwrap();
+            let mut messages = Vec::new();
+            for (_, record) in head.packages() {
+                let bytes = session
+                    .content(record.content_digest())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let WorkflowPayload::Message { message } =
+                    WorkflowPayload::decode(&bytes).unwrap()
+                {
+                    messages.push(message);
+                }
+            }
+            if messages.iter().any(|message| message == "good") {
+                // The good input is least on its edge: not the case under test.
+                worker.request_stop();
+                worker.wait().await;
+                drop(sender);
+                runtime.shutdown().await;
+                continue;
+            }
+            // "good" and a right input form a complete join that excludes the bad input.
+            let accepted = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let invocations = session
+                        .invocations_page(Some(&node), None, 20)
+                        .await
+                        .unwrap();
+                    if invocations
+                        .iter()
+                        .any(|invocation| invocation.status == InvocationStatus::Accepted)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            let parked = ledger.failed();
+            worker.request_stop();
+            worker.wait().await;
+            drop(sender);
+            runtime.shutdown().await;
+            assert!(
+                accepted.is_ok(),
+                "a complete join without the parked input never ran; core's head join {messages:?}; failures {parked:#?}"
+            );
+            return;
+        }
+        panic!("no trial placed the parked input first on its edge");
+    }
+
+    /// An attempt still running when its node's definition changes fails
+    /// afterwards. Its failure counts against the old definition, so the new
+    /// one attempts the task afresh instead of finding it parked.
+    #[tokio::test]
+    async fn an_attempt_begun_under_an_old_definition_does_not_park_the_new_one() {
+        let fixture = CommandFixture::launch(
+            json!({"config":{"argv":["/bin/sh","-c","sleep 1; exit 3"]},"retry":{"max_attempts":1}}),
+            &["input"],
+        )
+        .await;
+        let old = fixture._settings.borrow().clone();
+        // Reconcile renews every ledger before launching its worker.
+        fixture.ledger.renew(&old.digest()).unwrap();
+        fixture
+            .wait_invocations(|invocations| {
+                invocations
+                    .first()
+                    .is_some_and(|invocation| invocation.status == InvocationStatus::Open)
+            })
+            .await;
+        // The manager fixes the command while its attempt runs, as reconcile
+        // applies it: new settings, then the renewed ledger.
+        let mut fixed = old.clone();
+        fixed.config = json!({"argv":["/bin/sh","-c","printf fixed"]});
+        fixture._settings.send_replace(fixed.clone());
+        fixture.ledger.renew(&fixed.digest()).unwrap();
+        // The old attempt fails; the fixed command should then run the task.
+        let accepted = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let invocations = fixture
+                    .session
+                    .invocations_page(Some(&fixture.node), None, 10)
+                    .await
+                    .unwrap();
+                if invocations
+                    .iter()
+                    .any(|invocation| invocation.status == InvocationStatus::Accepted)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let failed = fixture.ledger.failed();
+        fixture.runtime.shutdown().await;
+        assert!(
+            accepted.is_ok(),
+            "the fixed definition never attempted the task; failures {failed:#?}"
+        );
     }
 }

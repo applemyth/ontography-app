@@ -1,7 +1,9 @@
 //! The manager's complete workflow interface. Core identities stay behind it.
 
 use super::{
-    Document, IdentityMap, NodeKind, WorkflowPayload, artifacts, edit, expand, output, runtime,
+    Document, DocumentNode, IdentityMap, NodeKind, WorkflowPayload, artifacts, edit, expand,
+    output, runtime,
+    tasks::{self, RetryLedger, TaskKey},
 };
 use crate::{
     AppError, Result,
@@ -11,8 +13,8 @@ use crate::{
     views,
 };
 use ontography::{
-    ContextPolicy, Emission, InvocationTrigger, OutputAuthority, PackageId, PackageStore, Payload,
-    ProposalDecision,
+    ContextPolicy, Emission, InvocationTrigger, OutputAuthority, PackageStore, Payload,
+    ProposalDecision, RetireError,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -23,6 +25,7 @@ pub fn operations() -> Vec<Operation> {
     let text = json!({"type":"string"});
     let document = crate::catalog::schema::<Document>();
     let run = json!({"run_id":text});
+    let task = json!({"run_id":text,"node":text,"task_id":text});
     let source = json!({"enum":["auto","output","pending"]});
     vec![
         Operation::new(
@@ -41,7 +44,7 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.status",
-            "Read the document, pending edit, workers and ready human tasks using workflow names.",
+            "Read the document, pending edit, workers, ready tasks and failed tasks using workflow names.",
             run.clone(),
             &["run_id"],
             false,
@@ -69,7 +72,7 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.resume",
-            "Recover an interrupted edit and restart stopped or failed workers. Accepted initial input is never replayed.",
+            "Recover an interrupted edit and restart stopped or failed workers. Failure counts are kept and parked tasks stay parked; retry them with flow.retry. Accepted initial input is never replayed.",
             run.clone(),
             &["run_id"],
             true,
@@ -78,6 +81,20 @@ pub fn operations() -> Vec<Operation> {
             "flow.decide",
             "Complete a specific human task with a message or captured workspace. The result goes to all connected successors.",
             json!({"run_id":text,"node":text,"task_id":text,"message":text,"workspace_id":text}),
+            &["run_id", "node", "task_id"],
+            true,
+        ),
+        Operation::new(
+            "flow.retry",
+            "Give a failed agent or command task fresh attempts, starting now; without task_id, every failed task at the node. Take task IDs from status failures.",
+            task.clone(),
+            &["run_id", "node"],
+            true,
+        ),
+        Operation::new(
+            "flow.discard",
+            "Discard a parked task so it is never attempted again: its pending input is retired, or a parked initial input is marked complete. Take its task_id from status failures.",
+            task,
             &["run_id", "node", "task_id"],
             true,
         ),
@@ -289,6 +306,19 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             status(&run).await
         }
         "flow.decide" => decide(&mut run, &state, args).await,
+        "flow.retry" => {
+            let (_, ledger) = failure_ledger(&run, &state, args)?;
+            match optional_str(args, "task_id")? {
+                Some(task) => {
+                    ledger
+                        .clear(&TaskKey::parse(task)?)?
+                        .ok_or_else(unknown_failure)?;
+                }
+                None => ledger.retry_all()?,
+            }
+            status(&run).await
+        }
+        "flow.discard" => discard(&run, &state, args).await,
         "flow.workspace" => {
             let mut internal = args.clone();
             let node_source = args["action"] == "open"
@@ -333,8 +363,9 @@ fn plan_path(run: &ManagedRun, id: &str) -> Result<PathBuf> {
     Ok(run.directory.join("edit-plans").join(format!("{id}.json")))
 }
 
+/// A task as the manager sees it: workflow names and a preview of its input.
 #[derive(Serialize)]
-pub struct Task {
+pub struct TaskView {
     pub node: String,
     pub task_id: String,
     pub kind: NodeKind,
@@ -343,18 +374,13 @@ pub struct Task {
     #[serde(skip)]
     pub(super) raw_input: Value,
     #[serde(skip)]
-    packages: Vec<PackageId>,
-    #[serde(skip)]
-    initial: bool,
+    task: tasks::Task,
 }
 
-fn task_id(node: &str, packages: &[PackageId]) -> String {
-    let ids: Vec<_> = packages.iter().map(ToString::to_string).collect();
-    format!("task_{:x}", Sha256::digest(json!([node, ids]).to_string()))
-}
-
-pub(super) fn work_id(package: &str) -> String {
-    format!("work_{:x}", Sha256::digest(package))
+/// A task the manager may select, before its input is read.
+pub(super) struct Candidate<'a> {
+    pub node: &'a DocumentNode,
+    pub task: tasks::Task,
 }
 
 pub(super) fn payload_view(value: &Value) -> Value {
@@ -375,33 +401,57 @@ pub(super) fn payload_view(value: &Value) -> Value {
     value.clone()
 }
 
-pub async fn tasks(run: &ManagedRun, state: &edit::WorkflowState) -> Result<Vec<Task>> {
-    ready_tasks(run, state, None).await
-}
-
-pub(super) async fn ready_task(
-    run: &ManagedRun,
-    state: &edit::WorkflowState,
-    node: &str,
-) -> Result<Option<Task>> {
-    run.live()?;
-    Ok(ready_tasks(run, state, Some(node)).await?.pop())
-}
-
-async fn ready_tasks(
-    run: &ManagedRun,
-    state: &edit::WorkflowState,
-    only: Option<&str>,
-) -> Result<Vec<Task>> {
-    if run.live.is_none() {
-        return Ok(vec![]);
+pub async fn tasks(run: &ManagedRun, state: &edit::WorkflowState) -> Result<Vec<TaskView>> {
+    let initial = initial_holder(run).await?;
+    let mut views = Vec::new();
+    for candidate in ready_tasks(run, state, None, initial).await? {
+        views.push(task_view(run, candidate).await?);
     }
-    let session = &run.live()?.session;
-    let kernel = session.kernel().await.map_err(AppError::core)?;
+    Ok(views)
+}
+
+/// Tasks the manager may select at one node: the one it runs or awaits a
+/// decision on next, then failed tasks that wait out a backoff or are parked.
+pub(super) async fn node_tasks<'a>(
+    run: &ManagedRun,
+    state: &'a edit::WorkflowState,
+    node: &str,
+) -> Result<Vec<Candidate<'a>>> {
+    run.live()?;
+    let initial = initial_holder(run).await?;
+    let mut selectable = ready_tasks(run, state, Some(node), initial).await?;
+    for failed in failed_tasks(run, state, Some(node), initial).await? {
+        if selectable
+            .iter()
+            .all(|candidate| candidate.task.key != failed.task.key)
+        {
+            selectable.push(Candidate {
+                node: failed.node,
+                task: failed.task,
+            });
+        }
+    }
+    Ok(selectable)
+}
+
+/// The core node holding the run's initial input while it is still pending.
+async fn initial_holder(run: &ManagedRun) -> Result<Option<&str>> {
     let initial = run.manifest.workflow.as_ref().expect("workflow loaded");
-    let original_entry = &initial.state.identities.nodes[&initial.state.current.entry];
-    let pending_initial = runtime::initial_pending(run).await?;
-    let mut tasks = Vec::new();
+    let entry = &initial.state.identities.nodes[&initial.state.current.entry];
+    Ok((run.live.is_some() && runtime::initial_pending(run).await?).then_some(entry.as_str()))
+}
+
+async fn ready_tasks<'a>(
+    run: &ManagedRun,
+    state: &'a edit::WorkflowState,
+    only: Option<&str>,
+    initial: Option<&str>,
+) -> Result<Vec<Candidate<'a>>> {
+    let Some(live) = &run.live else {
+        return Ok(vec![]);
+    };
+    let kernel = live.session.kernel().await.map_err(AppError::core)?;
+    let mut ready = Vec::new();
     for node in state
         .current
         .nodes
@@ -412,59 +462,232 @@ async fn ready_tasks(
         if kernel.graph().node(id).is_none() {
             continue;
         }
-        if pending_initial && id == original_entry {
-            let raw_input = serde_json::from_slice(&runtime::initial_payload(run).await?)?;
-            tasks.push(Task {
-                node: node.id.clone(),
-                task_id: task_id(id, &[]),
-                kind: node.kind,
-                input: payload_view(&raw_input),
-                raw_input,
-                work_ids: vec![],
-                packages: vec![],
-                initial: true,
-            });
-            continue;
-        }
-        let frontier = session
-            .next_trigger_at(id.as_str())
-            .await
-            .map_err(AppError::core)?;
-        if frontier.packages().is_empty() {
-            continue;
-        }
-        let mut inputs = Vec::new();
-        for (_, package) in frontier.packages() {
-            let bytes = session
-                .content(package.content_digest())
+        let holds_initial = initial == Some(id.as_str());
+        let task = if node.runs_tasks() {
+            // Exactly what its worker runs next; failed tasks that wait or are
+            // parked appear among the failures instead.
+            let Some(worker) = live.workers.get(id) else {
+                continue;
+            };
+            let next = tasks::TaskSource {
+                session: &live.session,
+                node_id: id,
+                initial: holds_initial,
+                ledger: &worker.ledger,
+                busy: &[],
+            }
+            .next()
+            .await?;
+            let Some(task) = next else {
+                continue;
+            };
+            task
+        } else if holds_initial {
+            tasks::Task::initial(id)
+        } else {
+            let frontier = live
+                .session
+                .next_trigger_at(id.as_str())
                 .await
-                .map_err(AppError::core)?
-                .ok_or_else(|| AppError::new("missing_content", "Task input is unavailable"))?;
-            inputs.push(serde_json::from_slice::<Value>(&bytes)?);
+                .map_err(AppError::core)?;
+            if frontier.packages().is_empty() {
+                continue;
+            }
+            tasks::Task::packages(id, frontier.packages().to_vec())
+        };
+        ready.push(Candidate { node, task });
+    }
+    Ok(ready)
+}
+
+pub(super) async fn task_view(run: &ManagedRun, candidate: Candidate<'_>) -> Result<TaskView> {
+    let Candidate { node, task } = candidate;
+    let raw_input = if task.is_initial() {
+        serde_json::from_slice(&runtime::initial_payload(run).await?)?
+    } else {
+        let mut inputs = Vec::with_capacity(task.inputs.len());
+        for (_, record) in &task.inputs {
+            inputs.push(output::input(run, record).await?);
         }
-        let packages: Vec<_> = frontier.packages().iter().map(|(id, _)| *id).collect();
-        let raw_input = if inputs.len() == 1 {
+        if inputs.len() == 1 {
             inputs.remove(0)
         } else {
             json!(inputs)
-        };
-        tasks.push(Task {
-            node: node.id.clone(),
-            task_id: task_id(id, &packages),
-            kind: node.kind,
-            input: payload_view(&raw_input),
-            raw_input,
-            work_ids: packages.iter().map(|id| work_id(&id.to_string())).collect(),
-            packages,
-            initial: false,
-        });
+        }
+    };
+    Ok(TaskView {
+        node: node.id.clone(),
+        task_id: task.key.to_string(),
+        kind: node.kind,
+        input: payload_view(&raw_input),
+        raw_input,
+        work_ids: task
+            .inputs
+            .iter()
+            .map(|(id, _)| tasks::work_id(id))
+            .collect(),
+        task,
+    })
+}
+
+/// A failed task whose input is still pending at its node.
+struct Failed<'a> {
+    node: &'a DocumentNode,
+    task: tasks::Task,
+    record: tasks::FailedTask,
+}
+
+impl Failed<'_> {
+    fn view(&self) -> Value {
+        let failures = &self.record.failures;
+        let mut view = json!({"node":self.node.id,"task_id":self.task.key,"attempts":failures.attempts,
+            "error":failures.error,"state":if failures.parked {"parked"} else {"retrying"}});
+        if let Some(wait) = self.record.retry_in {
+            view["retry_in_secs"] = json!(tasks::ceil_secs(wait));
+        }
+        view
     }
-    Ok(tasks)
+}
+
+/// Failed tasks in document order. A record whose task is gone, because an
+/// input was consumed or retired or a join no longer matches its node's
+/// connections, is dropped from the ledger once no edit is in progress.
+async fn failed_tasks<'a>(
+    run: &ManagedRun,
+    state: &'a edit::WorkflowState,
+    only: Option<&str>,
+    initial: Option<&str>,
+) -> Result<Vec<Failed<'a>>> {
+    let Some(live) = &run.live else {
+        return Ok(vec![]);
+    };
+    let mut failed = Vec::new();
+    for node in state
+        .current
+        .nodes
+        .iter()
+        .filter(|node| only.is_none_or(|id| node.id == id))
+    {
+        let id = &state.identities.nodes[&node.id];
+        let Some(worker) = live.workers.get(id) else {
+            continue;
+        };
+        let source = tasks::TaskSource {
+            session: &live.session,
+            node_id: id,
+            initial: initial == Some(id.as_str()),
+            ledger: &worker.ledger,
+            busy: &[],
+        };
+        for (record, task) in source.failures().await? {
+            match task {
+                Some(task) => failed.push(Failed { node, task, record }),
+                // Only a stale record changes; a failed write just keeps it.
+                None if state.pending.is_none() => {
+                    let _ = worker.ledger.clear(&record.key);
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(failed)
+}
+
+/// The core node and retry ledger of the node a manager request names. Only
+/// agent and command tasks fail.
+fn failure_ledger<'a>(
+    run: &'a ManagedRun,
+    state: &'a edit::WorkflowState,
+    args: &Value,
+) -> Result<(&'a str, &'a RetryLedger)> {
+    let node = views::field(args, "node")?;
+    let definition = state
+        .current
+        .nodes
+        .iter()
+        .find(|candidate| candidate.id == node)
+        .ok_or_else(|| AppError::invalid("Unknown workflow node"))?;
+    if !definition.runs_tasks() {
+        return Err(AppError::invalid(
+            "Only agent and command tasks fail and retry",
+        ));
+    }
+    let id = &state.identities.nodes[node];
+    let worker = run.live()?.workers.get(id).ok_or_else(|| {
+        AppError::new(
+            "worker_unavailable",
+            "This node has no worker; resume the run",
+        )
+    })?;
+    Ok((id, &worker.ledger))
+}
+
+fn unknown_failure() -> AppError {
+    AppError::new(
+        "stale_task",
+        "This task has no recorded failure; read status again",
+    )
+}
+
+/// Retires a parked task's input before forgetting it. Its worker never
+/// selects a parked task, so no attempt can start in between.
+async fn discard(run: &ManagedRun, state: &edit::WorkflowState, args: &Value) -> Result<Value> {
+    if state.pending.is_some() {
+        return Err(AppError::new(
+            "pending_edit",
+            "Complete the edit before discarding a task",
+        ));
+    }
+    let (node, ledger) = failure_ledger(run, state, args)?;
+    let key = TaskKey::parse(views::field(args, "task_id")?)?;
+    let failures = ledger.get(&key).ok_or_else(unknown_failure)?;
+    if !failures.parked {
+        return Err(AppError::new(
+            "task_not_parked",
+            "Only a parked task can be discarded; retry it or wait for its remaining attempts",
+        ));
+    }
+    let session = &run.live()?.session;
+    let source = tasks::TaskSource {
+        session,
+        node_id: node,
+        initial: initial_holder(run).await? == Some(node),
+        ledger,
+        busy: &[],
+    };
+    // A task that lost an input, or a join that no longer matches its node's
+    // connections, is gone: its inputs may belong to other work by now.
+    if source.current(&failures.inputs).await?.is_none() {
+        let _ = ledger.clear(&key);
+        return Err(unknown_failure());
+    }
+    if failures.inputs.is_empty() {
+        // The initial input is not a package; completing it ends its attempts.
+        runtime::complete_initial(&runtime::node_directory(run, node))?;
+    }
+    for input in &failures.inputs {
+        match session.retire(*input, None).await.map_err(AppError::core)? {
+            // Consumed or retired elsewhere: nothing is left to discard.
+            Ok(_) | Err(RetireError::NotLive(_)) => {}
+            Err(error) => return Err(views::retire_refusal(&error)),
+        }
+    }
+    ledger.clear(&key)?;
+    status(run).await
 }
 
 pub async fn status(run: &ManagedRun) -> Result<Value> {
     let state = runtime::load(run)?;
-    let tasks = tasks(run, &state).await?;
+    let initial = initial_holder(run).await?;
+    let mut tasks = Vec::new();
+    for candidate in ready_tasks(run, &state, None, initial).await? {
+        tasks.push(task_view(run, candidate).await?);
+    }
+    let failures: Vec<_> = failed_tasks(run, &state, None, initial)
+        .await?
+        .iter()
+        .map(Failed::view)
+        .collect();
     let counts = if let Some(live) = &run.live {
         Some(
             live.session
@@ -484,28 +707,10 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
     // The existing graph view uses workflow names, including intermediate
     // topology during an unfinished edit. No incarnation IDs leave this view.
     let mut result = json!({"run_id":run.manifest.run_id,"version":state.version,"document":state.current,"status":run.summary()["status"],
-        "pending_edit":state.pending.as_ref().map(|plan|json!({"plan_id":plan.id,"document":plan.document})),"nodes":nodes,"tasks":tasks});
+        "pending_edit":state.pending.as_ref().map(|plan|json!({"plan_id":plan.id,"document":plan.document})),"nodes":nodes,"tasks":tasks,"failures":failures});
     if let Some(view) = counts {
-        let mut names = std::collections::BTreeMap::new();
-        for (name, id) in &state.identities.nodes {
-            names.insert(id.as_str(), name.clone());
-        }
-        if let Some(plan) = &state.pending {
-            for (name, id) in &plan.identities.nodes {
-                if view.kernel().graph().node(id).is_some() {
-                    if let Some(old) = state.identities.nodes.get(name).filter(|old| *old != id) {
-                        names.insert(old.as_str(), format!("{name} (previous)"));
-                    }
-                    names.insert(id.as_str(), name.clone());
-                }
-            }
-        }
-        let name = |id: &str| {
-            names
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| "unknown node".into())
-        };
+        let names = state.node_names(view.kernel());
+        let name = |id: &str| edit::label(&names, id);
         result["revision"] = json!(view.revision().to_string());
         result["graph"] = json!({"nodes":view.kernel().graph().nodes().iter().map(|node|json!({"id":name(node.id())})).collect::<Vec<_>>(),
             "edges":view.kernel().graph().edges().iter().map(|edge|json!({"id":super::edge_key(&name(edge.source()),&name(edge.target())),"source":name(edge.source()),"target":name(edge.target())})).collect::<Vec<_>>()});
@@ -569,7 +774,7 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
     };
     let session = &run.live()?.session;
     let core_node = &state.identities.nodes[node];
-    let input = if task.initial {
+    let input = if task.task.is_initial() {
         Some(runtime::initial_payload(run).await?)
     } else {
         None
@@ -584,7 +789,7 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
             authority: views::authority(&[super::document::AUTHORITY.into()])?,
             input,
         },
-        None => InvocationTrigger::Packages(task.packages),
+        None => InvocationTrigger::Packages(task.task.ids()),
     };
     let invocation = session
         .begin_invocation_with_content(
@@ -618,12 +823,14 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
             // Core has committed; these caches can be reconstructed if either
             // write fails. A cache failure must not invite repeating the work.
             let _ = persistence::write_json(&directory.join("output.json"), &output);
-            if task.initial {
+            if task.task.is_initial() {
                 let _ = runtime::complete_initial(&directory);
             }
             status(run).await
         }
-        ProposalDecision::Rejected(error) => Err(AppError::new("stale_task", error.to_string())),
+        ProposalDecision::Rejected(error) => {
+            Err(AppError::new("stale_task", views::rejection(&error)))
+        }
     }
 }
 
@@ -636,10 +843,12 @@ pub(crate) fn public_error(mut error: AppError) -> AppError {
             .get("additional_retirements")
             .and_then(Value::as_object)
     {
+        // Core reported these identities, so each parses; a handle is never
+        // replaced by the identity it hides.
         details["additional_retirements"] = json!(
             retirements
                 .iter()
-                .map(|(id, reason)| json!({"work_id":work_id(id),"reason":reason}))
+                .map(|(id, reason)| json!({"work_id":views::package_id(id).ok().map(|id| tasks::work_id(&id)),"reason":reason}))
                 .collect::<Vec<_>>()
         );
     }
@@ -683,7 +892,7 @@ async fn retirements(
                 .find(|(_, id)| id.as_str() == history.package().holder())
                 .map(|(name, _)| name)
         });
-        result.push(json!({"work_id":work_id(id),"node":node,"reason":reason}));
+        result.push(json!({"work_id":tasks::work_id(&package),"node":node,"reason":reason}));
     }
     Ok(result)
 }

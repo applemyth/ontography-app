@@ -10,6 +10,7 @@ pub mod launcher;
 pub mod logging;
 pub mod managed_shell;
 pub mod migration;
+pub mod node_tool;
 pub mod persistence;
 pub mod protocol;
 pub mod registry;
@@ -23,6 +24,7 @@ pub mod tools;
 pub mod ui;
 pub mod views;
 pub mod workflow;
+pub mod workspace;
 
 pub use error::{AppError, Result};
 

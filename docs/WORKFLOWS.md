@@ -59,6 +59,8 @@ start and `run_id` afterward; a stable UUID `start_id` makes startup retryable.
 | `nodes[].kind` | `agent`, `command`, `human`, or `inbox`. |
 | `nodes[].config` | Worker settings; defaults to `{}`. |
 | `nodes[].join` | `any` by default, or `all`; belongs to the receiving node. |
+| `nodes[].retry` | Agent and command nodes only; see [Failed tasks](#failed-tasks). |
+| `nodes[].grants` | Agent and command nodes only: node-tool powers beyond the base set (`originate`, `send_later`, `retire`); see [Node tools](NODE_TOOLS.md). |
 | `edges` | Directed `{from,to}` connections; defaults to `[]`. |
 
 `any` takes one available incoming package. `all` waits for one package on
@@ -88,8 +90,8 @@ MCP tools, persistent Codex conversations, or attachable node panes.
 2. Call `flow.edit` with the updated `document`. Inspect `retirements`: pending
    work the proposed graph change would discard.
 3. Call `flow.commit` with the returned `plan_id`.
-4. Read status. Use `flow.resume` to recover an interrupted edit or explicitly
-   retry failed workers.
+4. Read status. Use `flow.resume` to recover an interrupted edit or restart
+   stopped or failed workers.
 
 A prompt/config change takes effect on the next task. A kind change stops and
 waits for the old worker before launching the replacement. Changing joins or
@@ -162,7 +164,62 @@ allowing accompanying messages to remain visible in status/output.
 Worker status uses `execution.state` (`running`, `exited`, `failed`, `panicked`,
 or `aborted`) and, on failure, `execution.error.class` and `.message`. Error
 messages preserve their original text. When no worker handle exists, `execution`
-is null.
+is null. A failed task does not fail its worker.
+
+## Failed tasks
+
+An agent or command task fails when its process exits nonzero, times out, or
+exceeds an output limit, when core rejects its result, or when the task cannot
+start as delivered. Its worker keeps running: the task waits out a backoff and
+is attempted again, while other tasks at the node proceed. At an `all` node, a
+failed join keeps its inputs together for its retries, and the node's other
+inputs form joins of their own. A node's `retry` sets the policy:
+
+```json
+{"id":"draft","kind":"command","config":{"argv":["./draft.sh"]},
+ "retry":{"max_attempts":3,"initial_delay_secs":5,"max_delay_secs":300}}
+```
+
+These are the defaults, and each field is optional. `max_attempts` includes the
+first attempt (1–100; 1 disables retries). The first wait is
+`initial_delay_secs`; each later wait doubles, up to `max_delay_secs` (at most
+86400, and not below the first wait). Human and inbox nodes reject `retry`.
+
+A task whose attempts run out is parked, as is one that retrying cannot help,
+such as a task that received two workspaces or a workspace that is not a
+directory, or an input core refuses to begin. A parked task stays pending, and
+no attempt starts until the manager intervenes. `flow.status` lists failed
+tasks in `failures`:
+
+```json
+{"node":"draft","task_id":"task_…","attempts":1,"state":"retrying","retry_in_secs":5,
+ "error":"Worker exited with status 3: …"}
+```
+
+`state` is `retrying` or `parked`; `retry_in_secs` appears while a backoff
+remains. `tasks` shows what each worker runs next, so a task that is waiting
+or parked appears only in `failures`. Its `task_id` also selects its input in
+`flow.output`, `flow.workspace`, and `flow.export`.
+
+- `flow.retry` with `node` and `task_id` gives a failed task a fresh set of
+  attempts, starting now. Without `task_id`, it does so for every failed task
+  at the node.
+- `flow.discard` with `node` and `task_id` retires a parked task's pending
+  input; the run's initial input is marked complete instead. Either way, the
+  task is never attempted again.
+- Any change to a node's definition (its config, retry, grants, join, or kind)
+  gives its failed tasks fresh attempts. The node's worker, or `flow.resume`,
+  applies it even if the edit reported an error, and an attempt already
+  running under the old definition does not count against the new one. A
+  change elsewhere in the graph, such as adding the connection a task was
+  missing, does not; retry the task. At an `all` node, though, a failed join
+  that no longer has one input per connection is no longer a task, and its
+  inputs join afresh.
+
+Failure counts are durable. Suspension, restart, and `flow.resume` keep them
+and keep parked tasks parked; only an unfinished backoff is cut short. A crash
+between core rejecting a result and the ledger counting it grants one extra
+attempt.
 
 ## Current policies and limits
 
@@ -171,9 +228,10 @@ is null.
 - Each delivery is a message or a workspace. A joined task may receive
   several messages but at most one workspace. Workspace workers currently
   need an outgoing connection; connect the final worker to an inbox.
-- Failed, timed-out, or interrupted workers do not automatically retry in a
-  loop. Resume or changed configuration enables a retry. External command
-  effects may repeat if a previous attempt ran but did not publish to core.
+- A failed or timed-out task retries with capped exponential backoff, then
+  parks until the manager retries or discards it. An interrupted attempt is not
+  counted. External command effects may repeat if a previous attempt ran but
+  did not publish to core.
 - Config updates do not interrupt a task already running. Removing a node or
   changing its kind stops its old worker during reconciliation.
 - Task timeout defaults to five minutes. Captured stdout/stderr are bounded

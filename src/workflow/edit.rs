@@ -34,6 +34,35 @@ impl WorkflowState {
             pending: None,
         })
     }
+
+    /// Workflow names of core nodes, by core identity. During an unfinished
+    /// edit, a replacement already in `kernel` takes its name and the node it
+    /// replaces is labeled "(previous)".
+    pub fn node_names(&self, kernel: &Kernel) -> BTreeMap<String, String> {
+        let mut names: BTreeMap<_, _> = self
+            .identities
+            .nodes
+            .iter()
+            .map(|(name, id)| (id.clone(), name.clone()))
+            .collect();
+        for (name, id) in self.pending.iter().flat_map(|plan| &plan.identities.nodes) {
+            if kernel.graph().node(id).is_some() {
+                if let Some(old) = self.identities.nodes.get(name).filter(|old| *old != id) {
+                    names.insert(old.clone(), format!("{name} (previous)"));
+                }
+                names.insert(id.clone(), name.clone());
+            }
+        }
+        names
+    }
+}
+
+/// A core node's workflow name from `WorkflowState::node_names`.
+pub fn label(names: &BTreeMap<String, String>, core_id: &str) -> String {
+    names
+        .get(core_id)
+        .cloned()
+        .unwrap_or_else(|| "unknown node".into())
 }
 
 /// Store server-side. A client supplies its ID, never its approval contents.

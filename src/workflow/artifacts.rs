@@ -1,8 +1,9 @@
 //! Manager workspace handles and publication of workflow output to the filesystem.
 
 use super::WorkflowPayload;
+use crate::workspace::WorkspaceStore;
 use crate::{AppError, Result, state::ManagedRun, tools, views};
-use ontography::{package::ResolvedEntryKind, workspace::WorkspaceStore};
+use ontography::package::ResolvedEntryKind;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},

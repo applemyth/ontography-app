@@ -1,7 +1,8 @@
 use crate::{AppError, Result};
 use ontography::{
     ActivationId, Authority, AuthorityTag, ContentDigest, Kernel, PackageId, PackageRecord,
-    Payload, Phase, ProposalDecision, Retirement, RetirementReason, SessionStatus, State,
+    Payload, Phase, ProposalDecision, Reject, RetireError, Retirement, RetirementReason,
+    RewriteError, SessionStatus, State,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -74,6 +75,54 @@ pub fn package_state(state: &State, id: PackageId, value: &PackageRecord) -> Res
             view
         })}),
     )
+}
+
+/// Why core rejected a submission, in workflow terms: core's own message names
+/// core identities. A contract's explanation is kept.
+pub fn rejection(reject: &Reject) -> String {
+    match reject {
+        Reject::UnknownPackage { .. }
+        | Reject::PackageRetired { .. }
+        | Reject::PackageNotDelivered { .. }
+        | Reject::AlreadyActivated { .. }
+        | Reject::InvalidPackageIdentity { .. } => "an input is no longer available here".into(),
+        Reject::EmptyPackageTrigger
+        | Reject::JoinTargetMismatch { .. }
+        | Reject::JoinAuthorityMismatch { .. }
+        | Reject::DuplicateJoinEdge { .. }
+        | Reject::JoinNotAllowed { .. }
+        | Reject::JoinEdgeMismatch { .. } => {
+            "the inputs no longer form a complete task for this node".into()
+        }
+        Reject::ResultContract { source, .. } => format!("the result was refused: {source}"),
+        Reject::PayloadContract { source, .. } => format!("an output was refused: {source}"),
+        Reject::UnknownEdge { .. } | Reject::WrongSource { .. } => {
+            "an output's connection no longer exists".into()
+        }
+        Reject::UnknownNode { .. } | Reject::ExecutionNodeMismatch { .. } => {
+            "this node is no longer in the graph".into()
+        }
+        Reject::RootNotAllowed { .. }
+        | Reject::RootAuthorityExceeded { .. }
+        | Reject::AuthorityOutsideSchema { .. }
+        | Reject::UnauthorizedAuthorityTransition { .. }
+        | Reject::EdgeAuthorityMismatch { .. } => "authority rules refused the submission".into(),
+        _ => "core refused the submission".into(),
+    }
+}
+
+/// Why core refused to retire a live package, in workflow terms: core's own
+/// message names the package.
+pub fn retire_refusal(error: &RetireError) -> AppError {
+    match error {
+        RetireError::Admission(RewriteError::Stale) => stale(),
+        _ => AppError::new("rejected", "Core refused to retire the package"),
+    }
+}
+
+/// Core's state moved between reading and changing it.
+pub fn stale() -> AppError {
+    AppError::new("stale", "The run changed meanwhile; try again")
 }
 
 pub fn decision(value: ProposalDecision) -> Result<Value> {
