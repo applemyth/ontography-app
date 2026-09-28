@@ -1,6 +1,6 @@
 # Session design and implementation
 
-**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions, the fixed editing grammar, persistent Codex worker sessions, and node-scoped MCP are implemented. Automatic incoming-work wakeups and node panes remain unfinished. [VERIFICATION.md](VERIFICATION.md) records release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
+**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions, the fixed editing grammar, persistent Codex worker sessions, and node-scoped MCP are implemented. Incoming work is delivered through persistent Codex app-servers; node pane selection remains unfinished. [VERIFICATION.md](VERIFICATION.md) records release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
 
 ## Ownership invariant
 
@@ -22,7 +22,7 @@ A process ID, connection, or terminal-instance ID is not a durable session ident
 | Ontography session | Group Pi state, project, optional graph binding, and manager terminal. | Implemented. |
 | Graph runtime | Govern nodes, edges, contracts, packages, workflow, authority, and rewrites. Coordinate nodes collectively. | Existing core bindings implemented. |
 | Manager execution | Run native Pi before and after graph initialization; resume the latest active conversation on shell reentry. | Managed launcher inside a persistent Bash PTY. |
-| Node execution | Run a concrete agent associated with a durable graph-node ID. | Persistent Codex node runtime binds execution, working directory, native conversation, PTY, and scoped tools. |
+| Node execution | Run a concrete agent associated with a durable graph-node ID. | Persistent Codex app-server owns the native conversation; the node runtime binds execution, working directory, attached native TUI, queued input, and scoped tools. |
 | PTY and terminal state | Host terminal bytes/dimensions; continuously read output and retain a current screen. | `portable-pty` and `vt100` shared by manager and worker sessions. |
 | Pane/view | Display existing execution and route controlling-client input. | Full Pi, shell + session panel, and graph view; worker panes deferred. |
 

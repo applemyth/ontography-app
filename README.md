@@ -24,7 +24,7 @@ Rust server
     ├── Pi manager state: conversations, active selection, tool preferences
     ├── Server-owned shell and PTY → native Pi when launched
     └── Optional graph run and core runtime
-        └── Agent nodes → managed PTYs → continuing Codex sessions
+        └── Agent nodes → persistent Codex app-servers + attached terminal clients
 ```
 
 | Component | Responsibility |
@@ -69,6 +69,6 @@ npm test
 
 The persistent session foundation is implemented. Final verification and the actual home-directory cutover are recorded separately in [VERIFICATION.md](docs/VERIFICATION.md). [ARCHITECTURE.md](ARCHITECTURE.md) tracks remaining pieces; [SESSION_DESIGN.md](docs/SESSION_DESIGN.md) explains ownership and recovery.
 
-**Persistent Codex node foundations are implemented:** an agent binding owns a managed PTY, continuing Codex conversation, persistent private working directory, and scoped node-tool context. Workflow startup, edits, suspension, and resume reconcile its process. Command, human, and inbox nodes retain their task behavior; message/workspace contracts and the fixed editing grammar already exist.
+**Persistent Codex node foundations are implemented:** an agent binding owns a persistent Codex app-server, an attached native terminal client in a managed PTY, a continuing conversation, a private working directory, and scoped node tools. Workflow startup, edits, suspension, and resume reconcile its process. Command, human, and inbox nodes retain their task behavior; message/workspace contracts and the fixed editing grammar already exist.
 
-The [node MCP adapter](docs/NODE_MCP.md) exposes shared graph tools to managed Codex sessions, with an optional per-node `tools` allowlist and existing grants enforced. Automatic incoming-work wakeups and node terminal panes remain unfinished. Starting a node does not start a model turn or publish terminal output. See [WORKFLOWS.md](docs/WORKFLOWS.md) for configuration.
+The [node MCP adapter](docs/NODE_MCP.md) exposes shared graph tools to managed Codex sessions, with an optional per-node `tools` allowlist and existing grants enforced. Initial and incoming work is queued into the Codex conversation automatically; agents publish graph replies through tools. Node terminal pane selection remains unfinished. See [WORKFLOWS.md](docs/WORKFLOWS.md) for configuration.

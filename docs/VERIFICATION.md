@@ -1,5 +1,54 @@
 # Verification
 
+## Persistent Codex app-server and incoming messages — 2026-09-27
+
+Passed: **239 app Rust tests** and **4 opt-in native Codex tests**, run
+separately against installed Codex **0.157.1**. The message fixture supplies
+Responses events over localhost; no external model request is made.
+
+```sh
+cargo test --locked --quiet
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
+git diff --check
+cargo test --locked --lib -- --ignored --nocapture
+```
+
+- Each native node now owns a persistent app-server on a private Unix socket.
+  Its native terminal joins the same live thread with `--remote`. Native checks
+  verify the composer, that `/exit` leaves the thread loaded, and that a new
+  server resumes the exact saved UUID. Mock checks reject missing/mismatched
+  saved sessions and remove only obsolete graph entries from the input queue.
+- Initial inputs and runnable incoming packages become recorded conversation
+  messages with attempt/task IDs, sender names, text, and attachment handles.
+  Existing joins, grants, task ownership, retry policy, and package receipts
+  remain in the shared node-tool implementation. Input text is bounded; large
+  inputs retain read handles. Open attempts bound queued delivery.
+- The native message test holds the first model request open, delivers a second
+  message, verifies it stays queued, then has real Codex execute two MCP
+  `submit_invocation` calls against the test graph. Both replies reach the sink
+  and both messages remain in the same conversation history.
+- MCP transport overrides preserve user-configured tool approval policy. A
+  separate native check starts turns through the controller, observes their
+  MCP approval prompts in the terminal, submits approval through terminal input,
+  and verifies both graph replies. Production does not automatically answer
+  approval requests. The native MCP discovery/call check also passes.
+- Lost queue acknowledgement leaves the exact message receipt prepared and
+  terminates delivery without replay. RPC tests cover interleaved notifications,
+  independent request/approval ID namespaces, concurrent calls, and disconnect.
+  Failed turns use task retries; already committed work is not retried.
+- Existing process supervision, forced cancellation, MCP revocation, command
+  overrides, workspace retention, workflow reconciliation, and manager tests
+  still pass. One manager-shell test timed out in the first full run, then
+  passed independently and in the final full suite.
+
+Codex app-server/remote transport is version-sensitive; these checks target the
+installed version above. Graph UI node pane selection and a full project run
+against live models remain outstanding. Ordinary assistant text does not publish
+a graph result; the agent uses its selected graph tools. A successful turn may
+leave an attempt open across conversation turns. See [WORKFLOWS.md](WORKFLOWS.md)
+for queueing, approval, recovery, and delivery limits.
+
 ## Node MCP and tool selection — 2026-09-27
 
 Passed: **238 app Rust tests**, all-target Clippy with warnings denied,

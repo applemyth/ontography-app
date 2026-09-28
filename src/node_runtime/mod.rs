@@ -3,6 +3,7 @@
 
 pub mod codex;
 mod process;
+mod rpc;
 
 use crate::{
     AppError, Result,
@@ -13,8 +14,10 @@ use crate::{
 };
 use ontography::{ExecutionContext, ExecutionFailure, Payload, SessionHandle, SessionStatus};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -28,6 +31,7 @@ pub struct NodeStatus {
     pub directory: PathBuf,
     pub cwd: PathBuf,
     pub conversation_id: Option<String>,
+    pub agent_state: Option<String>,
     pub terminal: Option<TerminalStatus>,
     pub exit_code: Option<u32>,
     pub error: Option<AppError>,
@@ -69,6 +73,7 @@ impl NodeRuntime {
                     cwd: directory.join("workspace"),
                     directory: directory.clone(),
                     conversation_id: None,
+                    agent_state: None,
                     terminal: None,
                     exit_code: None,
                     error: None,
@@ -172,24 +177,10 @@ impl NodeRuntime {
         ));
         private_directory(&endpoint)?;
         resources.mcp = Some(NodeMcp::bind(&endpoint, tools.clone())?);
-        resources.tools = Some(tools);
+        resources.tools = Some(tools.clone());
         let node = self.scope.borrow().node.clone();
-        let mut prepared = tokio::select! {
-            () = stop.requested() => {
-                lock(&self.state).status.state = "stopped";
-                return Ok(());
-            }
-            prepared = codex::prepare(&node, &self.directory, &cwd) => prepared?,
-        };
         let mcp = resources.mcp.as_ref().expect("bound node MCP");
-        if prepared.conversation_id.is_some() {
-            prepared
-                .args
-                .splice(0..0, ["-c".into(), mcp.codex_config()?]);
-        }
-        prepared.env.extend(mcp.environment());
-        lock(&self.state).status.conversation_id = prepared.conversation_id;
-        let mut env = prepared.env;
+        let mut env = mcp.environment();
         env.insert("ONTOGRAPHY_NODE_NAME".into(), node.id.clone());
         env.insert(
             "ONTOGRAPHY_NODE_DIRECTORY".into(),
@@ -199,15 +190,37 @@ impl NodeRuntime {
             "ONTOGRAPHY_PROJECT".into(),
             self.project.to_string_lossy().into_owned(),
         );
-        let spec = LaunchSpec {
-            program: prepared.program,
-            args: prepared.args,
-            env,
-            cwd,
-            rows: 24,
-            cols: 80,
-            server_id: uuid::Uuid::new_v4().to_string(),
-            session_id: node.id,
+        let spec = if let Some(argv) = node.config.get("argv") {
+            let argv = argv
+                .as_array()
+                .ok_or_else(|| AppError::invalid("agent argv must be an array"))?;
+            let argv: Vec<_> = argv
+                .iter()
+                .map(|arg| {
+                    arg.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| AppError::invalid("agent argv must contain strings"))
+                })
+                .collect::<Result<_>>()?;
+            let (program, args) = argv
+                .split_first()
+                .filter(|(program, _)| !program.trim().is_empty())
+                .ok_or_else(|| AppError::invalid("agent argv must name a program"))?;
+            LaunchSpec {
+                program: program.into(),
+                args: args.to_vec(),
+                env,
+                cwd,
+                rows: 24,
+                cols: 80,
+                server_id: uuid::Uuid::new_v4().to_string(),
+                session_id: node.id.clone(),
+            }
+        } else {
+            let plan = codex::Plan::new(&node, &self.directory, &cwd, &endpoint)?;
+            let spec = plan.launch(Path::new("codex"), &mcp.codex_overrides()?, env);
+            resources.plan = Some(plan);
+            spec
         };
         let lifetime = process::Lifetime::new(&self.directory)?;
         let spec = lifetime.supervise(spec);
@@ -221,10 +234,48 @@ impl NodeRuntime {
         resources.terminal = Some(terminal.clone());
         let lifetime = resources.lifetime.as_mut().expect("prepared lifetime");
         lifetime.permit(&terminal).await?;
+        let conversation = if let Some(plan) = &resources.plan {
+            let ready = async {
+                let rpc = loop {
+                    if !terminal.status().running {
+                        return Err(AppError::new(
+                            "codex_startup",
+                            "Codex app-server exited; inspect codex-server.log",
+                        ));
+                    }
+                    if plan.socket.try_exists()? {
+                        break rpc::Rpc::connect(&plan.socket).await?;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                };
+                let id = plan.open(&rpc).await?;
+                plan.attach(&id)?;
+                Ok::<_, AppError>((rpc, id))
+            };
+            let (rpc, id) = tokio::select! {
+                () = stop.requested() => { return Ok(()); }
+                result = tokio::time::timeout(Duration::from_secs(45), ready) => {
+                    result.map_err(|_| AppError::new("codex_startup", "Codex app-server initialization timed out; inspect codex-server.log"))??
+                }
+            };
+            lock(&self.state).status.conversation_id = Some(id.clone());
+            resources.rpc = Some(rpc);
+            Some(id)
+        } else {
+            None
+        };
         lock(&self.state).status.state = "running";
+        let delivery = async {
+            match (&mut resources.rpc, conversation) {
+                (Some(rpc), Some(id)) => self.deliver(rpc, &id, &tools).await,
+                _ => std::future::pending::<Result<()>>().await,
+            }
+        };
+        tokio::pin!(delivery);
         let mut tick = tokio::time::interval(Duration::from_millis(25));
         loop {
             tokio::select! {
+                result = &mut delivery => { return result; }
                 () = stop.requested() => {
                     lock(&self.state).status.state = "stopped";
                     return Ok(());
@@ -252,6 +303,100 @@ impl NodeRuntime {
             }
         }
     }
+
+    async fn deliver(
+        &self,
+        rpc: &mut rpc::Rpc,
+        thread: &str,
+        tools: &NodeToolContext,
+    ) -> Result<()> {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut messages = HashMap::<String, String>::new();
+        let mut turns = HashMap::<String, Vec<String>>::new();
+        loop {
+            tokio::select! {
+                _ = rpc.health.changed() => {
+                    return Err(rpc.health.borrow().clone().unwrap_or_else(|| AppError::new("codex_connection", "Codex controller stopped")));
+                }
+                event = rpc.events.recv() => {
+                    let Some(event) = event else { return Err(AppError::new("codex_connection", "Codex event stream closed")); };
+                    if event["params"]["threadId"] != thread { continue; }
+                    if event["method"] == "item/started"
+                        && let Some(client) = event["params"]["item"]["clientId"].as_str()
+                        && let Some(attempt) = messages.remove(client)
+                        && let Some(turn) = event["params"]["turnId"].as_str() {
+                        turns.entry(turn.into()).or_default().push(attempt);
+                    }
+                    if event["method"] == "turn/completed"
+                        && let Some(turn) = event["params"]["turn"]["id"].as_str()
+                        && let Some(attempts) = turns.remove(turn)
+                        && event["params"]["turn"]["status"] != "completed" {
+                        for attempt in attempts {
+                            tools.message_failed(&attempt, &format!("Codex turn ended: {}",event["params"]["turn"]["status"])).await?;
+                        }
+                    }
+                }
+                _ = tick.tick() => {
+                    messages.retain(|_, attempt| tools.message_is_open(attempt));
+                    let state = rpc.call("thread/read", json!({"threadId":thread})).await?;
+                    let status = state["thread"]["status"]["type"].as_str().unwrap_or("unknown");
+                    lock(&self.state).status.agent_state = Some(status.into());
+                    if matches!(status, "notLoaded" | "systemError") {
+                        return Err(AppError::new("codex_session", format!("Codex conversation became {status}")));
+                    }
+                    if let Some(reply) = tools.next_message().await? {
+                        let value = reply.value()?;
+                        let attempt = value["attempt_id"].as_str().ok_or_else(|| AppError::new("codex_delivery", "Message has no attempt ID"))?;
+                        let client_id = format!("ontography:{attempt}");
+                        let text = std::str::from_utf8(reply.bytes()).map_err(|error| AppError::new("codex_delivery", error.to_string()))?;
+                        rpc.call("thread/queue/add", json!({"threadId":thread,
+                            "clientUserMessageId":client_id,
+                            "input":[{"type":"text","text":text}]})).await?;
+                        // Server acceptance, rather than socket write, is the
+                        // receipt boundary. The queue preserves input verbatim.
+                        reply.sent().await?;
+                        messages.insert(client_id, attempt.into());
+                    }
+                    if status == "idle" { start_queued(rpc, thread).await?; }
+                }
+            }
+        }
+    }
+}
+
+async fn start_queued(rpc: &rpc::Rpc, thread: &str) -> Result<()> {
+    let queue = rpc
+        .call("thread/queue/list", json!({"threadId":thread,"limit":1}))
+        .await?;
+    let Some(first) = queue["data"].as_array().and_then(|items| items.first()) else {
+        return Ok(());
+    };
+    match rpc
+        .call(
+            "thread/queue/start",
+            json!({"threadId":thread,"queuedSubmissionId":first["id"]}),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.code == "codex_rpc" => {
+            // The native TUI can start the same queued turn concurrently. Only
+            // forgive a refusal after observing that race; never replay input.
+            let state = rpc.call("thread/read", json!({"threadId":thread})).await?;
+            if state["thread"]["status"]["type"] == "active" {
+                return Ok(());
+            }
+            let queue = rpc
+                .call("thread/queue/list", json!({"threadId":thread,"limit":1}))
+                .await?;
+            if queue["data"][0]["id"] != first["id"] {
+                return Ok(());
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// This guard also runs when core forcibly aborts the execution future. It stops
@@ -262,6 +407,8 @@ struct Resources<'a> {
     tools: Option<Arc<NodeToolContext>>,
     lifetime: Option<process::Lifetime>,
     mcp: Option<NodeMcp>,
+    rpc: Option<rpc::Rpc>,
+    plan: Option<codex::Plan>,
 }
 
 impl<'a> Resources<'a> {
@@ -272,10 +419,13 @@ impl<'a> Resources<'a> {
             tools: None,
             lifetime: None,
             mcp: None,
+            rpc: None,
+            plan: None,
         }
     }
 
     async fn close(&mut self) -> Result<()> {
+        self.rpc.take();
         if let Some(mut mcp) = self.mcp.take() {
             mcp.shutdown().await;
         }
@@ -305,6 +455,7 @@ impl<'a> Resources<'a> {
 
 impl Drop for Resources<'_> {
     fn drop(&mut self) {
+        self.rpc.take();
         self.mcp.take();
         if let Some(lifetime) = &mut self.lifetime {
             lifetime.disconnect();

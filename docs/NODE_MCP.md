@@ -5,7 +5,7 @@ adapter exposes the existing [shared node tools](NODE_TOOLS.md); their graph,
 package, attempt, grant, and receipt behavior stays in `NodeToolContext`.
 
 ```text
-Codex CLI in the node PTY
+Persistent Codex app-server (native TUI attached in the node PTY)
   → MCP stdio: ontography node-mcp
   → private execution socket
   → NodeToolContext → core
@@ -72,12 +72,18 @@ there are no management, resources, or prompts endpoints. See the official
 [stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio)
 and [tool protocol](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
 
-## Remaining integration
+## Conversation delivery
 
-An active agent can discover pending work, begin attempts, read packages, open
-and capture workspace checkouts, and submit results through its selected tools.
-Starting a node still starts an idle conversation: it does not start a model
-turn or inject incoming packages into terminal input. Automatic wakeups for
-incoming work and attachable node panes remain separate work. The native
-interoperability test verifies Codex tool discovery and an `inspect_node` call
-without a model turn; it does not establish a multi-agent project acceptance run.
+The node runtime supplies initial and incoming work as conversation messages
+through the persistent Codex app-server. The native CLI joins that same server
+and thread. MCP supplies outgoing graph actions, package access, and completion
+of the attempt named in each message. See [Workflow execution](WORKFLOWS.md).
+
+Codex's own MCP approval policy remains in force. For example, an operator may
+configure `mcp_servers.ontography_node.tools.submit_invocation.approval_mode`
+in their Codex settings. Tool selection and graph grants remain separate checks.
+
+The native verification uses a localhost Responses fixture to run real Codex
+turns, queue a second message during an active turn, and publish both replies
+through MCP. No external model is used. Node pane selection in the graph UI and
+a full project acceptance run with live models remain separate work.

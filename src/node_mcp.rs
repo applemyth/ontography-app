@@ -101,8 +101,9 @@ impl NodeMcp {
         ])
     }
 
-    /// A process-local Codex config override; never writes the user's config.
-    pub fn codex_config(&self) -> Result<String> {
+    /// Process-local transport overrides. Set individual fields so the user's
+    /// per-server/tool approval policy is retained; never rewrite their config.
+    pub fn codex_overrides(&self) -> Result<Vec<String>> {
         let program = crate::launcher::application_executable()?;
         let program = program
             .to_str()
@@ -111,12 +112,24 @@ impl NodeMcp {
             .socket
             .to_str()
             .ok_or_else(|| AppError::invalid("MCP socket path must be UTF-8"))?;
-        Ok(format!(
-            "mcp_servers.ontography_node={{command={},args=[\"node-mcp\"],env={{{SOCKET_ENV}={}, {TOKEN_ENV}={}}},enabled=true,required=true,startup_timeout_sec=10}}",
-            serde_json::to_string(program)?,
-            serde_json::to_string(socket)?,
-            serde_json::to_string(&self.token)?,
-        ))
+        Ok(vec![
+            format!(
+                "mcp_servers.ontography_node.command={}",
+                serde_json::to_string(program)?
+            ),
+            "mcp_servers.ontography_node.args=[\"node-mcp\"]".into(),
+            format!(
+                "mcp_servers.ontography_node.env.{SOCKET_ENV}={}",
+                serde_json::to_string(socket)?
+            ),
+            format!(
+                "mcp_servers.ontography_node.env.{TOKEN_ENV}={}",
+                serde_json::to_string(&self.token)?
+            ),
+            "mcp_servers.ontography_node.enabled=true".into(),
+            "mcp_servers.ontography_node.required=true".into(),
+            "mcp_servers.ontography_node.startup_timeout_sec=10".into(),
+        ])
     }
 }
 
@@ -331,7 +344,7 @@ async fn connection(stream: UnixStream, token: &str, context: Arc<NodeToolContex
                             let version = if VERSIONS.contains(&requested) { requested } else { VERSIONS[0] };
                             success(id, json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":true}},
                                 "serverInfo":{"name":"ontography-node","version":env!("CARGO_PKG_VERSION")},
-                                "instructions":"These tools act only for this graph node. Use inspect_node and next_trigger to discover its work; begin an invocation before reading packages or publishing a result."}))
+                                "instructions":"These tools act only for this graph node. An incoming ontography_message already includes an open attempt_id: use that attempt and its input handles. For additional work, use inspect_node and next_trigger, then begin_invocation before reading packages or publishing a result."}))
                         }
                     }
                     "ping" => success(id, json!({})),

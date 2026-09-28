@@ -154,17 +154,18 @@ run, invocation history, or live processes.
 
 Agent nodes use `NodeRuntime`: one core execution owns a persistent private
 working directory, managed PTY, continuing Codex session, and `NodeToolContext`.
-The launcher obtains and persists an exact Codex conversation reference via
-the native app-server protocol, then starts the interactive CLI with that
-reference. Restart reopens the same conversation rather than selecting a global
+The runtime hosts a persistent Codex app-server on a private Unix socket and
+connects the native terminal UI to the same saved conversation with `--remote`.
+Restart reopens the same conversation rather than selecting a global
 latest conversation. A complete `argv` override bypasses native Codex setup and
 does not provide managed conversation recovery. Live process state is never
 recovered from conversation history.
 
-The runtime starts agent sessions without consuming pending packages. A private
-[MCP adapter](NODE_MCP.md) exposes the selected scoped tools to Codex. Agents can
-use them to process work; automatic turns and terminal-input delivery remain
-separate integration steps.
+The runtime begins attempts for runnable tasks and queues recorded conversation
+input through app-server. Packages remain pending until core accepts a result.
+A private [MCP adapter](NODE_MCP.md) exposes the selected scoped tools for
+reading attachments and publishing replies. App-server acceptance marks an
+incoming message receipt sent; MCP stdout acknowledgement marks tool replies.
 
 Command tasks invoke the configured argv with input messages on stdin. Without
 a workspace, the result is stdout; with a workspace, the result is the captured
@@ -199,9 +200,9 @@ calls, and marks replies sent only after its stdio proxy flushes them to Codex.
 
 Worker and manager PTYs use the same terminal backend. Agent lifecycle includes
 cooperative stop, forced cancellation, exit reporting, and explicit resume.
-Automatic incoming-work wakeups and node panes remain unimplemented. MCP and
-tool-mediated package handoffs are available; a full interactive multi-agent
-acceptance run remains outstanding.
+Automatic incoming conversation delivery and MCP package handoffs are available.
+Graph UI node pane selection and a full interactive project acceptance run with
+live models remain outstanding.
 
 Other existing limits remain:
 
@@ -233,6 +234,7 @@ Other existing limits remain:
 | Retry backoff, parking, join sets, manager retry/discard, definition changes, durability | [task tests](../src/workflow/tasks.rs), [workflow retry](../tests/workflow_retry.rs) |
 | Node tools: receipts equal sent bytes, metadata-only views, attempts, retries, grants, content and checkouts | [node tool tests](../src/node_tool/tests.rs), [content](../src/node_tool/outputs.rs), [workspaces](../src/node_tool/workspace.rs) |
 | Persistent agent startup, scope updates, config replacement, exit, suspension, and resume | [persistent node tests](../tests/persistent_nodes.rs), [node runtime](../src/node_runtime/mod.rs), [Codex launcher](../src/node_runtime/codex.rs) |
+| Incoming messages, exact receipts, lost acknowledgements, native queueing, and MCP replies | [delivery tests](../src/node_tool/tests/delivery.rs), [controller tests](../src/node_runtime/rpc.rs), [native Codex fixture](../src/node_runtime/codex/tests/native_delivery.rs) |
 | Workspace capture/reopen/export and no-clobber/path validation | [artifact tests](../src/workflow/artifacts.rs), [workspace flow](../tests/workflow_artifacts.rs) |
 | Session ownership, scoped targets, manager catalog, initialization recovery | [session ownership](../tests/session_ownership.rs), [catalog tests](../src/catalog.rs) |
 | Detached server lifetime, abrupt death, receipts, stale instances, multiplexing | [server process tests](../tests/server_lifecycle.rs) |
@@ -241,6 +243,6 @@ Other existing limits remain:
 | Retained core adapters, bounded content reads, workspace checkpoints | [tool module tests](../src/tools/), [management flow](../tests/management_flow.rs) |
 | Manager allowlist, session defaults, no replay, receipts, bounded output | [Pi tests](../pi/test/) |
 
-[VERIFICATION.md](VERIFICATION.md) records the earlier manager/session release
-checks. That history and deterministic worker fixtures do not establish live
-Codex authentication, model execution, or interactive worker-terminal acceptance.
+[VERIFICATION.md](VERIFICATION.md) records release checks. Native Codex terminal
+and agent-loop checks use a localhost Responses fixture; they do not establish
+the quality or completion of a project run against a live model provider.

@@ -25,10 +25,10 @@ use std::collections::HashSet;
 pub(super) struct Begin {
     /// A task from next_trigger or list_inputs.
     #[serde(default)]
-    task_id: Option<String>,
+    pub(super) task_id: Option<String>,
     /// Instead, start new work with this message. Needs the originate grant.
     #[serde(default)]
-    originate: Option<String>,
+    pub(super) originate: Option<String>,
 }
 
 pub(super) struct BeginInvocation;
@@ -40,99 +40,116 @@ impl Tool for BeginInvocation {
     type Input = Begin;
 
     async fn run(context: &NodeToolContext, begin: Begin) -> Result<Reply> {
-        let _exclusive = context.exclusive().await?;
-        // The attempt counts against the definition it begins under, even
-        // one the host has not renewed the node's retry ledger with yet.
-        let node = context.scope().node;
-        context.ledger.renew(&node.digest())?;
-        let (trigger, contents, task) = match (begin.task_id, begin.originate) {
-            (Some(key), None) => {
-                let task = runnable_task(context, &TaskKey::parse(&key)?).await?;
-                if task.is_initial() {
-                    let input = context.initial()?.ok_or_else(stale_task)?;
-                    let contents =
-                        crate::workflow::tools::dependencies(&context.session, &input).await?;
-                    let authority = root_authority(context).await?;
-                    (
-                        InvocationTrigger::Root { authority, input },
-                        contents,
-                        Some(task),
-                    )
-                } else {
-                    (
-                        InvocationTrigger::Packages(task.ids()),
-                        Vec::new(),
-                        Some(task),
-                    )
-                }
-            }
-            (None, Some(message)) => {
-                context.require(Grant::Originate)?;
-                // Until the initial input is done, an accepted root at the entry
-                // must be that input's: restart recovery reads it that way.
-                if context.initial()?.is_some() {
-                    return Err(AppError::new(
-                        "initial_pending",
-                        "Begin the initial input before originating new work",
-                    ));
-                }
-                let input = WorkflowPayload::Message { message }.encode()?;
+        begin_attempt(context, begin, false).await
+    }
+}
+
+pub(super) async fn begin_attempt(
+    context: &NodeToolContext,
+    begin: Begin,
+    delivery: bool,
+) -> Result<Reply> {
+    let _exclusive = context.exclusive().await?;
+    // The attempt counts against the definition it begins under, even
+    // one the host has not renewed the node's retry ledger with yet.
+    let node = context.scope().node;
+    context.ledger.renew(&node.digest())?;
+    let (trigger, contents, task) = match (begin.task_id, begin.originate) {
+        (Some(key), None) => {
+            let task = runnable_task(context, &TaskKey::parse(&key)?).await?;
+            if task.is_initial() {
+                let input = context.initial()?.ok_or_else(stale_task)?;
+                let contents =
+                    crate::workflow::tools::dependencies(&context.session, &input).await?;
                 let authority = root_authority(context).await?;
                 (
                     InvocationTrigger::Root { authority, input },
+                    contents,
+                    Some(task),
+                )
+            } else {
+                (
+                    InvocationTrigger::Packages(task.ids()),
                     Vec::new(),
-                    None,
+                    Some(task),
                 )
             }
-            _ => {
-                return Err(AppError::invalid(
-                    "Supply exactly one of task_id or originate",
+        }
+        (None, Some(message)) => {
+            context.require(Grant::Originate)?;
+            // Until the initial input is done, an accepted root at the entry
+            // must be that input's: restart recovery reads it that way.
+            if context.initial()?.is_some() {
+                return Err(AppError::new(
+                    "initial_pending",
+                    "Begin the initial input before originating new work",
                 ));
             }
-        };
-        let policy = ContextPolicy {
-            mode: ContextMode::Explorable,
-            initial: InitialContext::None,
-            ..ContextPolicy::default()
-        };
-        let invocation = match context
-            .execution
-            .begin_invocation_with_content(trigger, policy, contents)
-            .await
-        {
-            Ok(invocation) => invocation,
-            Err(error) => return Err(refused(context, &node, task.as_ref(), error).await?),
-        };
-        let attempt = context.register(invocation, task, node).await?;
-        context
-            .with_attempt(&attempt.id, async |attempt, state| {
-                let reply = async {
-                    let (_, names) = context.graph().await?;
-                    let inputs = describe_inputs(context, attempt, &names).await?;
-                    Reply::record(
-                        attempt,
-                        Self::NAME,
-                        &json!({
-                            "attempt_id": attempt.id,
-                            "task_id": attempt.task.as_ref().map(|task| &task.key),
-                            "initial": attempt.task.as_ref().is_some_and(Task::is_initial),
-                            "inputs": inputs,
-                        }),
-                    )
-                    .await
+            let input = WorkflowPayload::Message { message }.encode()?;
+            let authority = root_authority(context).await?;
+            (
+                InvocationTrigger::Root { authority, input },
+                Vec::new(),
+                None,
+            )
+        }
+        _ => {
+            return Err(AppError::invalid(
+                "Supply exactly one of task_id or originate",
+            ));
+        }
+    };
+    let policy = ContextPolicy {
+        mode: ContextMode::Explorable,
+        initial: InitialContext::None,
+        ..ContextPolicy::default()
+    };
+    let invocation = match context
+        .execution
+        .begin_invocation_with_content(trigger, policy, contents)
+        .await
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return Err(refused(context, &node, task.as_ref(), error).await?),
+    };
+    let attempt = context.register(invocation, task, node).await?;
+    context
+        .with_attempt(&attempt.id, async |attempt, state| {
+            let mut reply = async {
+                let (_, names) = context.graph().await?;
+                let inputs = describe_inputs(context, attempt, &names).await?;
+                if delivery {
+                    return super::delivery::record(context, attempt, inputs).await;
                 }
-                .await;
-                if reply.is_err() {
-                    // Nobody learned this attempt's ID, so nobody could end it.
-                    let _ = attempt.invocation.interrupt("begin reply failed").await;
-                    context
-                        .finish(attempt, state, json!({"status":"interrupted"}))
-                        .await;
+                Reply::record(
+                    attempt,
+                    BeginInvocation::NAME,
+                    &json!({
+                        "attempt_id": attempt.id,
+                        "task_id": attempt.task.as_ref().map(|task| &task.key),
+                        "initial": attempt.task.as_ref().is_some_and(Task::is_initial),
+                        "inputs": inputs,
+                    }),
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = &mut reply {
+                if delivery && !context.execution.stop().is_requested() {
+                    // Undeliverable input must not crash/restart the whole
+                    // agent repeatedly. Persist its task failure first.
+                    let retry = context.record_failure(attempt, &error.message, false)?;
+                    error.details = Some(json!({"retry":retry}));
                 }
-                reply
-            })
-            .await
-    }
+                // Nobody learned this attempt's ID, so nobody could end it.
+                let _ = attempt.invocation.interrupt("begin reply failed").await;
+                context
+                    .finish(attempt, state, json!({"status":"interrupted"}))
+                    .await;
+            }
+            reply
+        })
+        .await
 }
 
 /// Core refused to begin a task: it cannot run as delivered, for example

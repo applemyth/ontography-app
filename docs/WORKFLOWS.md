@@ -82,27 +82,49 @@ An agent node definition looks like this:
 ```
 
 The server needs Codex installed and authenticated; a configured `CODEX_HOME`
-must be an absolute path. It establishes a saved
-conversation through Codex's app server without starting a model turn, then
-launches the interactive CLI with that conversation ID. `prompt` supplies its
-standing instructions. The session starts when the node starts and remains
-alive independently of individual graph tasks. Native Codex trust, onboarding,
-and approval prompts retain their normal behavior.
+must be absolute. Each native agent owns a long-lived `codex app-server` on a
+private Unix socket. A Codex terminal client joins that server with `--remote`
+and resumes the exact saved conversation. `prompt` supplies standing
+instructions, followed by the graph delivery instructions. Closing the native
+terminal interface leaves the server running; Enter reconnects the interface.
+Suspending or replacing the node stops both processes and their child jobs.
 
 Each agent owns a persistent private working directory under its node's storage
 directory, separate from the workflow project and temporary package checkouts.
-Restarts retain this directory and resume the recorded Codex conversation.
-An `argv` override is the complete interactive command, passed without a shell;
-it bypasses Codex setup and has no managed Codex conversation reference.
+Restarts retain this directory and resume the recorded conversation. An `argv`
+override is the complete interactive command: it receives MCP connection
+variables but bypasses managed Codex setup and automatic conversation delivery.
 `timeout_secs` belongs to command tasks and is rejected for agent sessions.
 
-The [node MCP adapter](NODE_MCP.md) exposes the selected shared tools to Codex
-automatically, bound to this execution. The agent can use those tools to inspect
-and process graph packages. Initial and incoming packages remain pending until
-the agent begins and submits work; startup does not start a model turn, inject
-packages into terminal input, or publish terminal output. Automatic incoming-work
-wakeups and attachable node panes remain future work.
-Use command nodes for the end-to-end task workflow above.
+Initial and incoming graph work is delivered automatically as user messages in
+that conversation. The host begins an attempt using the existing join and retry
+rules, then supplies its `attempt_id`, `task_id`, sender names, input handles,
+and message text in an `ontography_message` envelope. Up to 32 KiB of input
+payloads is included inline; larger messages retain handles for `read_package`.
+Workspaces retain handles for `open_workspace`. Delivery is independent of the
+node's tool allowlist; graph operations still enforce that allowlist and grants.
+At most eight attempts are open before automatic delivery waits for capacity.
+
+Codex queues new messages while a turn is active and starts queued work when
+idle. It uses the [node MCP adapter](NODE_MCP.md) to work on the supplied attempt
+and publish results with `submit_invocation`. Terminal text and ordinary chat
+answers are not automatically published. A completed turn may leave its attempt
+open for later conversation; failed/interrupted turns fail their still-open
+delivered attempts under the normal retry policy.
+
+Codex's native approval settings still apply, including MCP tool approvals.
+A tool with a destructive annotation can require approval even when
+`approval_policy="never"` is configured (that policy refuses the call).
+Use Codex's per-server/per-tool approval configuration when configuring unattended
+workers; this app does not automatically approve requests. The native terminal
+handles interactive requests. See [Codex MCP settings](https://learn.chatgpt.com/docs/extend/mcp).
+
+Delivery receipts are marked sent after app-server accepts the queued input.
+A lost acknowledgement stops the execution without replaying the request.
+On explicit resume, pending graph tasks receive fresh attempts; old graph queue
+entries are withdrawn because their attempt handles expired. History remains,
+so a task may be presented again after restart. This is not an exactly-once
+model execution guarantee. Node pane selection in the graph UI remains future work.
 
 ## Edit and recover
 
@@ -193,7 +215,7 @@ is null. A failed task does not fail its worker.
 
 Agent nodes also report `session`: its lifecycle state, terminal status,
 persistent directory and working directory, native conversation ID when managed
-by Codex, and any startup or process error. A failed or exited agent session
+by Codex, its observed `agent_state` (`idle`, `active`, etc.), and any startup or process error. A failed or exited agent session
 stays stopped until `flow.resume` or a change to that node's definition; its
 process is not restarted by the task retry policy. Status is available even
 though the graph UI does not yet expose node terminal panes.

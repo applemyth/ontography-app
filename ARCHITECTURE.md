@@ -20,11 +20,11 @@ authority, package/workflow state, and persistence.
 - Process reconciliation and node terminal views.
 
 The document/compiler, edit recovery, task harness, and persistent Codex node
-runtime are implemented. Agent nodes own interactive Codex sessions in managed
-PTYs; command nodes run individual tasks, human nodes wait for decisions, and
+runtime are implemented. Agent nodes own persistent Codex app-servers with native
+terminal clients in managed PTYs; command nodes run individual tasks, human nodes wait for decisions, and
 inboxes hold results. Node-scoped MCP exposes selected graph tools to Codex;
-automatic incoming-work wakeups and node panes remain unfinished. Starting an
-agent starts an idle conversation. Pi remains the management harness. Core is
+incoming work enters the same conversation as queued user messages. Node pane
+selection remains unfinished. An agent with no work stays idle. Pi remains the management harness. Core is
 unchanged by this work.
 
 ## The picture
@@ -33,7 +33,7 @@ unchanged by this work.
 manager (Pi)
  └─ workflow document          named nodes, settings, joins, connections
      ├─ translator → core      graph declaration + fixed rewrite grammar
-     ├─ agent → node runtime   managed PTY + continuing Codex session + scoped tools
+     ├─ agent → node runtime   Codex app-server + native PTY client + queued input + scoped tools
      ├─ other kinds → harness command tasks, human decisions, inboxes
      └─ editor → core          preview changes, save target, apply/recover
 
@@ -47,7 +47,7 @@ core commits graph and package state; workflow runtime reconciles worker process
 | Workflow document | Named nodes, kind/config, joins, directed edges, and entry. | 10 | Implemented. |
 | Compiler + library | Fixed vocabulary, declaration expansion, edit grammar, and diff. | 2–5, 9 | Implemented using existing core APIs. |
 | Core | Enforces graph and package/workflow semantics. | — | Existing dependency; no additions in scope. |
-| Nodes | Host continuing agents or execute tasks using scoped graph tools. | 1, 6, 7 | Codex PTY runtime, task harness, selected node tools, and MCP implemented; automatic incoming-work wakeups remain. |
+| Nodes | Host continuing agents or execute tasks using scoped graph tools. | 1, 6, 7 | Persistent Codex server, attached PTY client, incoming conversation messages, task harness, selected tools, and MCP implemented. |
 
 ## Workflow document
 
@@ -107,8 +107,8 @@ Define, compile, run, inspect, edit.
 1. **Describe.** Say what the workflow should do. The manager writes the document.
 2. **Compile.** The document becomes a definition, or plain errors.
 3. **Run.** Start with an input. Command tasks run when inputs arrive; agent
-   sessions start with the graph and remain running. Agents can discover and
-   process work through MCP tools; automatic wakeups remain unfinished.
+   sessions start with the graph and remain running. Agents receive work as queued conversation messages
+   and process it through MCP tools.
 4. **Watch.** Read graph status, pending tasks, and committed outputs. Node
    terminal panes remain future work.
 5. **Edit.** Change the document, inspect the edit steps and retirement preview,
@@ -120,7 +120,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **1. Codex node definition**
 
-   An `agent` binding launches a persistent interactive Codex session in a server-owned `portable-pty` terminal. The node runtime binds its core identity, persistent private working directory, configuration, native conversation reference, and `NodeToolContext`. Startup establishes a durable Codex conversation through its app server, then launches the interactive CLI with that exact conversation ID and its scoped MCP adapter. Stop, process exit, definition changes, and resume reconcile these resources. An `argv` override hosts another interactive command without managed Codex conversation recovery. Node panes belong to item 12; automatic incoming-work wakeups remain follow-up work.
+   An `agent` binding launches a persistent interactive Codex session in a server-owned `portable-pty` terminal. The node runtime binds its core identity, persistent private working directory, configuration, native conversation reference, and `NodeToolContext`. A persistent app-server owns the saved conversation, and a native CLI connects to it with `--remote`. The controller queues incoming graph work as recorded user messages; MCP exposes graph actions. Stop, process exit, definition changes, and resume reconcile these resources. An `argv` override hosts another interactive command without managed Codex conversation recovery. Node pane selection belongs to item 12.
 
 - [x] **2. Workspace package**
 
@@ -128,7 +128,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **3. Message package definition**
 
-   A message is `{"message":"text"}`. The contract validates it; the command task harness supplies its text on stdin and records delivery receipts. Delivering graph messages to a continuing interactive Codex conversation remains unfinished.
+   A message is `{"message":"text"}`. The contract validates it; the command task harness supplies its text on stdin and records delivery receipts. The Codex runtime begins a graph attempt and delivers its message text, sender, and input handles into the continuing conversation. Busy agents queue new messages.
 
 - [x] **4. Union package definition**
 
@@ -144,7 +144,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **7. Node-scoped MCP interface**
 
-   Shared tools in [`src/node_tool`](src/node_tool) serve one execution at one node. The [MCP adapter](docs/NODE_MCP.md) exposes the node's selected tools, with grants enforced in both catalog and dispatch. Managed Codex sessions receive a stdio adapter connected to a private execution socket; they cannot select another node by name or ID. Tool text preserves the exact receipt bytes, and delivery is acknowledged after stdout flush. Live selection/grant edits notify clients without restarting Codex. Automatic turns for incoming work remain separate follow-up work.
+   Shared tools in [`src/node_tool`](src/node_tool) serve one execution at one node. The [MCP adapter](docs/NODE_MCP.md) exposes the node's selected tools, with grants enforced in both catalog and dispatch. Managed Codex sessions receive a stdio adapter connected to a private execution socket; they cannot select another node by name or ID. Tool text preserves the exact receipt bytes, and delivery is acknowledged after stdout flush. Live selection/grant edits notify clients without restarting Codex. Incoming conversation delivery uses app-server separately from MCP tool calls.
 
 - [x] **8. Graph TUI and native management harness**
 
@@ -198,8 +198,8 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 **Build status.** The document, fixed vocabulary, translator/editor, task
 harness, persistent Codex runtime (1), and Pi surface are implemented. Remaining
-execution/UI work includes automatic incoming-work wakeups, verification of
-interactive package handoffs between agents, and node panes (12).
+execution/UI work includes a live-model project acceptance run and node pane
+selection (12).
 Core remains an existing dependency; no composite-production API was added.
 
 ## Session foundation
@@ -242,8 +242,8 @@ Workspace workers currently need an outgoing edge; an inbox provides a terminal
 result holder. These are app policies, not restrictions imposed by worker kinds
 or new core semantics.
 
-Remaining within the agreed scope: automatic incoming-work wakeups, interactive
-verification of package handoffs between continuing sessions, and node panes.
+Remaining within the agreed scope: live-model project acceptance and node pane
+selection. Native Codex message delivery is verified against a local model fixture.
 [WORKFLOWS.md](docs/WORKFLOWS.md) describes current behavior and recovery limits.
 
 ## Tentative ideas

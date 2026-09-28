@@ -497,8 +497,13 @@ async fn native_codex_discovers_and_calls_the_selected_node_tools() {
     let (fixture, directory, server) = hosted(json!({"tools":["inspect_node"]})).await;
     let log = std::fs::File::create(directory.path().join("codex.log")).unwrap();
     let mut child = Command::new("codex")
-        .arg("-c")
-        .arg(server.codex_config().unwrap())
+        .args(
+            server
+                .codex_overrides()
+                .unwrap()
+                .into_iter()
+                .flat_map(|value| ["-c".into(), value]),
+        )
         .args(["app-server", "--listen", "stdio://"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

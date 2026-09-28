@@ -14,13 +14,14 @@
 
 mod attempt;
 mod context;
+mod delivery;
 mod granted;
 mod node;
 mod outputs;
 mod read;
 mod reply;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod workspace;
 
 pub use context::{NodeScope, NodeToolContext};

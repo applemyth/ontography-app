@@ -1,5 +1,6 @@
 //! Node tools hosted in a real core execution, as a transport would host them.
 
+mod delivery;
 mod mcp;
 
 use super::{NodeScope, NodeToolContext};
@@ -21,7 +22,7 @@ use tokio::sync::{mpsc, watch};
 
 /// `source` feeds `worker`, which feeds `sink`. Tools run at `worker`, or at
 /// the entry when a test needs to originate work.
-pub(super) fn document(worker: Value) -> Document {
+pub(crate) fn document(worker: Value) -> Document {
     let mut worker = worker;
     worker["id"] = json!("worker");
     worker["kind"] = json!("agent");
@@ -47,7 +48,7 @@ fn entry_document(grants: Value) -> Document {
     .unwrap()
 }
 
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub directory: tempfile::TempDir,
     pub runtime: ProposalRuntime,
     pub session: SessionHandle,

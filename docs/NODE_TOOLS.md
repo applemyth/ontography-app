@@ -9,6 +9,14 @@ core package, activation, node, or edge identities. The [node MCP adapter](NODE_
 lists selected tools and relays calls from Codex. The persistent Codex node
 runtime owns and refreshes the context and its private transport endpoint.
 
+Managed Codex nodes also receive graph work as conversation messages. The host
+begins the attempt and supplies its `attempt_id` and input handles; the agent
+uses those handles directly instead of beginning the delivered task again.
+This input channel is independent of tool selection. Its exact message envelope
+is recorded as a `node_message` response and marked sent when app-server accepts
+the queued input. The shared tools still govern reading attachments, submitting
+results, and failing attempts.
+
 ## Hosting
 
 One `NodeToolContext` serves one execution at one node:
