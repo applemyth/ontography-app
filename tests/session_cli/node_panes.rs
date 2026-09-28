@@ -7,9 +7,9 @@ use tokio::{io::BufReader, net::UnixStream};
 
 fn document() -> Value {
     json!({"name":"panes","entry":"a-worker","nodes":[
-        {"id":"a-worker","kind":"agent","config":{"prompt":"Test pane attachment","argv":["/bin/sh","-c",
+        {"id":"a-worker","component":"agent","config":{"prompt":"Test pane attachment","argv":["/bin/sh","-c",
             "stty -echo; printf 'worker ready\\n'; while IFS= read -r line; do printf '%s\\n' \"$line\" >> input; [ \"$line\" = quit ] && exit; printf 'reply:%s\\n' \"$line\"; done"]}},
-        {"id":"z-inbox","kind":"inbox"}],"edges":[{"from":"a-worker","to":"z-inbox"}]})
+        {"id":"z-inbox","component":"inbox"}],"edges":[{"from":"a-worker","to":"z-inbox"}]})
 }
 
 async fn worker(client: &Client, predicate: impl Fn(&Value) -> bool) -> Value {
@@ -217,7 +217,11 @@ async fn worker_lookup_is_session_scoped_and_stale_attachments_cannot_enter_repl
     )
     .unwrap();
     let mut changed = document();
-    changed["nodes"][0]["config"]["prompt"] = json!("Replacement worker");
+    // A new argument ($0 of the script) changes the program, so it restarts.
+    changed["nodes"][0]["config"]["argv"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("replacement"));
     let plan = client
         .call("flow.edit", json!({"document":changed}))
         .await

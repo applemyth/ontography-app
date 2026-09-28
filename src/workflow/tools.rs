@@ -1,8 +1,8 @@
 //! The manager's complete workflow interface. Core identities stay behind it.
 
 use super::{
-    Document, DocumentNode, IdentityMap, NodeKind, WorkflowPayload, artifacts, edit, expand,
-    output, runtime,
+    Catalog, Document, DocumentNode, IdentityMap, NodeType, WorkflowPayload, artifacts, edit,
+    expand, output, runtime,
     tasks::{self, RetryLedger, TaskKey},
 };
 use crate::{
@@ -28,6 +28,13 @@ pub fn operations() -> Vec<Operation> {
     let task = json!({"run_id":text,"node":text,"task_id":text});
     let source = json!({"enum":["auto","output","pending"]});
     vec![
+        Operation::new(
+            "flow.library",
+            "List the components a document's nodes can place, with their node types and settings, and the library's MCP servers.",
+            json!({}),
+            &[],
+            false,
+        ),
         Operation::new(
             "flow.define",
             "Validate and save a reusable workflow document.",
@@ -122,8 +129,36 @@ pub fn operations() -> Vec<Operation> {
     ]
 }
 
+/// Built-in components and the user's library, read afresh for each request.
+pub fn components(service: &Service) -> Result<Catalog> {
+    Catalog::load(&service.paths.library())
+}
+
+/// The components a document can place, and the MCP servers agents can load
+/// by name. Server environments are listed by variable name only.
+fn library(service: &Service) -> Result<Value> {
+    let path = service.paths.library();
+    let library = super::components::Library::load(&path)?;
+    let servers: serde_json::Map<_, _> = library
+        .servers
+        .iter()
+        .map(|(name, server)| {
+            (
+                name.clone(),
+                json!({"command":server.command,"args":server.args,"env":server.env.keys().collect::<Vec<_>>()}),
+            )
+        })
+        .collect();
+    Ok(json!({
+        "library": path,
+        "components": Catalog::with_library(&library)?.describe(),
+        "servers": servers,
+    }))
+}
+
 pub fn save_document(service: &Service, document: &Document) -> Result<Value> {
     let document = document.canonicalized()?;
+    components(service)?.bind(&document)?;
     let revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&document)?));
     persistence::write_json(&service.paths.workflow_definition(&revision)?, &document)?;
     Ok(json!({"revision":revision,"document":document}))
@@ -166,10 +201,11 @@ pub fn prepare_start(
     if args.get("message").is_some() && args.get("workspace").is_some() {
         return Err(AppError::invalid("Supply message or workspace, not both"));
     }
+    let bindings = components(service)?.bind(&document)?;
     let identities = IdentityMap::fresh(&document);
-    let declaration = expand(&document, id, &identities)?;
+    let declaration = expand(&document, &bindings, id, &identities)?;
     declaration.compile().map_err(AppError::core)?;
-    let state = edit::WorkflowState::new(document, identities)?;
+    let state = edit::WorkflowState::new(document, bindings, identities)?;
     let input = json!({"message":optional_str(args,"message")?.unwrap_or("")});
     let workspace = args
         .get("workspace")
@@ -201,6 +237,9 @@ pub fn prepare_start(
 }
 
 pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Result<Value> {
+    if operation == "flow.library" {
+        return library(service);
+    }
     if operation == "flow.define" {
         return save_document(
             service,
@@ -238,7 +277,12 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             }
             initial = original.clone();
             // An incomplete core creation is recovered by the reserved start path.
-            let declaration = expand(&initial.state.current, &id, &initial.state.identities)?;
+            let declaration = expand(
+                &initial.state.current,
+                &initial.state.bindings,
+                &id,
+                &initial.state.identities,
+            )?;
             drop(run);
             service
                 .start_workflow_reserved(&id, declaration, project, initial)
@@ -270,12 +314,13 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             save_document(service, &state.current)
         }
         "flow.edit" => {
-            let next = serde_json::from_value(
+            let next: Document = serde_json::from_value(
                 args.get("document")
                     .cloned()
                     .ok_or_else(|| AppError::invalid("document is required"))?,
             )?;
-            let plan = edit::preview(&run.live()?.session, &state, next).await?;
+            let bindings = components(service)?.bind(&next)?;
+            let plan = edit::preview(&run.live()?.session, &state, next, bindings).await?;
             let initial = run.manifest.workflow.as_ref().expect("workflow loaded");
             let entry = &initial.state.current.entry;
             if runtime::initial_pending(&run).await?
@@ -368,7 +413,8 @@ fn plan_path(run: &ManagedRun, id: &str) -> Result<PathBuf> {
 pub struct TaskView {
     pub node: String,
     pub task_id: String,
-    pub kind: NodeKind,
+    #[serde(rename = "type")]
+    pub node_type: NodeType,
     pub input: Value,
     pub work_ids: Vec<String>,
     #[serde(skip)]
@@ -380,6 +426,7 @@ pub struct TaskView {
 /// A task the manager may select, before its input is read.
 pub(super) struct Candidate<'a> {
     pub node: &'a DocumentNode,
+    pub node_type: NodeType,
     pub task: tasks::Task,
 }
 
@@ -427,6 +474,7 @@ pub(super) async fn node_tasks<'a>(
         {
             selectable.push(Candidate {
                 node: failed.node,
+                node_type: state.binding(&failed.node.id)?.node_type,
                 task: failed.task,
             });
         }
@@ -463,7 +511,8 @@ async fn ready_tasks<'a>(
             continue;
         }
         let holds_initial = initial == Some(id.as_str());
-        let task = if node.runs_tasks() {
+        let node_type = state.binding(&node.id)?.node_type;
+        let task = if node_type.runs_tasks() {
             // Exactly what its worker runs next; failed tasks that wait or are
             // parked appear among the failures instead.
             let Some(worker) = live.workers.get(id) else {
@@ -495,13 +544,21 @@ async fn ready_tasks<'a>(
             }
             tasks::Task::packages(id, frontier.packages().to_vec())
         };
-        ready.push(Candidate { node, task });
+        ready.push(Candidate {
+            node,
+            node_type,
+            task,
+        });
     }
     Ok(ready)
 }
 
 pub(super) async fn task_view(run: &ManagedRun, candidate: Candidate<'_>) -> Result<TaskView> {
-    let Candidate { node, task } = candidate;
+    let Candidate {
+        node,
+        node_type,
+        task,
+    } = candidate;
     let raw_input = if task.is_initial() {
         serde_json::from_slice(&runtime::initial_payload(run).await?)?
     } else {
@@ -518,7 +575,7 @@ pub(super) async fn task_view(run: &ManagedRun, candidate: Candidate<'_>) -> Res
     Ok(TaskView {
         node: node.id.clone(),
         task_id: task.key.to_string(),
-        kind: node.kind,
+        node_type,
         input: payload_view(&raw_input),
         raw_input,
         work_ids: task
@@ -601,13 +658,7 @@ fn failure_ledger<'a>(
     args: &Value,
 ) -> Result<(&'a str, &'a RetryLedger)> {
     let node = views::field(args, "node")?;
-    let definition = state
-        .current
-        .nodes
-        .iter()
-        .find(|candidate| candidate.id == node)
-        .ok_or_else(|| AppError::invalid("Unknown workflow node"))?;
-    if !definition.runs_tasks() {
+    if !state.binding(node)?.node_type.runs_tasks() {
         return Err(AppError::invalid(
             "Only agent and command tasks fail and retry",
         ));
@@ -702,7 +753,10 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
         let id = &state.identities.nodes[&node.id];
         let worker = run.live.as_ref().and_then(|live| live.workers.get(id));
         let execution = run.live.as_ref().and_then(|live| worker.and_then(|worker| live.executions.get(&worker.execution_id)));
-        let mut view = json!({"id":node.id,"kind":node.kind,"pending":counts.as_ref().and_then(|view|view.counts().get(id.as_str())).map_or(0,|count|count.received()),
+        let binding = &state.bindings[&node.id];
+        let mut view = json!({"id":node.id,"type":binding.node_type,"component":node.component,
+            "implementation":binding.implementation.kind(),
+            "pending":counts.as_ref().and_then(|view|view.counts().get(id.as_str())).map_or(0,|count|count.received()),
             "execution":execution.map(|handle|execution_status(handle.status()))});
         if let Some(runtime) = worker.and_then(|worker| worker.node.as_ref()) {
             view["session"] = json!(runtime.status());
@@ -757,7 +811,7 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
                 "This task is no longer ready; read status again",
             )
         })?;
-    if task.kind != NodeKind::Human {
+    if task.node_type != NodeType::Human {
         return Err(AppError::invalid("Only human tasks accept decisions"));
     }
     let result = match (args.get("message"), args.get("workspace_id")) {

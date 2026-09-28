@@ -4,9 +4,11 @@
 //! accept loose placement settings and produce these exact configurations.
 //! Every field here is already validated and defaulted.
 
-use super::super::NodeType;
+use super::{super::NodeType, is_name};
 use crate::{AppError, Result};
+use ontography::project::BoundComponent;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 /// The node tools' own MCP server name; configured servers cannot take it.
@@ -36,7 +38,7 @@ pub enum Implementation {
     /// A person deciding each task.
     Human(HumanConfig),
     /// Incoming work, held.
-    Inbox,
+    Inbox(InboxConfig),
 }
 
 impl Implementation {
@@ -48,7 +50,34 @@ impl Implementation {
             Self::Program(_) => "program",
             Self::Command(_) => "command",
             Self::Human(_) => "human",
-            Self::Inbox => "inbox",
+            Self::Inbox(_) => "inbox",
+        }
+    }
+
+    /// Read what a component bound. Its configuration must be exact.
+    pub fn from_bound(bound: BoundComponent) -> Result<Self> {
+        serde_json::from_value(json!({"kind": bound.kind, "config": bound.config})).map_err(
+            |error| {
+                AppError::new(
+                    "invalid_component_binding",
+                    format!("Component bound {:?} incorrectly: {error}", bound.kind),
+                )
+            },
+        )
+    }
+
+    /// This configuration as core's execution bindings record it.
+    pub fn configuration(&self) -> Value {
+        serde_json::to_value(self)
+            .map(|mut value| value["config"].take())
+            .unwrap_or_default()
+    }
+
+    /// The command a task harness runs for each task, if this is one.
+    pub const fn command(&self) -> Option<&CommandConfig> {
+        match self {
+            Self::Command(command) => Some(command),
+            _ => None,
         }
     }
 
@@ -62,7 +91,7 @@ impl Implementation {
         match self {
             Self::Codex(agent) | Self::Claude(agent) => agent.pty,
             Self::Program(_) => true,
-            Self::Command(_) | Self::Human(_) | Self::Inbox => false,
+            Self::Command(_) | Self::Human(_) | Self::Inbox(_) => false,
         }
     }
 }
@@ -146,16 +175,14 @@ pub struct HumanConfig {
     pub prompt: Option<String>,
 }
 
-/// Names shared with other programs' configuration keys.
-fn is_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxConfig {}
 
 fn is_env_name(name: &str) -> bool {
-    name.bytes().next().is_some_and(|byte| !byte.is_ascii_digit())
+    name.bytes()
+        .next()
+        .is_some_and(|byte| !byte.is_ascii_digit())
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')

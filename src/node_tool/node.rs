@@ -23,7 +23,7 @@ pub(super) struct InspectNode;
 
 impl Tool for InspectNode {
     const NAME: &'static str = "inspect_node";
-    const DESCRIPTION: &'static str = "Read this node's name, kind, settings, join, grants, retry policy, neighbors, and open attempts.";
+    const DESCRIPTION: &'static str = "Read this node's name, type, component, settings, join, grants, retry policy, neighbors, and open attempts.";
     const MUTATING: bool = false;
     type Input = Nothing;
 
@@ -34,7 +34,8 @@ impl Tool for InspectNode {
         let node = &scope.node;
         Reply::plain(&json!({
             "node": node.id,
-            "kind": node.kind,
+            "type": scope.binding.node_type,
+            "component": node.component,
             "config": node.config,
             "join": node.join,
             "grants": node.grants,

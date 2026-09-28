@@ -1,7 +1,9 @@
 //! Command workers consume scoped inputs and publish through core admission.
 
 use super::{
-    document::{DocumentNode, NodeKind, WorkflowPayload},
+    BoundNode, Implementation,
+    components::CommandConfig,
+    document::{DocumentNode, WorkflowPayload},
     tasks::{self, RetryLedger, Task},
 };
 use crate::persistence::write_json;
@@ -44,7 +46,7 @@ fn failure(error: impl std::fmt::Display) -> ExecutionFailure {
 /// backoff, or is parked, while the worker continues with other tasks.
 pub async fn run(
     mut context: ExecutionContext,
-    mut settings: watch::Receiver<DocumentNode>,
+    mut settings: watch::Receiver<BoundNode>,
     project: PathBuf,
     directory: PathBuf,
     mut initial: Option<Payload>,
@@ -67,8 +69,8 @@ pub async fn run(
             return Ok(());
         }
         let node = settings.borrow_and_update().clone();
-        if node.kind == NodeKind::Agent {
-            return Err(failure("Agent nodes require the persistent node runtime"));
+        if node.binding.implementation.is_session() {
+            return Err(failure("Sessions run in the persistent node runtime"));
         }
         let definition = node.digest();
         // Failures count against the definition they happen under; renewing
@@ -79,12 +81,13 @@ pub async fn run(
         if initial.is_some() && super::runtime::initial_complete(&directory).map_err(failure)? {
             initial = None;
         }
-        if node.kind == NodeKind::Inbox
+        if matches!(node.binding.implementation, Implementation::Inbox(_))
             && let Some(input) = initial.take()
         {
-            accept_initial_sink(&context, &node, &directory, input).await?;
+            accept_initial_sink(&context, &node.node, &directory, input).await?;
         }
-        if matches!(node.kind, NodeKind::Human | NodeKind::Inbox) {
+        // Human and inbox work waits for the manager.
+        if node.binding.implementation.command().is_none() {
             if !idle(&mut context, &mut settings, &mut retries, None).await {
                 return Ok(());
             }
@@ -115,7 +118,7 @@ pub async fn run(
             initial = None;
             continue;
         }
-        let policy = node.retry_policy();
+        let policy = node.node.retry_policy();
         let started = match trigger(&context, &task, initial.as_ref()).await? {
             Ok((trigger, payloads)) => begin(&context, trigger, &payloads)
                 .await?
@@ -165,7 +168,7 @@ pub async fn run(
             Err(error) if context.stop().is_requested() => {
                 // A stop interrupts the attempt; it is not the task's failure.
                 let _ = invocation.interrupt(error.message()).await;
-                report_failure(&directory, &invocation, &node, &error);
+                report_failure(&directory, &invocation, &node.node, &error);
                 return Ok(());
             }
             Err(error) => {
@@ -174,7 +177,7 @@ pub async fn run(
                 let recorded =
                     ledger.record_failure(&task, error.message(), true, &policy, &definition);
                 let _ = invocation.fail(error.message()).await;
-                report_failure(&directory, &invocation, &node, &error);
+                report_failure(&directory, &invocation, &node.node, &error);
                 recorded.map_err(failure)?;
             }
         }
@@ -185,7 +188,7 @@ pub async fn run(
 /// change, a retry decision, or the end of a backoff. False means exit.
 async fn idle(
     context: &mut ExecutionContext,
-    settings: &mut watch::Receiver<DocumentNode>,
+    settings: &mut watch::Receiver<BoundNode>,
     retries: &mut watch::Receiver<u64>,
     wake: Option<Instant>,
 ) -> bool {
@@ -368,12 +371,17 @@ async fn begin(
 async fn perform(
     context: &ExecutionContext,
     invocation: &InvocationHandle,
-    node: &DocumentNode,
+    node: &BoundNode,
     project: &Path,
     directory: &Path,
     workspaces: &WorkspaceStore,
     payloads: &[Payload],
 ) -> WorkerResult<()> {
+    let command = node
+        .binding
+        .implementation
+        .command()
+        .ok_or_else(|| failure("Only command nodes run tasks"))?;
     // Preparation records the exact source exposure, including resolved package views.
     invocation.prepare_context().await.map_err(failure)?;
     let mut parts = Vec::new();
@@ -403,7 +411,7 @@ async fn perform(
             invocation,
             receipt: receipt.sequence,
             workspace_receipt: workspace.as_ref().map(|(_, exposure)| *exposure),
-            node,
+            command,
             cwd,
             directory,
             input: input.into_bytes(),
@@ -431,7 +439,7 @@ async fn perform(
         .record_tool_response("worker_output", encoded.clone())
         .await
         .map_err(failure)?;
-    let mut report = json!({"invocation_id":invocation.id().to_string(), "node":node.id,
+    let mut report = json!({"invocation_id":invocation.id().to_string(), "node":node.node.id,
         "result":result, "stdout":output.stdout, "stderr":output.stderr, "publication_status":"prepared"});
     write_json(&directory.join("output.json"), &report).map_err(failure)?;
     // Fetch routes after execution; the admitted result always follows the current graph.
@@ -515,7 +523,7 @@ struct ProcessInput<'a> {
     invocation: &'a InvocationHandle,
     receipt: u64,
     workspace_receipt: Option<u64>,
-    node: &'a DocumentNode,
+    command: &'a CommandConfig,
     cwd: &'a Path,
     directory: &'a Path,
     input: Vec<u8>,
@@ -987,34 +995,17 @@ async fn process(
         invocation,
         receipt,
         workspace_receipt,
-        node,
+        command,
         cwd,
         directory,
         input,
     } = request;
-    let argv: Vec<String> = node
-        .config
-        .get("argv")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| failure("Worker argv is missing"))?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| failure("Worker argv must contain strings"))
-        })
-        .collect::<WorkerResult<_>>()?;
-    let timeout = Duration::from_secs(
-        node.config
-            .get("timeout_secs")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(300),
-    );
+    let argv = &command.argv;
+    let timeout = Duration::from_secs(command.timeout_secs.unwrap_or(300));
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| failure("Worker timeout is too large"))?;
-    let mut supervised = spawn_supervised(&argv, cwd, directory, &input).await?;
+    let mut supervised = spawn_supervised(argv, cwd, directory, &input).await?;
     let stdout = supervised.child().stdout.take().expect("piped stdout");
     let stderr = supervised.child().stderr.take().expect("piped stderr");
     let mut stop = context.stop();
@@ -1068,7 +1059,7 @@ async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::document::{Document, IdentityMap, expand};
+    use crate::workflow::document::{Document, IdentityMap, expand_builtin as expand};
     use ontography::{
         ExecutionHandle, ExecutionHost, InvocationStatus, ProposalRuntime, ReceiptState,
     };
@@ -1088,7 +1079,7 @@ mod tests {
     async fn launch(
         host: &ExecutionHost,
         node: &str,
-        settings: watch::Receiver<DocumentNode>,
+        settings: watch::Receiver<BoundNode>,
         project: PathBuf,
         directory: PathBuf,
         initial: Option<Payload>,
@@ -1366,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn initial_inbox_accepts_input_once_without_a_process() {
         let document = Document::parse(
-            r#"{"name":"sink","entry":"inbox","nodes":[{"id":"inbox","kind":"inbox"}]}"#,
+            r#"{"name":"sink","entry":"inbox","nodes":[{"id":"inbox","component":"inbox"}]}"#,
         )
         .unwrap();
         let ids = IdentityMap::fresh(&document);
@@ -1377,7 +1368,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("worker");
         let marker = directory.join("initial-complete.json");
-        let (sender, settings) = watch::channel(document.nodes[0].clone());
+        let (sender, settings) = watch::channel(BoundNode::of(document.nodes[0].clone()));
         let input = WorkflowPayload::Message {
             message: "stored".into(),
         }
@@ -1412,7 +1403,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_publishes_message_and_reloads_settings_for_next_task() {
-        let document = Document::parse(r#"{"name":"worker","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/bin/cat"]}},{"id":"output","kind":"inbox"}],"edges":[{"from":"command","to":"output"},{"from":"output","to":"command"}]}"#).unwrap();
+        let document = Document::parse(r#"{"name":"worker","entry":"command","nodes":[{"id":"command","component":"command","config":{"argv":["/bin/cat"]}},{"id":"output","component":"inbox"}],"edges":[{"from":"command","to":"output"},{"from":"output","to":"command"}]}"#).unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "worker", &ids)
             .unwrap()
@@ -1430,7 +1421,7 @@ mod tests {
             .find(|node| node.id == "command")
             .unwrap()
             .clone();
-        let (settings, receiver) = watch::channel(node.clone());
+        let (settings, receiver) = watch::channel(BoundNode::of(node.clone()));
         let first = WorkflowPayload::Message {
             message: "first".into(),
         }
@@ -1475,7 +1466,7 @@ mod tests {
         // A setting change does not replace the graph node or replay initial input.
         let mut changed = node;
         changed.config = json!({"argv":["/usr/bin/printf","second"]});
-        settings.send(changed).unwrap();
+        settings.send(BoundNode::of(changed)).unwrap();
         let input = WorkflowPayload::Message {
             message: "next".into(),
         }
@@ -1566,7 +1557,7 @@ mod tests {
         inputs: Vec<String>,
         _host: ExecutionHost,
         // An idle worker exits once its settings sender is gone.
-        _settings: watch::Sender<DocumentNode>,
+        _settings: watch::Sender<BoundNode>,
         temporary: tempfile::TempDir,
     }
 
@@ -1578,7 +1569,7 @@ mod tests {
             command["kind"] = json!("command");
             let document: Document =
                 serde_json::from_value(json!({"name":"failure","entry":"source",
-                "nodes":[{"id":"source","kind":"inbox"},command],
+                "nodes":[{"id":"source","component":"inbox"},command],
                 "edges":[{"from":"source","to":"command"}]}))
                 .unwrap();
             let ids = IdentityMap::fresh(&document);
@@ -1629,7 +1620,7 @@ mod tests {
                 .find(|node| node.id == "command")
                 .unwrap()
                 .clone();
-            let (sender, receiver) = watch::channel(settings);
+            let (sender, receiver) = watch::channel(BoundNode::of(settings));
             let project = temporary.path().to_path_buf();
             let (worker, ledger) = launch(
                 &host,
@@ -1796,7 +1787,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_command_uses_private_checkout_and_publishes_captured_package() {
-        let document = Document::parse(r#"{"name":"workspace","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/bin/sh","-c","printf changed > file.txt"]}},{"id":"output","kind":"inbox"}],"edges":[{"from":"command","to":"output"}]}"#).unwrap();
+        let document = Document::parse(r#"{"name":"workspace","entry":"command","nodes":[{"id":"command","component":"command","config":{"argv":["/bin/sh","-c","printf changed > file.txt"]}},{"id":"output","component":"inbox"}],"edges":[{"from":"command","to":"output"}]}"#).unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "workspace", &ids)
             .unwrap()
@@ -1821,7 +1812,7 @@ mod tests {
             .find(|node| node.id == "command")
             .unwrap()
             .clone();
-        let (sender, settings) = watch::channel(node);
+        let (sender, settings) = watch::channel(BoundNode::of(node));
         let directory = temporary.path().join("worker");
         let complete = directory.join("initial-complete.json");
         let (worker, _) = launch(
@@ -1921,7 +1912,7 @@ mod tests {
     /// retry policy. The worker keeps running.
     #[tokio::test]
     async fn a_file_sent_as_a_workspace_parks_at_once_and_the_worker_keeps_running() {
-        let document = Document::parse(r#"{"name":"file-workspace","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}},{"id":"output","kind":"inbox"}],"edges":[{"from":"command","to":"output"}]}"#).unwrap();
+        let document = Document::parse(r#"{"name":"file-workspace","entry":"command","nodes":[{"id":"command","component":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}},{"id":"output","component":"inbox"}],"edges":[{"from":"command","to":"output"}]}"#).unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "file-workspace", &ids)
             .unwrap()
@@ -1949,7 +1940,7 @@ mod tests {
             .find(|node| node.id == "command")
             .unwrap()
             .clone();
-        let (sender, settings) = watch::channel(node);
+        let (sender, settings) = watch::channel(BoundNode::of(node));
         let (worker, ledger) = launch(
             &host,
             &ids.nodes["command"],
@@ -1985,7 +1976,7 @@ mod tests {
     /// either, so its task parks at once as well.
     #[tokio::test]
     async fn a_symlink_sent_as_a_workspace_parks_at_once() {
-        let document = Document::parse(r#"{"name":"symlink-workspace","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}},{"id":"output","kind":"inbox"}],"edges":[{"from":"command","to":"output"}]}"#).unwrap();
+        let document = Document::parse(r#"{"name":"symlink-workspace","entry":"command","nodes":[{"id":"command","component":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}},{"id":"output","component":"inbox"}],"edges":[{"from":"command","to":"output"}]}"#).unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "symlink-workspace", &ids)
             .unwrap()
@@ -2011,7 +2002,7 @@ mod tests {
             .find(|node| node.id == "command")
             .unwrap()
             .clone();
-        let (sender, settings) = watch::channel(node);
+        let (sender, settings) = watch::channel(BoundNode::of(node));
         let (worker, ledger) = launch(
             &host,
             &ids.nodes["command"],
@@ -2048,7 +2039,7 @@ mod tests {
     #[tokio::test]
     async fn abandoned_checkouts_are_removed_when_a_worker_starts() {
         use std::os::unix::fs::PermissionsExt;
-        let document = Document::parse(r#"{"name":"abandoned","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/true"]}}]}"#).unwrap();
+        let document = Document::parse(r#"{"name":"abandoned","entry":"command","nodes":[{"id":"command","component":"command","config":{"argv":["/usr/bin/true"]}}]}"#).unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "abandoned", &ids)
             .unwrap()
@@ -2065,7 +2056,7 @@ mod tests {
         for path in [abandoned.join("nested"), abandoned.clone()] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
-        let (sender, settings) = watch::channel(document.nodes[0].clone());
+        let (sender, settings) = watch::channel(BoundNode::of(document.nodes[0].clone()));
         let (worker, _) = launch(
             &host,
             &ids.nodes["command"],
@@ -2095,7 +2086,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_worker_starts_even_if_an_abandoned_checkout_cannot_be_removed() {
-        let document = Document::parse(r#"{"name":"undeletable","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/true"]}}]}"#).unwrap();
+        let document = Document::parse(r#"{"name":"undeletable","entry":"command","nodes":[{"id":"command","component":"command","config":{"argv":["/usr/bin/true"]}}]}"#).unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "undeletable", &ids)
             .unwrap()
@@ -2119,7 +2110,7 @@ mod tests {
                 .success()
         };
         assert!(chflags("uchg"));
-        let (sender, settings) = watch::channel(document.nodes[0].clone());
+        let (sender, settings) = watch::channel(BoundNode::of(document.nodes[0].clone()));
         let (worker, _) = launch(
             &host,
             &ids.nodes["command"],
@@ -2149,7 +2140,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_without_output_route_parks_its_task_before_running_a_command() {
-        let document = Document::parse(r#"{"name":"terminal-workspace","entry":"command","nodes":[{"id":"command","kind":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}}]}"#).unwrap();
+        let document = Document::parse(r#"{"name":"terminal-workspace","entry":"command","nodes":[{"id":"command","component":"command","config":{"argv":["/usr/bin/touch","should-not-run"]}}]}"#).unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "terminal-workspace", &ids)
             .unwrap()
@@ -2169,7 +2160,7 @@ mod tests {
         let initial = WorkflowPayload::Workspace(PackageEnvelope::new(base.root()))
             .encode()
             .unwrap();
-        let (sender, settings) = watch::channel(document.nodes[0].clone());
+        let (sender, settings) = watch::channel(BoundNode::of(document.nodes[0].clone()));
         let (worker, ledger) = launch(
             &host,
             &ids.nodes["command"],
@@ -2299,12 +2290,12 @@ mod tests {
             let document: Document = serde_json::from_value(json!({
                 "name": "join", "entry": "feed",
                 "nodes": [
-                    {"id": "feed", "kind": "inbox"},
-                    {"id": "left", "kind": "inbox"},
-                    {"id": "right", "kind": "inbox"},
-                    {"id": "join", "kind": "command", "join": "all",
+                    {"id": "feed", "component": "inbox"},
+                    {"id": "left", "component": "inbox"},
+                    {"id": "right", "component": "inbox"},
+                    {"id": "join", "component": "command", "join": "all",
                         "config": {"argv": ["/bin/sh", "-c", JOIN]}, "retry": {"max_attempts": 1}},
-                    {"id": "done", "kind": "inbox"}],
+                    {"id": "done", "component": "inbox"}],
                 "edges": [
                     {"from": "feed", "to": "left"}, {"from": "feed", "to": "right"},
                     {"from": "left", "to": "join"}, {"from": "right", "to": "join"},
@@ -2354,7 +2345,7 @@ mod tests {
                 .find(|candidate| candidate.id == "join")
                 .unwrap()
                 .clone();
-            let (sender, receiver) = watch::channel(settings);
+            let (sender, receiver) = watch::channel(BoundNode::of(settings));
             let project = temporary.path().to_path_buf();
             let (worker, ledger) = launch(
                 &host,
@@ -2449,8 +2440,9 @@ mod tests {
             .await;
         // The manager fixes the command while its attempt runs, as reconcile
         // applies it: new settings, then the renewed ledger.
-        let mut fixed = old.clone();
+        let mut fixed = old.node.clone();
         fixed.config = json!({"argv":["/bin/sh","-c","printf fixed"]});
+        let fixed = BoundNode::of(fixed);
         fixture._settings.send_replace(fixed.clone());
         fixture.ledger.renew(&fixed.digest()).unwrap();
         // The old attempt fails; the fixed command should then run the task.

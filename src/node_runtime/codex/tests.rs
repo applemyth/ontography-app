@@ -10,7 +10,7 @@ mod native_delivery;
 const THREAD: &str = "6b121953-b116-4a0f-b2dd-a63c293e2c85";
 
 fn node() -> DocumentNode {
-    serde_json::from_value(json!({"id":"writer","kind":"agent","config":{"prompt":"Review changes","model":"test-model"}})).unwrap()
+    serde_json::from_value(json!({"id":"writer","component":"agent","config":{"prompt":"Review changes","model":"test-model"}})).unwrap()
 }
 
 #[tokio::test]

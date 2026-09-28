@@ -27,7 +27,7 @@ fn task(status: &Value, node: &str) -> Value {
 
 fn review_loop() -> Value {
     json!({"name":"review-loop","entry":"review","nodes":[
-        {"id":"review","kind":"human"},{"id":"revise","kind":"human"}
+        {"id":"review","component":"human"},{"id":"revise","component":"human"}
     ],"edges":[{"from":"review","to":"revise"},{"from":"revise","to":"review"}]})
 }
 
@@ -269,7 +269,7 @@ async fn inbox_items_are_selected_explicitly_paged_consistently_and_stable_after
     let paths = Paths::initialize(directory.path().join("data")).unwrap();
     let service = Service::new(paths.clone()).unwrap();
     let document = json!({"name":"collect-results","entry":"review","nodes":[
-        {"id":"review","kind":"human"},{"id":"results","kind":"inbox"}
+        {"id":"review","component":"human"},{"id":"results","component":"inbox"}
     ],"edges":[{"from":"review","to":"review"},{"from":"review","to":"results"}]});
     let initial = call(
         &service,
@@ -404,8 +404,8 @@ async fn joined_task_selects_each_input_and_opens_its_unique_workspace() {
     std::fs::write(source.join("draft.txt"), "joined workspace").unwrap();
     let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
     let document = json!({"name":"joined-review","entry":"start","nodes":[
-        {"id":"start","kind":"human"},{"id":"files","kind":"human"},
-        {"id":"note","kind":"human"},{"id":"review","kind":"human","join":"all"}
+        {"id":"start","component":"human"},{"id":"files","component":"human"},
+        {"id":"note","component":"human"},{"id":"review","component":"human","join":"all"}
     ],"edges":[{"from":"start","to":"files"},{"from":"start","to":"note"},
         {"from":"files","to":"review"},{"from":"note","to":"review"}]});
     let initial = call(
@@ -464,7 +464,7 @@ async fn failed_command_exposes_structured_error_without_changing_case() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
     let document = json!({"name":"command-failure","entry":"fail","nodes":[
-        {"id":"fail","kind":"command","config":{"argv":["/bin/sh","-c","printf 'MiXeD Failure' >&2; exit 7"]}}
+        {"id":"fail","component":"command","config":{"argv":["/bin/sh","-c","printf 'MiXeD Failure' >&2; exit 7"]}}
     ],"edges":[]});
     let started = call(
         &service,

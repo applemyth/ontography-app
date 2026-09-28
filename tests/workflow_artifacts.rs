@@ -17,7 +17,7 @@ async fn captured_workspace_survives_restart_and_becomes_the_human_result() {
     let paths = Paths::initialize(directory.path().join("data")).unwrap();
     let service = Service::new(paths.clone()).unwrap();
     let document = json!({"name":"workspace-review","entry":"review",
-        "nodes":[{"id":"review","kind":"human","config":{"prompt":"Review the files"}},{"id":"result","kind":"inbox"}],
+        "nodes":[{"id":"review","component":"human","config":{"prompt":"Review the files"}},{"id":"result","component":"inbox"}],
         "edges":[{"from":"review","to":"result"}]});
     let started = call(
         &service,

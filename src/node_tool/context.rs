@@ -1,7 +1,8 @@
 //! One execution's node tools: what they can see, and the attempts they own.
 
 use crate::workflow::{
-    DocumentNode, Grant,
+    Binding, BoundNode, DocumentNode, Grant,
+    components::definition_digest,
     edit::{self, WorkflowState},
     runtime,
     tasks::{Held, RetryLedger, RetryOutcome, Task, TaskSource},
@@ -39,19 +40,31 @@ const SEND_GRACE: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub struct NodeScope {
     pub node: DocumentNode,
+    /// What the node runs, as its component bound it.
+    pub binding: Binding,
     workflow: Arc<WorkflowState>,
 }
 
 impl NodeScope {
     pub fn new(workflow: Arc<WorkflowState>, node: &str) -> Result<Self> {
-        let node = workflow
-            .current
-            .nodes
-            .iter()
-            .find(|candidate| candidate.id == node)
-            .cloned()
-            .ok_or_else(|| AppError::invalid(format!("Unknown workflow node {node:?}")))?;
-        Ok(Self { node, workflow })
+        let BoundNode { node, binding } = workflow.bound_node(node)?;
+        Ok(Self {
+            node,
+            binding,
+            workflow,
+        })
+    }
+
+    /// Names this node's exact definition, for its retry counts.
+    pub fn definition(&self) -> String {
+        definition_digest(&self.node, &self.binding)
+    }
+
+    pub fn bound_node(&self) -> BoundNode {
+        BoundNode {
+            node: self.node.clone(),
+            binding: self.binding.clone(),
+        }
     }
 
     /// Workflow names of the core nodes, as `kernel` shows them.
@@ -109,9 +122,11 @@ pub(super) struct Attempt {
     pub(super) invocation: InvocationHandle,
     /// The queued task this attempt works on; `None` for originated work.
     pub(super) task: Option<Task>,
-    /// The node's definition when the attempt began. Its failure counts
-    /// only while that definition holds.
+    /// The node when the attempt began. Its failure counts only while that
+    /// definition holds.
     pub(super) node: DocumentNode,
+    /// `node`'s definition digest, including its binding.
+    pub(super) definition: String,
     /// The root input's handle and digest, when core triggered the attempt
     /// with bytes rather than packages.
     pub(super) root_input: Option<(String, ContentDigest)>,
@@ -303,7 +318,7 @@ impl NodeToolContext {
     pub(super) fn version(&self) -> String {
         let frontier = self.session.frontier().revision();
         let (retries, ended) = self.ledger.version();
-        let settings = self.scope.borrow().node.digest();
+        let settings = self.scope.borrow().definition();
         format!("{frontier}.{retries}.{ended}.{}", &settings[..16])
     }
 
@@ -410,8 +425,10 @@ impl NodeToolContext {
         &self,
         invocation: InvocationHandle,
         task: Option<Task>,
-        node: DocumentNode,
+        node: BoundNode,
     ) -> Result<Arc<Attempt>> {
+        let definition = node.digest();
+        let node = node.node;
         let staging = self
             .execution
             .content_store()
@@ -443,6 +460,7 @@ impl NodeToolContext {
             invocation,
             task,
             node,
+            definition,
             root_input,
             members,
             unsent: Arc::default(),
@@ -544,7 +562,6 @@ impl NodeToolContext {
         reason: &str,
         retryable: bool,
     ) -> Result<Option<RetryOutcome>> {
-        let node = &attempt.node;
         attempt
             .task
             .as_ref()
@@ -553,8 +570,8 @@ impl NodeToolContext {
                     task,
                     reason,
                     retryable,
-                    &node.retry_policy(),
-                    &node.digest(),
+                    &attempt.node.retry_policy(),
+                    &attempt.definition,
                 )
             })
             .transpose()

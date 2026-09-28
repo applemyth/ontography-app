@@ -141,7 +141,10 @@ impl Drop for NodeHooks {
 /// execution has accepted it, so a hook finishes after its event is recorded.
 async fn accept(stream: UnixStream, token: &str, events: &mpsc::Sender<HookEvent>) -> Result<()> {
     if stream.peer_cred()?.uid() != nix::unistd::geteuid().as_raw() {
-        return Err(AppError::new("node_hooks", "Hook peer has a different owner"));
+        return Err(AppError::new(
+            "node_hooks",
+            "Hook peer has a different owner",
+        ));
     }
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -150,7 +153,10 @@ async fn accept(stream: UnixStream, token: &str, events: &mpsc::Sender<HookEvent
     };
     let frame: Frame = serde_json::from_slice(&bytes)?;
     if frame.version != 1 || frame.token != token {
-        return Err(AppError::new("node_hooks", "Stale or invalid hook identity"));
+        return Err(AppError::new(
+            "node_hooks",
+            "Stale or invalid hook identity",
+        ));
     }
     if !EVENTS.contains(&frame.event.as_str()) {
         return Err(AppError::invalid(format!(
@@ -226,8 +232,7 @@ mod tests {
 
     fn directory() -> tempfile::TempDir {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }
 
@@ -238,20 +243,38 @@ mod tests {
         let environment = hooks.environment();
         let socket = PathBuf::from(&environment[SOCKET_ENV]);
         let token = environment[TOKEN_ENV].clone();
-        forward(&socket, token.clone(), "SessionStart", json!({"source":"startup"}))
-            .await
-            .unwrap();
-        forward(&socket, token.clone(), "UserPromptSubmit", json!({"prompt":"work"}))
-            .await
-            .unwrap();
+        forward(
+            &socket,
+            token.clone(),
+            "SessionStart",
+            json!({"source":"startup"}),
+        )
+        .await
+        .unwrap();
+        forward(
+            &socket,
+            token.clone(),
+            "UserPromptSubmit",
+            json!({"prompt":"work"}),
+        )
+        .await
+        .unwrap();
         let first = events.recv().await.unwrap();
         assert_eq!(first.name, "SessionStart");
         assert_eq!(first.input["source"], "startup");
         let second = events.recv().await.unwrap();
         assert_eq!(second.prompt(), Some("work"));
 
-        assert!(forward(&socket, "stale".into(), "Stop", json!({})).await.is_err());
-        assert!(forward(&socket, token.clone(), "PreToolUse", json!({})).await.is_err());
+        assert!(
+            forward(&socket, "stale".into(), "Stop", json!({}))
+                .await
+                .is_err()
+        );
+        assert!(
+            forward(&socket, token.clone(), "PreToolUse", json!({}))
+                .await
+                .is_err()
+        );
         forward(&socket, token, "Stop", Value::Null).await.unwrap();
         let third = events.recv().await.unwrap();
         assert_eq!((third.name.as_str(), third.input.is_null()), ("Stop", true));

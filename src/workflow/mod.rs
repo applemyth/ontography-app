@@ -12,8 +12,8 @@ pub mod runtime;
 pub mod tasks;
 pub mod tools;
 
+pub use components::{Binding, Bindings, BoundNode, Catalog, Implementation};
 pub use document::{
-    Document, DocumentEdge, DocumentNode, Grant, IdentityMap, JoinMode, NodeKind, WorkflowPayload,
-    edge_key, expand,
+    Document, DocumentEdge, DocumentNode, Grant, IdentityMap, WorkflowPayload, edge_key, expand,
 };
 pub use node_type::NodeType;

@@ -166,7 +166,7 @@ mod tests {
     use ontography::ProposalRuntime;
 
     use super::*;
-    use crate::workflow::{Document, IdentityMap, expand};
+    use crate::workflow::{Document, IdentityMap, document::expand_builtin as expand};
 
     /// A store in `directory`, and its view of `files`.
     async fn imported(
@@ -174,7 +174,7 @@ mod tests {
         files: &[(&str, &str)],
     ) -> (ProposalRuntime, WorkspaceStore, ResolvedPackage) {
         let document = Document::parse(
-            r#"{"name":"store","entry":"inbox","nodes":[{"id":"inbox","kind":"inbox"}]}"#,
+            r#"{"name":"store","entry":"inbox","nodes":[{"id":"inbox","component":"inbox"}]}"#,
         )
         .unwrap();
         let compiled = expand(&document, "store", &IdentityMap::fresh(&document))

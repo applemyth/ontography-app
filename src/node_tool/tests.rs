@@ -5,9 +5,10 @@ mod mcp;
 
 use super::{NodeScope, NodeToolContext};
 use crate::workflow::{
-    Document, Grant, IdentityMap, WorkflowPayload, edge_key,
+    Document, Grant, IdentityMap, WorkflowPayload,
+    document::expand_builtin as expand,
+    edge_key,
     edit::WorkflowState,
-    expand,
     tasks::{RetryLedger, TaskKey},
 };
 use crate::workspace::WorkspaceStore;
@@ -25,13 +26,13 @@ use tokio::sync::{mpsc, watch};
 pub(crate) fn document(worker: Value) -> Document {
     let mut worker = worker;
     worker["id"] = json!("worker");
-    worker["kind"] = json!("agent");
+    worker["component"] = json!("agent");
     if worker.get("config").is_none() {
         worker["config"] = json!({"prompt": "Work"});
     }
     serde_json::from_value(json!({
         "name": "tools", "entry": "source",
-        "nodes": [{"id": "source", "kind": "inbox"}, worker, {"id": "sink", "kind": "inbox"}],
+        "nodes": [{"id": "source", "component": "inbox"}, worker, {"id": "sink", "component": "inbox"}],
         "edges": [{"from": "source", "to": "worker"}, {"from": "worker", "to": "sink"}],
     }))
     .unwrap()
@@ -41,8 +42,8 @@ pub(crate) fn document(worker: Value) -> Document {
 fn entry_document(grants: Value) -> Document {
     serde_json::from_value(json!({
         "name": "entry", "entry": "worker",
-        "nodes": [{"id": "worker", "kind": "agent", "config": {"prompt": "Start"}, "grants": grants},
-            {"id": "sink", "kind": "inbox"}],
+        "nodes": [{"id": "worker", "component": "agent", "config": {"prompt": "Start"}, "grants": grants},
+            {"id": "sink", "component": "inbox"}],
         "edges": [{"from": "worker", "to": "sink"}],
     }))
     .unwrap()
@@ -72,7 +73,7 @@ impl Fixture {
         let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
-        let state = Arc::new(WorkflowState::new(document, identities.clone()).unwrap());
+        let state = Arc::new(WorkflowState::builtin(document, identities.clone()).unwrap());
         let (scope, receiver) = watch::channel(NodeScope::new(state, node).unwrap());
         let node_directory = directory.path().join("nodes").join(node);
         std::fs::create_dir_all(&node_directory).unwrap();
@@ -1267,9 +1268,9 @@ async fn relay(fixture: &Fixture, ids: &IdentityMap, root: &str, side: &str, tex
 async fn a_parked_join_keeps_its_inputs_while_a_later_join_runs() {
     let document: Document = serde_json::from_value(json!({
         "name": "parked", "entry": "left",
-        "nodes": [{"id": "left", "kind": "inbox"}, {"id": "right", "kind": "inbox"},
-            {"id": "worker", "kind": "agent", "config": {"prompt": "Join"}, "join": "all"},
-            {"id": "sink", "kind": "inbox"}],
+        "nodes": [{"id": "left", "component": "inbox"}, {"id": "right", "component": "inbox"},
+            {"id": "worker", "component": "agent", "config": {"prompt": "Join"}, "join": "all"},
+            {"id": "sink", "component": "inbox"}],
         "edges": [{"from": "left", "to": "worker"}, {"from": "left", "to": "right"},
             {"from": "right", "to": "worker"}, {"from": "worker", "to": "sink"}],
     }))
@@ -1356,11 +1357,11 @@ async fn a_parked_join_keeps_its_inputs_while_a_later_join_runs() {
 async fn a_failed_join_is_released_when_its_node_gains_a_connection() {
     let mut document = json!({
         "name": "stale", "entry": "feed",
-        "nodes": [{"id": "feed", "kind": "inbox"}, {"id": "left", "kind": "inbox"},
-            {"id": "right", "kind": "inbox"}, {"id": "third", "kind": "inbox"},
-            {"id": "worker", "kind": "agent", "config": {"prompt": "Join"}, "join": "all",
+        "nodes": [{"id": "feed", "component": "inbox"}, {"id": "left", "component": "inbox"},
+            {"id": "right", "component": "inbox"}, {"id": "third", "component": "inbox"},
+            {"id": "worker", "component": "agent", "config": {"prompt": "Join"}, "join": "all",
                 "retry": {"max_attempts": 3, "initial_delay_secs": 0}},
-            {"id": "sink", "kind": "inbox"}],
+            {"id": "sink", "component": "inbox"}],
         "edges": [{"from": "feed", "to": "left"}, {"from": "feed", "to": "right"},
             {"from": "feed", "to": "third"}, {"from": "left", "to": "worker"},
             {"from": "right", "to": "worker"}, {"from": "worker", "to": "sink"}],
@@ -1386,7 +1387,7 @@ async fn a_failed_join_is_released_when_its_node_gains_a_connection() {
 
     // The manager connects `third` to the join; nothing pending is retired.
     let path = fixture.directory.path().join("workflow.json");
-    let mut state = WorkflowState::new(
+    let mut state = WorkflowState::builtin(
         serde_json::from_value(document.clone()).unwrap(),
         ids.clone(),
     )
@@ -1396,13 +1397,11 @@ async fn a_failed_join_is_released_when_its_node_gains_a_connection() {
         .as_array_mut()
         .unwrap()
         .push(json!({"from": "third", "to": "worker"}));
-    let plan = crate::workflow::edit::preview(
-        &fixture.session,
-        &state,
-        serde_json::from_value(document).unwrap(),
-    )
-    .await
-    .unwrap();
+    let next: crate::workflow::Document = serde_json::from_value(document).unwrap();
+    let bindings = crate::workflow::Catalog::builtin().bind(&next).unwrap();
+    let plan = crate::workflow::edit::preview(&fixture.session, &state, next, bindings)
+        .await
+        .unwrap();
     assert!(plan.retirements.is_empty(), "{:?}", plan.retirements);
     crate::workflow::edit::commit(&fixture.session, &mut state, &path, plan)
         .await

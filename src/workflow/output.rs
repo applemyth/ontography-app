@@ -1,7 +1,7 @@
 //! Select task inputs and node results without confusing scheduling order with
 //! result order. Inbox items are paged by stable identity, never called latest.
 
-use super::{NodeKind, WorkflowPayload, edit::WorkflowState, runtime, tasks, tools};
+use super::{NodeType, WorkflowPayload, edit::WorkflowState, runtime, tasks, tools};
 use crate::{AppError, Result, persistence, state::ManagedRun, views};
 use ontography::{PackageId, PackageRecord};
 use serde_json::{Value, json};
@@ -89,12 +89,7 @@ pub async fn payload(
 
 async fn read(run: &ManagedRun, state: &WorkflowState, args: &Value) -> Result<Value> {
     let node = views::field(args, "node")?;
-    let definition = state
-        .current
-        .nodes
-        .iter()
-        .find(|candidate| candidate.id == node)
-        .ok_or_else(|| AppError::invalid("Unknown workflow node"))?;
+    let node_type = state.binding(node)?.node_type;
     let id = &state.identities.nodes[node];
     let source = tools::optional_str(args, "source")?.unwrap_or("auto");
     if !matches!(source, "auto" | "output" | "pending") {
@@ -112,7 +107,7 @@ async fn read(run: &ManagedRun, state: &WorkflowState, args: &Value) -> Result<V
             "Select a result, a task/item, or a pending page; do not combine those selectors",
         ));
     }
-    if source == "auto" && matches!(definition.kind, NodeKind::Human | NodeKind::Inbox) {
+    if source == "auto" && matches!(node_type, NodeType::Human | NodeType::Inbox) {
         // Without current core custody, a cached decision cannot be presented
         // as the input of a possibly newer review task.
         run.live()?;
@@ -161,15 +156,15 @@ async fn read(run: &ManagedRun, state: &WorkflowState, args: &Value) -> Result<V
         // A worker's pending initial input shows even while it fails; it is
         // not a package, so the pending page cannot list it.
         if !paging
-            && (definition.kind == NodeKind::Human || source == "pending")
+            && (node_type == NodeType::Human || source == "pending")
             && let Some(candidate) = tools::node_tasks(run, state, node)
                 .await?
                 .into_iter()
-                .find(|candidate| definition.kind == NodeKind::Human || candidate.task.is_initial())
+                .find(|candidate| node_type == NodeType::Human || candidate.task.is_initial())
         {
             return Ok(task_record(tools::task_view(run, candidate).await?));
         }
-        if definition.kind == NodeKind::Inbox || source == "pending" || paging {
+        if node_type == NodeType::Inbox || source == "pending" || paging {
             let page = pending(run, node, id, args).await?;
             if source == "pending"
                 || paging

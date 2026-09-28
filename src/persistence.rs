@@ -51,6 +51,11 @@ impl Paths {
         })
     }
 
+    /// The user's library of components and MCP servers.
+    pub fn library(&self) -> PathBuf {
+        self.root.join(crate::workflow::components::LIBRARY_FILE)
+    }
+
     pub fn run(&self, id: &str) -> Result<PathBuf> {
         uuid::Uuid::parse_str(id).map_err(|_| AppError::invalid("run_id must be a UUID"))?;
         Ok(self.root.join("runs").join(id))

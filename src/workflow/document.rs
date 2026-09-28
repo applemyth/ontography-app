@@ -1,6 +1,10 @@
 //! The manager's workflow language and its expansion into existing declarations.
 
-use super::{grammar, tasks::RetryPolicy};
+use super::{
+    components::Bindings,
+    grammar::{self, Typing},
+    tasks::RetryPolicy,
+};
 use crate::declarations::{
     ContractDeclaration, DECLARATION_VERSION, GraphDeclaration, IngressDeclaration,
     SchemaDeclaration, VALIDATOR_VERSION, ValidatorKind,
@@ -10,10 +14,10 @@ use crate::{AppError, Result};
 use ontography::{ContractViolation, PackageEnvelope, Payload, content::BlobFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const NODE_TYPE: &str = "WorkflowNode";
+/// The one node type every node of a run created before node types has.
+pub const SHARED_NODE_TYPE: &str = "WorkflowNode";
 pub const EDGE_TYPE: &str = "WorkflowConnection";
 pub const OBJECT_TYPE: &str = "WorkflowPayload";
 pub const CONTRACT: &str = "workflow_payload";
@@ -24,6 +28,10 @@ pub const AUTHORITY: &str = "workflow";
 pub struct Document {
     pub name: String,
     pub entry: String,
+    /// This document's own components: specifications that extend a built-in
+    /// or library component with default settings.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub components: BTreeMap<String, Value>,
     pub nodes: Vec<DocumentNode>,
     #[serde(default)]
     pub edges: Vec<DocumentEdge>,
@@ -33,11 +41,15 @@ pub struct Document {
 #[serde(deny_unknown_fields)]
 pub struct DocumentNode {
     pub id: String,
-    pub kind: NodeKind,
+    /// The component this node places: `agent`, `codex`, `claude`, `command`,
+    /// `human`, `inbox`, or one from the library or this document.
+    #[serde(alias = "kind")]
+    pub component: String,
+    /// This placement's settings, merged over its component's defaults.
     #[serde(default = "empty_config")]
     pub config: Value,
     #[serde(default)]
-    pub join: JoinMode,
+    pub join: IngressDeclaration,
     /// Retries for failed tasks; the defaults apply when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryPolicy>,
@@ -53,18 +65,6 @@ pub struct DocumentNode {
 impl DocumentNode {
     pub fn retry_policy(&self) -> RetryPolicy {
         self.retry.unwrap_or_default()
-    }
-
-    /// Agent and command nodes can handle tasks through a worker. Agent
-    /// sessions choose tasks through node tools; commands run them directly.
-    pub const fn runs_tasks(&self) -> bool {
-        matches!(self.kind, NodeKind::Agent | NodeKind::Command)
-    }
-
-    /// Names this exact definition; any change to the node changes it.
-    pub fn digest(&self) -> String {
-        let encoded = serde_json::to_vec(self).unwrap_or_default();
-        format!("{:x}", Sha256::digest(encoded))
     }
 }
 
@@ -92,45 +92,6 @@ impl Grant {
             Self::Originate => "originate",
             Self::SendLater => "send_later",
             Self::Retire => "retire",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeKind {
-    Agent,
-    Command,
-    Human,
-    Inbox,
-}
-
-impl NodeKind {
-    pub const fn implementation(self) -> &'static str {
-        match self {
-            Self::Agent => "workflow.agent",
-            Self::Command => "workflow.command",
-            Self::Human => "workflow.human",
-            Self::Inbox => "workflow.inbox",
-        }
-    }
-}
-
-#[derive(
-    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum JoinMode {
-    #[default]
-    Any,
-    All,
-}
-
-impl From<JoinMode> for IngressDeclaration {
-    fn from(value: JoinMode) -> Self {
-        match value {
-            JoinMode::Any => Self::Any,
-            JoinMode::All => Self::All,
         }
     }
 }
@@ -191,65 +152,12 @@ impl Document {
     }
 }
 
+/// Checks that need no component. Components check each node's settings
+/// when they bind it (`components::Catalog::bind`).
 fn validate_node(node: &DocumentNode) -> Result<()> {
     let error = |message: &str| invalid(format!("Node {:?}: {message}", node.id));
-    let config = node
-        .config
-        .as_object()
-        .ok_or_else(|| error("config must be an object"))?;
-    let allowed: &[&str] = match node.kind {
-        NodeKind::Agent => &["prompt", "harness", "argv", "model"],
-        NodeKind::Command => &["argv", "timeout_secs"],
-        NodeKind::Human => &["prompt"],
-        NodeKind::Inbox => &[],
-    };
-    for key in config.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(error(&format!("unsupported configuration field {key:?}")));
-        }
-    }
-    if node.kind == NodeKind::Agent && !config.get("prompt").is_some_and(Value::is_string) {
-        return Err(error("agent prompt must be a string"));
-    }
-    for key in ["prompt", "model"] {
-        if config.get(key).is_some_and(|value| !value.is_string()) {
-            return Err(error(&format!("{key} must be a string")));
-        }
-    }
-    if config
-        .get("harness")
-        .is_some_and(|value| value.as_str() != Some("codex"))
-    {
-        return Err(error(
-            "the supported agent harness is codex; use argv to override its interactive command",
-        ));
-    }
-    if node.kind == NodeKind::Command || config.contains_key("argv") {
-        let argv = config
-            .get("argv")
-            .and_then(Value::as_array)
-            .ok_or_else(|| error("argv must be a nonempty array of strings"))?;
-        if argv.is_empty()
-            || argv.iter().any(|value| !value.is_string())
-            || argv[0].as_str().is_none_or(|value| value.trim().is_empty())
-        {
-            return Err(error(
-                "argv must contain a command followed by string arguments",
-            ));
-        }
-    }
-    if config
-        .get("timeout_secs")
-        .is_some_and(|value| value.as_u64().is_none_or(|n| n == 0))
-    {
-        return Err(error("timeout_secs must be a positive integer"));
-    }
-    if !node.runs_tasks()
-        && (node.retry.is_some() || !node.grants.is_empty() || node.tools.is_some())
-    {
-        return Err(error(
-            "retry, grants, and tools apply only to agent and command nodes",
-        ));
+    if !node.config.is_object() {
+        return Err(error("config must be an object"));
     }
     if let Some(selected) = &node.tools {
         for name in selected {
@@ -327,8 +235,11 @@ impl IdentityMap {
     }
 }
 
+/// Expand a bound document into a new run's declaration. Each node's role is
+/// its core node type, and its binding is its execution binding.
 pub fn expand(
     document: &Document,
+    bindings: &Bindings,
     definition_id: &str,
     identities: &IdentityMap,
 ) -> Result<GraphDeclaration> {
@@ -337,10 +248,23 @@ pub fn expand(
     if definition_id.trim().is_empty() {
         return Err(invalid("Definition identity must not be empty"));
     }
+    if !bindings
+        .keys()
+        .eq(document.nodes.iter().map(|node| &node.id))
+    {
+        return Err(invalid("Every node needs exactly one component binding"));
+    }
+    let typing = Typing::Roles;
     let nodes = document
         .nodes
         .iter()
-        .map(|node| grammar::node(&identities.nodes[&node.id], node.join))
+        .map(|node| {
+            grammar::node(
+                &identities.nodes[&node.id],
+                typing.core_type(bindings[&node.id].node_type),
+                node.join,
+            )
+        })
         .collect();
     let edges = document
         .edges
@@ -350,25 +274,29 @@ pub fn expand(
                 &identities.edges[&edge_key(&edge.from, &edge.to)],
                 &identities.nodes[&edge.from],
                 &identities.nodes[&edge.to],
+                typing,
             )
         })
         .collect();
     let execution_bindings = document
         .nodes
         .iter()
-        .map(|node| ExecutionBinding {
-            id: identities.nodes[&node.id].clone(),
-            node_id: identities.nodes[&node.id].clone(),
-            implementation: node.kind.implementation().into(),
-            version: "1".into(),
-            configuration: node.config.clone(),
+        .map(|node| {
+            let implementation = &bindings[&node.id].implementation;
+            ExecutionBinding {
+                id: identities.nodes[&node.id].clone(),
+                node_id: identities.nodes[&node.id].clone(),
+                implementation: implementation.kind().into(),
+                version: "1".into(),
+                configuration: implementation.configuration(),
+            }
         })
         .collect();
     Ok(GraphDeclaration {
         version: DECLARATION_VERSION,
         id: definition_id.into(),
         schema: SchemaDeclaration {
-            node_types: vec![NODE_TYPE.into()],
+            node_types: typing.node_types().into_iter().map(Into::into).collect(),
             object_types: vec![OBJECT_TYPE.into()],
             authority_tags: vec![AUTHORITY.into()],
         },
@@ -382,9 +310,20 @@ pub fn expand(
         edges,
         roots: vec![grammar::root(&identities.nodes[&document.entry])],
         authority_transitions: vec![],
-        rewrites: grammar::universal(),
+        rewrites: grammar::productions(typing),
         execution_bindings,
     })
+}
+
+/// Expand a document that places only built-in components.
+#[cfg(test)]
+pub(crate) fn expand_builtin(
+    document: &Document,
+    definition_id: &str,
+    identities: &IdentityMap,
+) -> Result<GraphDeclaration> {
+    let bindings = super::Catalog::builtin().bind(document)?;
+    expand(document, &bindings, definition_id, identities)
 }
 
 /// The workspace alternative preserves core's explicit package envelope unchanged.
@@ -424,9 +363,14 @@ pub fn validate_payload(bytes: &[u8]) -> std::result::Result<(), ContractViolati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::{Catalog, NodeType, components::definition_digest};
 
     fn document() -> Document {
-        Document::parse(r#"{"name":"example","entry":"write","nodes":[{"id":"write","kind":"agent","config":{"prompt":"Write"}},{"id":"test","kind":"command","config":{"argv":["true"]}}],"edges":[{"from":"write","to":"test"}]}"#).unwrap()
+        Document::parse(r#"{"name":"example","entry":"write","nodes":[{"id":"write","component":"agent","config":{"prompt":"Write"}},{"id":"test","component":"command","config":{"argv":["true"]}}],"edges":[{"from":"write","to":"test"}]}"#).unwrap()
+    }
+
+    fn bind(document: &Document) -> Result<Bindings> {
+        Catalog::builtin().bind(document)
     }
 
     #[test]
@@ -437,12 +381,13 @@ mod tests {
         second.nodes.reverse();
         second.edges.reverse();
         assert_eq!(first, second.canonicalized().unwrap());
+        let bindings = bind(&first).unwrap();
         assert_eq!(
-            expand(&first, "example", &identities)
+            expand(&first, &bindings, "example", &identities)
                 .unwrap()
                 .fingerprint()
                 .unwrap(),
-            expand(&second, "example", &identities)
+            expand(&second, &bindings, "example", &identities)
                 .unwrap()
                 .fingerprint()
                 .unwrap()
@@ -450,39 +395,62 @@ mod tests {
     }
 
     #[test]
-    fn every_kind_has_the_same_core_semantics() {
+    fn each_node_role_is_its_core_node_type_and_its_binding_its_execution_binding() {
         let mut document = document();
         let identities = IdentityMap::fresh(&document);
-        let expected = expand(&document, "example", &identities)
-            .unwrap()
-            .compile()
-            .unwrap()
-            .kernel
-            .fingerprint()
-            .to_string();
-        for (kind, config) in [
-            (NodeKind::Agent, json!({"prompt":"Different"})),
-            (NodeKind::Command, json!({"argv":["false"]})),
-            (NodeKind::Human, json!({"prompt":"Approve?"})),
-            (NodeKind::Inbox, json!({})),
+        let mut fingerprints = BTreeSet::new();
+        for (component, config, node_type, implementation) in [
+            (
+                "agent",
+                json!({"prompt":"Different"}),
+                NodeType::Agent,
+                "codex",
+            ),
+            (
+                "claude",
+                json!({"prompt":"Different"}),
+                NodeType::Agent,
+                "claude",
+            ),
+            (
+                "command",
+                json!({"argv":["false"]}),
+                NodeType::Command,
+                "command",
+            ),
+            (
+                "human",
+                json!({"prompt":"Approve?"}),
+                NodeType::Human,
+                "human",
+            ),
+            ("inbox", json!({}), NodeType::Inbox, "inbox"),
         ] {
-            document.nodes[0].kind = kind;
-            document.nodes[0].config = config;
-            let declaration = expand(&document, "example", &identities).unwrap();
+            document.nodes[1].component = component.into();
+            document.nodes[1].config = config;
+            let declaration =
+                expand(&document, &bind(&document).unwrap(), "example", &identities).unwrap();
             assert_eq!(
-                declaration.execution_bindings[0].implementation,
-                kind.implementation()
+                declaration.schema.node_types,
+                ["Agent", "Command", "Human", "Inbox"]
             );
-            assert_eq!(
-                declaration
-                    .compile()
-                    .unwrap()
-                    .kernel
-                    .fingerprint()
-                    .to_string(),
-                expected
-            );
+            let node = declaration
+                .nodes
+                .iter()
+                .find(|node| node.id == identities.nodes["write"])
+                .unwrap();
+            assert_eq!(node.types, [node_type.as_str()]);
+            let binding = declaration
+                .execution_bindings
+                .iter()
+                .find(|binding| binding.node_id == identities.nodes["write"])
+                .unwrap();
+            assert_eq!(binding.implementation, implementation);
+            let compiled = declaration.compile().unwrap();
+            fingerprints.insert(compiled.kernel.fingerprint().to_string());
         }
+        // Core records the role: agents share one graph, other roles differ.
+        assert_eq!(fingerprints.len(), 4);
     }
 
     #[test]
@@ -496,10 +464,30 @@ mod tests {
         assert!(bad.canonicalized().is_err());
         bad = original.clone();
         bad.nodes[0].config["typo"] = json!(true);
-        assert!(bad.canonicalized().is_err());
-        assert!(expand(&original, "example", &IdentityMap::default()).is_err());
+        assert!(bind(&bad).is_err());
+        let bindings = bind(&original).unwrap();
+        assert!(expand(&original, &bindings, "example", &IdentityMap::default()).is_err());
+        assert!(
+            expand(
+                &original,
+                &Bindings::new(),
+                "example",
+                &IdentityMap::fresh(&original)
+            )
+            .is_err()
+        );
         assert!(Document::parse(r#"{"name":"a","name":"b","entry":"n","nodes":[]}"#).is_err());
         assert_ne!(edge_key("a:b", "c"), edge_key("a", "b:c"));
+    }
+
+    #[test]
+    fn documents_saved_with_kind_still_parse() {
+        let old = Document::parse(r#"{"name":"example","entry":"write","nodes":[{"id":"write","kind":"agent","config":{"prompt":"Write"}}]}"#).unwrap();
+        assert_eq!(old.nodes[0].component, "agent");
+        let saved = serde_json::to_value(&old).unwrap();
+        assert_eq!(saved["nodes"][0]["component"], "agent");
+        assert!(saved["nodes"][0].get("kind").is_none());
+        assert!(Document::parse(r#"{"name":"example","entry":"write","nodes":[{"id":"write","kind":"inbox","component":"inbox"}]}"#).is_err());
     }
 
     #[test]
@@ -510,7 +498,7 @@ mod tests {
         assert!(serialized["nodes"][0].get("grants").is_none());
         assert_eq!(original.nodes[0].retry_policy(), RetryPolicy::default());
 
-        let configured = Document::parse(r#"{"name":"example","entry":"write","nodes":[{"id":"write","kind":"agent","config":{"prompt":"Write"},"retry":{"max_attempts":5},"grants":["send_later","originate"]}]}"#).unwrap();
+        let configured = Document::parse(r#"{"name":"example","entry":"write","nodes":[{"id":"write","component":"agent","config":{"prompt":"Write"},"retry":{"max_attempts":5},"grants":["send_later","originate"]}]}"#).unwrap();
         let node = &configured.nodes[0];
         assert_eq!(node.retry_policy().max_attempts, 5);
         assert_eq!(
@@ -523,15 +511,24 @@ mod tests {
         );
 
         for invalid in [
-            r#"{"id":"write","kind":"agent","config":{"prompt":"Write"},"retry":{"max_attempts":0}}"#,
-            r#"{"id":"write","kind":"agent","config":{"prompt":"Write"},"retry":{"typo":1}}"#,
-            r#"{"id":"write","kind":"agent","config":{"prompt":"Write"},"grants":["everything"]}"#,
-            r#"{"id":"write","kind":"human","retry":{"max_attempts":2}}"#,
-            r#"{"id":"write","kind":"inbox","grants":["retire"]}"#,
+            r#"{"id":"write","component":"agent","config":{"prompt":"Write"},"retry":{"max_attempts":0}}"#,
+            r#"{"id":"write","component":"agent","config":{"prompt":"Write"},"retry":{"typo":1}}"#,
+            r#"{"id":"write","component":"agent","config":{"prompt":"Write"},"grants":["everything"]}"#,
         ] {
             let text = format!(r#"{{"name":"example","entry":"write","nodes":[{invalid}]}}"#);
             assert!(
                 Document::parse(&text).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+        // Whether a node takes tasks depends on its component's node type.
+        for invalid in [
+            r#"{"id":"write","component":"human","retry":{"max_attempts":2}}"#,
+            r#"{"id":"write","component":"inbox","grants":["retire"]}"#,
+        ] {
+            let text = format!(r#"{{"name":"example","entry":"write","nodes":[{invalid}]}}"#);
+            assert!(
+                bind(&Document::parse(&text).unwrap()).is_err(),
                 "{invalid} must be rejected"
             );
         }
@@ -540,33 +537,22 @@ mod tests {
     #[test]
     fn persistent_agent_configuration_has_no_task_timeout() {
         let mut configured = document();
-        let agent = configured
-            .nodes
-            .iter_mut()
-            .find(|node| node.kind == NodeKind::Agent)
-            .unwrap();
-        agent.config["timeout_secs"] = json!(30);
+        configured.nodes[1].config["timeout_secs"] = json!(30);
         assert!(
-            configured
-                .canonicalized()
+            bind(&configured)
                 .unwrap_err()
                 .message
                 .contains("timeout_secs")
         );
 
         let mut configured = document();
-        let command = configured
-            .nodes
-            .iter_mut()
-            .find(|node| node.kind == NodeKind::Command)
-            .unwrap();
-        command.config["timeout_secs"] = json!(30);
-        assert!(configured.canonicalized().is_ok());
+        configured.nodes[0].config["timeout_secs"] = json!(30);
+        assert!(bind(&configured).is_ok());
     }
 
     #[test]
     fn tool_selection_is_validated_and_preserves_omitted_and_empty_semantics() {
-        let text = r#"{"name":"tools","entry":"worker","nodes":[{"id":"worker","kind":"agent","config":{"prompt":"Observe"},"tools":["inspect_node","inspect_graph"]}]}"#;
+        let text = r#"{"name":"tools","entry":"worker","nodes":[{"id":"worker","component":"agent","config":{"prompt":"Observe"},"tools":["inspect_node","inspect_graph"]}]}"#;
         let configured = Document::parse(text).unwrap();
         let mut reversed: Value = serde_json::from_str(text).unwrap();
         reversed["nodes"][0]["tools"] = json!(["inspect_graph", "inspect_node"]);
@@ -575,7 +561,11 @@ mod tests {
         default.nodes[0].tools = None;
         let mut empty = default.clone();
         empty.nodes[0].tools = Some(BTreeSet::new());
-        assert_ne!(default.nodes[0].digest(), empty.nodes[0].digest());
+        let binding = &bind(&default).unwrap()["worker"];
+        assert_ne!(
+            definition_digest(&default.nodes[0], binding),
+            definition_digest(&empty.nodes[0], binding)
+        );
         assert!(
             serde_json::to_value(default).unwrap()["nodes"][0]
                 .get("tools")
@@ -592,8 +582,8 @@ mod tests {
                 .message
                 .contains("invented_tool")
         );
-        reversed["nodes"][0] = json!({"id":"worker","kind":"inbox","tools":[]});
-        assert!(Document::parse(&reversed.to_string()).is_err());
+        reversed["nodes"][0] = json!({"id":"worker","component":"inbox","tools":[]});
+        assert!(bind(&Document::parse(&reversed.to_string()).unwrap()).is_err());
     }
 
     #[test]

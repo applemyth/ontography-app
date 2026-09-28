@@ -10,8 +10,8 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 fn document() -> Value {
     json!({"name":"persistent", "entry":"worker", "nodes":[
-        {"id":"worker", "kind":"agent", "config":{"prompt":"Work together", "argv":["/bin/cat"]}},
-        {"id":"archive", "kind":"inbox"}
+        {"id":"worker", "component":"agent", "config":{"prompt":"Work together", "argv":["/bin/cat"]}},
+        {"id":"archive", "component":"inbox"}
     ], "edges":[{"from":"worker", "to":"archive"}]})
 }
 
@@ -187,7 +187,7 @@ async fn graph_and_grant_edits_refresh_tools_without_restarting_the_session() {
     changed["nodes"]
         .as_array_mut()
         .unwrap()
-        .push(json!({"id":"new-recipient", "kind":"inbox"}));
+        .push(json!({"id":"new-recipient", "component":"inbox"}));
     changed["edges"]
         .as_array_mut()
         .unwrap()
@@ -250,12 +250,13 @@ async fn config_restarts_and_removal_stop_the_old_process_before_replacement() {
     let (identity, original, ledger) = resources(&service, &run_id).await;
     let original_terminal = original.terminal().unwrap();
     let mut changed = status["document"].clone();
+    // The program is all a session with argv runs, so only argv restarts it.
     changed["nodes"]
         .as_array_mut()
         .unwrap()
         .iter_mut()
         .find(|node| node["id"] == "worker")
-        .unwrap()["config"]["prompt"] = json!("Updated instructions");
+        .unwrap()["config"]["argv"] = json!(["/bin/cat", "-u"]);
     edit(&service, &run_id, changed.clone()).await;
     running(&service, &run_id).await;
     let (current_identity, current, current_ledger) = resources(&service, &run_id).await;
@@ -264,33 +265,39 @@ async fn config_restarts_and_removal_stop_the_old_process_before_replacement() {
     assert!(!original_terminal.status().running);
     assert_ne!(original_terminal.id(), current_terminal.id());
     assert!(Arc::ptr_eq(&ledger, &current_ledger));
-    // Change the kind while retaining identity, then remove that node.
+    // A different node type is a different core node: the edit replaces it.
     let replacement = changed["nodes"]
         .as_array_mut()
         .unwrap()
         .iter_mut()
         .find(|node| node["id"] == "worker")
         .unwrap();
-    replacement["kind"] = json!("human");
+    replacement["component"] = json!("human");
     replacement["config"] = json!({"prompt":"Manual work"});
     edit(&service, &run_id, changed.clone()).await;
     assert!(!current_terminal.status().running);
     let run = service.run(&run_id).await.unwrap();
-    {
+    let human = {
         let run = run.lock().await;
-        assert!(run.live().unwrap().workers[&identity].node.is_none());
-    }
+        let human = runtime::load(&run).unwrap().identities.nodes["worker"].clone();
+        assert_ne!(human, identity);
+        let workers = &run.live().unwrap().workers;
+        assert!(!workers.contains_key(&identity));
+        assert!(workers[&human].node.is_none());
+        human
+    };
     let replacement = changed["nodes"]
         .as_array_mut()
         .unwrap()
         .iter_mut()
         .find(|node| node["id"] == "worker")
         .unwrap();
-    replacement["kind"] = json!("agent");
+    replacement["component"] = json!("agent");
     replacement["config"] = json!({"prompt":"Restored session", "argv":["/bin/cat"]});
     edit(&service, &run_id, changed.clone()).await;
     running(&service, &run_id).await;
-    let (_, restored, _) = resources(&service, &run_id).await;
+    let (restored_identity, restored, _) = resources(&service, &run_id).await;
+    assert_ne!(restored_identity, human);
     let restored_terminal = restored.terminal().unwrap();
     changed["nodes"]
         .as_array_mut()
@@ -305,7 +312,7 @@ async fn config_restarts_and_removal_stop_the_old_process_before_replacement() {
             .live()
             .unwrap()
             .workers
-            .contains_key(&identity)
+            .contains_key(&restored_identity)
     );
     service.shutdown().await.unwrap();
 }

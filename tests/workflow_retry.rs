@@ -8,9 +8,9 @@ const WORKER: &str = r#"read x; case "$x" in *bad*) [ -e fixed ] || { printf 're
 /// A human feeder that sends each decision on to the worker and back to itself.
 fn document(retry: Value) -> Value {
     json!({"name":"retries","entry":"feed","nodes":[
-        {"id":"feed","kind":"human"},
-        {"id":"work","kind":"command","config":{"argv":["/bin/sh","-c",WORKER]},"retry":retry},
-        {"id":"done","kind":"inbox"}
+        {"id":"feed","component":"human"},
+        {"id":"work","component":"command","config":{"argv":["/bin/sh","-c",WORKER]},"retry":retry},
+        {"id":"done","component":"inbox"}
     ],"edges":[{"from":"feed","to":"feed"},{"from":"feed","to":"work"},{"from":"work","to":"done"}]})
 }
 
@@ -338,7 +338,7 @@ async fn discard_retires_a_parked_input_or_completes_the_initial_one() {
 
     // The run's initial input is not a package; discarding it completes it.
     let entry = json!({"name":"entry","entry":"work","nodes":[
-        {"id":"work","kind":"command","config":{"argv":["/bin/sh","-c",WORKER]},"retry":{"max_attempts":1}}
+        {"id":"work","component":"command","config":{"argv":["/bin/sh","-c",WORKER]},"retry":{"max_attempts":1}}
     ]});
     let run_id = call(
         &service,

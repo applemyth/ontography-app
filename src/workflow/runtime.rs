@@ -1,7 +1,7 @@
 //! Run ownership and worker reconciliation for document workflows.
 
 use super::{
-    DocumentNode, NodeKind, WorkflowPayload,
+    BoundNode, WorkflowPayload,
     edit::{self, WorkflowState},
     harness,
     tasks::RetryLedger,
@@ -31,10 +31,11 @@ pub struct InitialWorkflow {
 
 pub struct Worker {
     pub execution_id: String,
-    pub settings: watch::Sender<DocumentNode>,
+    pub settings: watch::Sender<BoundNode>,
     /// Refreshed after every graph edit, including edits to other nodes.
     pub scope: watch::Sender<NodeScope>,
-    /// A continuing session for agent nodes. Other kinds use the task harness.
+    /// A continuing session for session implementations (agents and
+    /// programs). Other implementations use the task harness.
     pub node: Option<Arc<NodeRuntime>>,
     /// Shared with the harness and flow tools. A relaunched worker keeps its
     /// predecessor's instance, so a node never has two writers.
@@ -60,8 +61,9 @@ pub fn load(run: &ManagedRun) -> Result<WorkflowState> {
     if path.exists() {
         edit::load(&path)
     } else {
-        edit::store(&path, &initial.state)?;
-        Ok(initial.state.clone())
+        let state = initial.state.clone().with_bindings()?;
+        edit::store(&path, &state)?;
+        Ok(state)
     }
 }
 
@@ -159,6 +161,17 @@ pub async fn initial_payload(run: &ManagedRun) -> Result<ontography::Payload> {
     Ok(bytes)
 }
 
+/// A session runs one exact implementation, so any change to its binding needs
+/// a new process. The task harness reads its settings as it goes and needs a
+/// new worker only for a different implementation.
+fn needs_new_worker(current: &BoundNode, next: &BoundNode) -> bool {
+    let (current, next) = (
+        &current.binding.implementation,
+        &next.binding.implementation,
+    );
+    current.kind() != next.kind() || (next.is_session() && current != next)
+}
+
 pub async fn reconcile(
     run: &mut ManagedRun,
     state: &WorkflowState,
@@ -171,27 +184,30 @@ pub async fn reconcile(
         ));
     }
     let kernel = run.live()?.session.kernel().await.map_err(AppError::core)?;
-    let desired: BTreeMap<_, _> = state
+    let desired = state
         .current
         .nodes
         .iter()
-        .map(|node| (&state.identities.nodes[&node.id], node))
-        .collect();
+        .map(|node| {
+            Ok((
+                &state.identities.nodes[&node.id],
+                state.bound_node(&node.id)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let removed: Vec<_> = run
         .live()?
         .workers
         .iter()
         .filter(|(id, worker)| {
-            let current = worker.settings.borrow();
             kernel.graph().node(id.as_str()).is_none()
-                || desired.get(*id).is_none_or(|node| {
-                    node.kind != current.kind
-                        || (node.kind == NodeKind::Agent && node.config != current.config)
-                })
+                || desired
+                    .get(*id)
+                    .is_none_or(|next| needs_new_worker(&worker.settings.borrow(), next))
         })
         .map(|(id, _)| id.clone())
         .collect();
-    // A replacement continues its node's retry ledger. Agent launch settings
+    // A replacement continues its node's retry ledger. Session launch settings
     // require a new process; graph grants and task policy update in place.
     // Each ledger is renewed below with its node's definition, so a changed
     // node gets fresh attempts even if this reconcile stops early.
@@ -222,15 +238,14 @@ pub async fn reconcile(
         .clone();
     let original_entry = &initial.state.identities.nodes[&initial.state.current.entry];
     let workflow = Arc::new(state.clone());
-    for node in &state.current.nodes {
-        let id = &state.identities.nodes[&node.id];
+    for (id, node) in desired {
         let definition = node.digest();
-        let scope = NodeScope::new(workflow.clone(), &node.id)?;
+        let scope = NodeScope::new(workflow.clone(), &node.node.id)?;
         let mut ledger = ledgers.remove(id);
         let existing = run.live()?.workers.get(id).map(|worker| {
             (
                 worker.execution_id.clone(),
-                *worker.settings.borrow() != *node,
+                *worker.settings.borrow() != node,
             )
         });
         if let Some((execution_id, changed)) = existing {
@@ -244,7 +259,7 @@ pub async fn reconcile(
             if active || !(changed || retry_failed) {
                 let worker = &live.workers[id];
                 if changed {
-                    worker.settings.send_replace(node.clone());
+                    worker.settings.send_replace(node);
                 }
                 // Node tools resolve names and grants from the whole graph.
                 // An edge or another node can change without changing this
@@ -274,7 +289,7 @@ pub async fn reconcile(
         std::fs::create_dir_all(&directory)?;
         let project = run.manifest.project.clone();
         let session = run.live()?.session.clone();
-        let node_runtime = (node.kind == NodeKind::Agent).then(|| {
+        let node_runtime = node.binding.implementation.is_session().then(|| {
             NodeRuntime::new(
                 project.clone(),
                 directory.clone(),

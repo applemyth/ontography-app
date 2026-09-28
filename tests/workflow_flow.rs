@@ -6,9 +6,9 @@ fn document() -> Value {
     json!({
         "name":"reviewable", "entry":"draft",
         "nodes":[
-            {"id":"draft","kind":"command","config":{"argv":["/bin/echo","draft"]}},
-            {"id":"review","kind":"human","config":{"prompt":"Check the draft"}},
-            {"id":"archive","kind":"inbox"}
+            {"id":"draft","component":"command","config":{"argv":["/bin/echo","draft"]}},
+            {"id":"review","component":"human","config":{"prompt":"Check the draft"}},
+            {"id":"archive","component":"inbox"}
         ],
         "edges":[{"from":"draft","to":"review"},{"from":"review","to":"archive"}]
     })
@@ -149,7 +149,7 @@ async fn prompt_edits_preserve_graph_and_added_nodes_launch_with_idempotent_comm
     with_node["nodes"]
         .as_array_mut()
         .unwrap()
-        .push(json!({"id":"extra","kind":"inbox"}));
+        .push(json!({"id":"extra","component":"inbox"}));
     let preview = call(
         &service,
         "flow.edit",

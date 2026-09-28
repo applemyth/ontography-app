@@ -8,7 +8,7 @@ use super::outputs::{Source, resolve};
 use super::{NodeToolContext, Reply, Tool};
 use crate::workflow::document::OBJECT_TYPE;
 use crate::workflow::tasks::{Standing, Task, TaskKey};
-use crate::workflow::{DocumentNode, Grant, WorkflowPayload};
+use crate::workflow::{BoundNode, Grant, WorkflowPayload};
 use crate::{AppError, Result, persistence, views};
 use ontography::{
     Authority, ContentId, ContextError, ContextMode, ContextPolicy, Emission, InitialContext,
@@ -52,7 +52,7 @@ pub(super) async fn begin_attempt(
     let _exclusive = context.exclusive().await?;
     // The attempt counts against the definition it begins under, even
     // one the host has not renewed the node's retry ledger with yet.
-    let node = context.scope().node;
+    let node = context.scope().bound_node();
     context.ledger.renew(&node.digest())?;
     let (trigger, contents, task) = match (begin.task_id, begin.originate) {
         (Some(key), None) => {
@@ -157,7 +157,7 @@ pub(super) async fn begin_attempt(
 /// unless an input was taken meanwhile and the task no longer exists.
 async fn refused(
     context: &NodeToolContext,
-    node: &DocumentNode,
+    node: &BoundNode,
     task: Option<&Task>,
     error: ContextError,
 ) -> Result<AppError> {
@@ -177,7 +177,7 @@ async fn refused(
             task,
             &error.message,
             false,
-            &node.retry_policy(),
+            &node.node.retry_policy(),
             &node.digest(),
         ) {
             Ok(retry) => error.details(json!({"retry": retry})),

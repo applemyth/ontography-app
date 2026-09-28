@@ -707,7 +707,7 @@ async fn killed_server_stops_worker_and_resumes_its_durable_invocation_input() {
     let fixture = Fixture::new();
     let client = fixture.start().await;
     let document = json!({"name":"worker-crash","entry":"worker","nodes":[{
-        "id":"worker","kind":"command","config":{"argv":["/bin/sh","-c",
+        "id":"worker","component":"command","config":{"argv":["/bin/sh","-c",
             "printf '%s' \"$$\" > started; while [ ! -f proceed ]; do sleep 0.05; done; printf finished"]}
     }]});
     let started = client

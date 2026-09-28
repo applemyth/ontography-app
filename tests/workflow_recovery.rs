@@ -7,8 +7,8 @@ use std::time::Duration;
 
 fn human_document() -> Value {
     json!({"name":"initial-review","entry":"gate","nodes":[
-        {"id":"gate","kind":"human","config":{"prompt":"Approve the initial input"}},
-        {"id":"archive","kind":"inbox"}
+        {"id":"gate","component":"human","config":{"prompt":"Approve the initial input"}},
+        {"id":"archive","component":"inbox"}
     ],"edges":[{"from":"gate","to":"archive"}]})
 }
 
@@ -64,7 +64,7 @@ async fn changing_completed_human_entry_to_command_does_not_replay_initial_input
         .iter_mut()
         .find(|node| node["id"] == "gate")
         .unwrap();
-    gate["kind"] = json!("command");
+    gate["component"] = json!("command");
     gate["config"] = json!({"argv":["/bin/echo","must not repeat initial task"]});
     let plan = call(
         &service,

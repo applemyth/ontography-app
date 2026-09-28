@@ -205,10 +205,7 @@ impl Managers {
 }
 
 async fn node_terminal(service: &Service, session: &str, args: &Value) -> Result<Value> {
-    use crate::{
-        sessions::SessionStatus,
-        workflow::{NodeKind, runtime},
-    };
+    use crate::{sessions::SessionStatus, workflow::runtime};
     let handle = service.sessions.get(session).await?;
     let record = handle.lock().await;
     if record.status != SessionStatus::Active {
@@ -225,21 +222,16 @@ async fn node_terminal(service: &Service, session: &str, args: &Value) -> Result
     let run = handle.lock().await;
     let state = runtime::load(&run)?;
     let name = crate::views::field(args, "node")?;
-    let node = state
-        .current
-        .nodes
-        .iter()
-        .find(|node| node.id == name)
-        .ok_or_else(|| {
-            AppError::new(
-                "node_not_found",
-                format!("Node {name:?} is no longer in this workflow"),
-            )
-        })?;
-    if node.kind != NodeKind::Agent {
+    let binding = state.binding(name).map_err(|_| {
+        AppError::new(
+            "node_not_found",
+            format!("Node {name:?} is no longer in this workflow"),
+        )
+    })?;
+    if !binding.implementation.has_terminal() {
         return Err(AppError::new(
             "node_no_terminal",
-            format!("Node {name:?} has no interactive terminal; only agent nodes do"),
+            format!("Node {name:?} has no interactive terminal"),
         ));
     }
     let terminal = run.live.as_ref()

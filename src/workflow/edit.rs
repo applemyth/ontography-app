@@ -4,8 +4,11 @@
 //! between steps: this is a recoverable live edit, not one atomic graph change.
 //! The graph itself records progress; a saved target fixes all fresh identities.
 
-use super::document::{Document, IdentityMap, JoinMode, edge_key};
-use super::grammar::{self, Variant};
+use super::NodeType;
+use super::components::{Binding, Bindings, BoundNode, Catalog};
+use super::document::{Document, IdentityMap, SHARED_NODE_TYPE, edge_key};
+use super::grammar::{self, Typing, Variant};
+use crate::declarations::IngressDeclaration;
 use crate::{AppError, Result, persistence};
 use ontography::{
     IngressMode, Kernel, RetirementReason, RewriteError, RewriteGrammar, RewriteMatch,
@@ -21,17 +24,65 @@ const MAX_STALE_RETRIES: usize = 8;
 pub struct WorkflowState {
     pub version: u64,
     pub current: Document,
+    /// What each node of `current` is bound to.
+    #[serde(default)]
+    pub bindings: Bindings,
     pub identities: IdentityMap,
     pub pending: Option<Plan>,
 }
 
 impl WorkflowState {
-    pub fn new(current: Document, identities: IdentityMap) -> Result<Self> {
+    pub fn new(current: Document, bindings: Bindings, identities: IdentityMap) -> Result<Self> {
         Ok(Self {
             version: 1,
             current: current.canonicalized()?,
+            bindings,
             identities,
             pending: None,
+        })
+    }
+
+    /// State saved before components had no bindings. Its documents could
+    /// only place built-in components, which bind the same way today.
+    pub fn with_bindings(mut self) -> Result<Self> {
+        if self.bindings.is_empty() {
+            self.bindings = Catalog::builtin().bind(&self.current)?;
+        }
+        if let Some(plan) = self
+            .pending
+            .as_mut()
+            .filter(|plan| plan.bindings.is_empty())
+        {
+            plan.bindings = Catalog::builtin().bind(&plan.document)?;
+        }
+        Ok(self)
+    }
+
+    /// A new run's state for a document that places only built-in components.
+    #[cfg(test)]
+    pub(crate) fn builtin(current: Document, identities: IdentityMap) -> Result<Self> {
+        let bindings = Catalog::builtin().bind(&current)?;
+        Self::new(current, bindings, identities)
+    }
+
+    /// The binding of the node named `name` in the current document.
+    pub fn binding(&self, name: &str) -> Result<&Binding> {
+        self.bindings
+            .get(name)
+            .ok_or_else(|| AppError::invalid(format!("Unknown workflow node {name:?}")))
+    }
+
+    /// The node named `name` with its binding.
+    pub fn bound_node(&self, name: &str) -> Result<BoundNode> {
+        let node = self
+            .current
+            .nodes
+            .iter()
+            .find(|node| node.id == name)
+            .ok_or_else(|| AppError::invalid(format!("Unknown workflow node {name:?}")))?;
+        Ok(BoundNode {
+            node: node.clone(),
+            binding: self.binding(name)?.clone(),
         })
     }
 
@@ -73,6 +124,10 @@ pub struct Plan {
     pub base_version: u64,
     pub base_core_revision: u64,
     pub document: Document,
+    /// Bindings made when the plan was previewed; a later library change
+    /// cannot alter an accepted edit.
+    #[serde(default)]
+    pub bindings: Bindings,
     pub identities: IdentityMap,
     pub retirements: BTreeMap<String, String>,
     pub steps: usize,
@@ -86,7 +141,7 @@ pub struct EditOutcome {
 }
 
 pub fn load(path: &Path) -> Result<WorkflowState> {
-    persistence::read_json(path)
+    persistence::read_json::<WorkflowState>(path)?.with_bindings()
 }
 
 pub fn store(path: &Path, state: &WorkflowState) -> Result<()> {
@@ -103,25 +158,31 @@ pub fn store(path: &Path, state: &WorkflowState) -> Result<()> {
 }
 
 /// Simulate the remaining changes using the same kernel rules and exact bytes.
-/// A stopped edit can be re-previewed only with its original target and IDs.
+/// A stopped edit can be re-previewed only with its original target, IDs, and
+/// bindings.
 pub async fn preview(
     session: &SessionHandle,
     state: &WorkflowState,
     next: Document,
+    bindings: Bindings,
 ) -> Result<Plan> {
     let document = next.canonicalized()?;
-    let identities = if let Some(pending) = &state.pending {
-        if pending.document != document {
-            return Err(pending_edit());
-        }
-        pending.identities.clone()
-    } else {
-        target_identities(state, &document)
-    };
     let snapshot = session.try_snapshot().await.map_err(AppError::core)?;
     let mut kernel = snapshot.kernel().clone();
     let mut facts = snapshot.state().clone();
-    if state.pending.is_none() && next_step(&kernel, &state.current, &state.identities)?.is_some() {
+    let typing = Typing::of(&kernel);
+    let (bindings, identities) = if let Some(pending) = &state.pending {
+        if pending.document != document {
+            return Err(pending_edit());
+        }
+        (pending.bindings.clone(), pending.identities.clone())
+    } else {
+        let identities = target_identities(state, &document, &bindings, typing);
+        (bindings, identities)
+    };
+    if state.pending.is_none()
+        && next_step(&kernel, &state.current, &state.bindings, &state.identities)?.is_some()
+    {
         return Err(AppError::new(
             "workflow_drift",
             "Core's graph differs from the saved workflow",
@@ -129,7 +190,7 @@ pub async fn preview(
     }
     let contracts = kernel.contracts().to_vec();
     let grammar = RewriteGrammar::new(
-        grammar::universal()
+        grammar::productions(typing)
             .iter()
             .map(|rule| rule.compile(kernel.id(), kernel.schema(), &contracts))
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -139,7 +200,7 @@ pub async fn preview(
     let mut evidence = BTreeMap::new();
     let mut retirements = BTreeMap::new();
     let mut steps = 0;
-    while let Some(request) = next_step(&kernel, &document, &identities)? {
+    while let Some(request) = next_step(&kernel, &document, &bindings, &identities)? {
         let prepared = loop {
             match kernel.prepare_rewrite(&facts, &grammar, &request, &evidence) {
                 Ok(prepared) => break prepared,
@@ -171,6 +232,7 @@ pub async fn preview(
         base_version: state.version,
         base_core_revision: snapshot.revision(),
         document,
+        bindings,
         identities,
         retirements,
         steps,
@@ -185,7 +247,9 @@ pub async fn commit(
     plan: Plan,
 ) -> Result<EditOutcome> {
     if let Some(pending) = &state.pending
-        && (pending.document != plan.document || pending.identities != plan.identities)
+        && (pending.document != plan.document
+            || pending.bindings != plan.bindings
+            || pending.identities != plan.identities)
     {
         return Err(pending_edit());
     }
@@ -201,6 +265,7 @@ pub async fn commit(
     if state.pending.is_none()
         && plan.base_version.checked_add(1) == Some(state.version)
         && state.current == plan.document
+        && state.bindings == plan.bindings
         && state.identities == plan.identities
     {
         // The final metadata publication can succeed before its response is
@@ -219,7 +284,7 @@ pub async fn commit(
         // Worker progress cannot stale a settings edit. Its graph must still
         // match, so skipping the work revision never authorizes graph repair.
         let kernel = session.kernel().await.map_err(AppError::core)?;
-        if next_step(&kernel, &plan.document, &plan.identities)?.is_some() {
+        if next_step(&kernel, &plan.document, &plan.bindings, &plan.identities)?.is_some() {
             return Err(AppError::new(
                 "workflow_drift",
                 "Core's graph changed after this settings preview",
@@ -253,7 +318,8 @@ pub async fn recover(
     let mut stale_retries = 0;
     loop {
         let kernel = session.kernel().await.map_err(AppError::core)?;
-        let Some(request) = next_step(&kernel, &plan.document, &plan.identities)? else {
+        let Some(request) = next_step(&kernel, &plan.document, &plan.bindings, &plan.identities)?
+        else {
             let completed = completed_state(state)?;
             store(path, &completed)?;
             *state = completed;
@@ -317,6 +383,7 @@ fn completed_state(state: &WorkflowState) -> Result<WorkflowState> {
             .checked_add(1)
             .ok_or_else(|| AppError::new("version_exhausted", "Workflow version is exhausted"))?,
         current: plan.document.clone(),
+        bindings: plan.bindings.clone(),
         identities: plan.identities.clone(),
         pending: None,
     })
@@ -346,13 +413,26 @@ fn retirement_report(
         .collect()
 }
 
-fn target_identities(state: &WorkflowState, document: &Document) -> IdentityMap {
+/// Keep a node's core identity unless core must replace it: its join, entry
+/// status, or core node type changed.
+fn target_identities(
+    state: &WorkflowState,
+    document: &Document,
+    bindings: &Bindings,
+    typing: Typing,
+) -> IdentityMap {
+    let role = |bindings: &Bindings, name: &str| {
+        bindings
+            .get(name)
+            .map(|binding| typing.role(binding.node_type))
+    };
     let mut identities = IdentityMap::fresh(document);
     for node in &document.nodes {
         if state.current.nodes.iter().any(|old| {
             old.id == node.id
                 && old.join == node.join
                 && (old.id == state.current.entry) == (node.id == document.entry)
+                && role(&state.bindings, &old.id) == role(bindings, &node.id)
         }) && let Some(id) = state.identities.nodes.get(&node.id)
         {
             identities.nodes.insert(node.id.clone(), id.clone());
@@ -370,14 +450,30 @@ fn target_identities(state: &WorkflowState, document: &Document) -> IdentityMap 
     identities
 }
 
+/// A node's variant as core records it, including its core node type.
 fn variant(kernel: &Kernel, node_id: &str) -> Result<Variant> {
+    let drift = |message: String| AppError::new("workflow_drift", message);
     let node = kernel
         .node_definition(node_id)
-        .ok_or_else(|| AppError::new("workflow_drift", format!("Missing node {node_id}")))?;
+        .ok_or_else(|| drift(format!("Missing node {node_id}")))?;
+    let role = match node
+        .types()
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<&str>>()[..]
+    {
+        [SHARED_NODE_TYPE] => None,
+        [name] => Some(
+            NodeType::from_core(name)
+                .ok_or_else(|| drift(format!("Node {node_id} has unknown type {name:?}")))?,
+        ),
+        _ => return Err(drift(format!("Node {node_id} must have exactly one type"))),
+    };
     Ok(Variant {
+        role,
         join: match node.ingress_mode() {
-            IngressMode::Any => JoinMode::Any,
-            IngressMode::All => JoinMode::All,
+            IngressMode::Any => IngressDeclaration::Any,
+            IngressMode::All => IngressDeclaration::All,
         },
         root: kernel.root_ceiling(node_id).is_some(),
     })
@@ -388,14 +484,20 @@ fn variant(kernel: &Kernel, node_id: &str) -> Result<Variant> {
 fn next_step(
     kernel: &Kernel,
     document: &Document,
+    bindings: &Bindings,
     ids: &IdentityMap,
 ) -> Result<Option<RewriteRequest>> {
+    let typing = Typing::of(kernel);
     for node in &document.nodes {
         let id = ids
             .nodes
             .get(&node.id)
             .ok_or_else(|| AppError::invalid("Incomplete workflow node identities"))?;
+        let binding = bindings
+            .get(&node.id)
+            .ok_or_else(|| AppError::invalid("Incomplete workflow node bindings"))?;
         let wanted = Variant {
+            role: typing.role(binding.node_type),
             join: node.join,
             root: node.id == document.entry,
         };
@@ -405,7 +507,7 @@ fn next_step(
                 RewriteMatch::new(
                     BTreeMap::new(),
                     BTreeMap::new(),
-                    bindings(&[("n", id)]),
+                    symbols(&[("n", id)]),
                     BTreeMap::new(),
                 ),
             )));
@@ -451,7 +553,7 @@ fn next_step(
             return Ok(Some(RewriteRequest::new(
                 grammar::node_rule(false, variant(kernel, node.id())?),
                 RewriteMatch::new(
-                    bindings(&[("n", node.id())]),
+                    symbols(&[("n", node.id())]),
                     BTreeMap::new(),
                     BTreeMap::new(),
                     BTreeMap::new(),
@@ -479,18 +581,18 @@ fn edge_request(
         ),
         RewriteMatch::new(
             if is_loop {
-                bindings(&[("n", source)])
+                symbols(&[("n", source)])
             } else {
-                bindings(&[("a", source), ("b", target)])
+                symbols(&[("a", source), ("b", target)])
             },
             if add {
                 BTreeMap::new()
             } else {
-                bindings(&[("e", id)])
+                symbols(&[("e", id)])
             },
             BTreeMap::new(),
             if add {
-                bindings(&[("e", id)])
+                symbols(&[("e", id)])
             } else {
                 BTreeMap::new()
             },
@@ -498,7 +600,7 @@ fn edge_request(
     ))
 }
 
-fn bindings(entries: &[(&str, &str)]) -> BTreeMap<Arc<str>, Arc<str>> {
+fn symbols(entries: &[(&str, &str)]) -> BTreeMap<Arc<str>, Arc<str>> {
     entries
         .iter()
         .map(|(key, value)| (Arc::from(*key), Arc::from(*value)))
@@ -508,7 +610,7 @@ fn bindings(entries: &[(&str, &str)]) -> BTreeMap<Arc<str>, Arc<str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::document::expand;
+    use crate::workflow::document::expand_builtin as expand;
     use ontography::{
         ActivationProposal, Emission, OutputAuthority, ProposalDecision, ProposalRuntime,
     };
@@ -518,12 +620,22 @@ mod tests {
         serde_json::from_value(json!({
             "name":"edit-test", "entry":"writer",
             "nodes":[
-                {"id":"writer","kind":"agent","config":{"prompt":"before"}},
-                {"id":"review","kind":"inbox"}
+                {"id":"writer","component":"agent","config":{"prompt":"before"}},
+                {"id":"review","component":"inbox"}
             ],
             "edges":[{"from":"writer","to":"review"}]
         }))
         .unwrap()
+    }
+
+    /// Preview `next` bound by the built-in components.
+    async fn preview(
+        session: &SessionHandle,
+        state: &WorkflowState,
+        next: Document,
+    ) -> Result<Plan> {
+        let bindings = Catalog::builtin().bind(&next)?;
+        super::preview(session, state, next, bindings).await
     }
 
     fn fixture() -> (
@@ -541,7 +653,7 @@ mod tests {
         let session = runtime
             .create_persistent(directory.path().join("core"))
             .unwrap();
-        let state = WorkflowState::new(doc, ids).unwrap();
+        let state = WorkflowState::builtin(doc, ids).unwrap();
         store(&directory.path().join("workflow.json"), &state).unwrap();
         (directory, runtime, session, state)
     }
@@ -720,12 +832,15 @@ mod tests {
             // Simulate a bypassing topology writer. A settings edit must not
             // remove its new node, before acceptance or during recovery.
             let mut changed = state.current.clone();
-            changed
-                .nodes
-                .push(serde_json::from_value(json!({"id":"unexpected","kind":"inbox"})).unwrap());
-            let ids = target_identities(&state, &changed);
+            changed.nodes.push(
+                serde_json::from_value(json!({"id":"unexpected","component":"inbox"})).unwrap(),
+            );
+            let bindings = Catalog::builtin().bind(&changed).unwrap();
             let kernel = session.kernel().await.unwrap();
-            let request = next_step(&kernel, &changed, &ids).unwrap().unwrap();
+            let ids = target_identities(&state, &changed, &bindings, Typing::of(&kernel));
+            let request = next_step(&kernel, &changed, &bindings, &ids)
+                .unwrap()
+                .unwrap();
             let prepared = session.prepare_rewrite(&request).await.unwrap().unwrap();
             session.commit_rewrite(prepared).await.unwrap().unwrap();
             let revision = session.frontier().revision();
@@ -814,7 +929,7 @@ mod tests {
             .iter_mut()
             .find(|node| node.id == "review")
             .unwrap()
-            .join = JoinMode::All;
+            .join = IngressDeclaration::All;
         let plan = preview(&session, &state, next).await.unwrap();
         assert_ne!(plan.identities.nodes["review"], old_node);
         assert_ne!(
@@ -847,7 +962,7 @@ mod tests {
             let declaration = expand(&state.current, "edit-test", &state.identities).unwrap();
             let mut next = state.current.clone();
             next.nodes
-                .push(serde_json::from_value(json!({"id":"archive","kind":"inbox"})).unwrap());
+                .push(serde_json::from_value(json!({"id":"archive","component":"inbox"})).unwrap());
             next.edges
                 .push(serde_json::from_value(json!({"from":"review","to":"archive"})).unwrap());
             let plan = preview(&session, &state, next).await.unwrap();
@@ -857,7 +972,7 @@ mod tests {
             store(&path, &state).unwrap();
             for _ in 0..committed_steps {
                 let kernel = session.kernel().await.unwrap();
-                let request = next_step(&kernel, &plan.document, &plan.identities)
+                let request = next_step(&kernel, &plan.document, &plan.bindings, &plan.identities)
                     .unwrap()
                     .unwrap();
                 let prepared = session.prepare_rewrite(&request).await.unwrap().unwrap();
