@@ -1,7 +1,8 @@
 # Core bindings and coverage
 
 The workflow layer uses the existing public core API. It adds an app document,
-fixed vocabulary, edit recovery, and a worker harness; it does not change core.
+fixed vocabulary, edit recovery, a task harness, and persistent node sessions;
+it does not change core.
 [WORKFLOWS.md](WORKFLOWS.md) is the usage guide. [ARCHITECTURE.md](../ARCHITECTURE.md)
 retains the agreed scope and unfinished interactive worker work.
 
@@ -22,7 +23,7 @@ harness handles initial input and workspace preparation. The older native
 All worker kinds share one core node type, result contract, edge rule, and
 authority tag. Only ingress (`any`/`all`) and root status affect the graph
 variants. The fixed grammar contains 40 productions, including self loops.
-Kind and process settings belong to the harness. Reusable documents live under
+Kind and process settings belong to app execution bindings. Reusable documents live under
 `definitions/workflows/<revision>.json`, separately from legacy graph drafts.
 
 The app persists its document, identity map, and edit intentions alongside
@@ -95,6 +96,8 @@ tool wrappers do not.
 Implementation: [document](../src/workflow/document.rs),
 [grammar](../src/workflow/grammar.rs), [editor](../src/workflow/edit.rs),
 [runtime ownership](../src/workflow/runtime.rs),
+[persistent node runtime](../src/node_runtime/mod.rs),
+[Codex session launcher](../src/node_runtime/codex.rs),
 [task harness](../src/workflow/harness.rs),
 [workflow tools](../src/workflow/tools.rs),
 [artifacts](../src/workflow/artifacts.rs),
@@ -147,15 +150,29 @@ publishes without overwriting an existing destination. Failure cleans up its
 partial staging output. This is result export, not a portable backup of the
 run, invocation history, or live processes.
 
-## Harness and remaining limits
+## Node runtimes and remaining limits
 
-Agent tasks currently invoke noninteractive `codex exec`; command tasks invoke
-the configured argv. Input messages go to stdin. Without a workspace, the
-result is the command's stdout or Codex's last message; with a workspace, the
-result is the captured checkout. Each result broadcasts to every outgoing
+Agent nodes use `NodeRuntime`: one core execution owns a persistent private
+working directory, managed PTY, continuing Codex session, and `NodeToolContext`.
+The launcher obtains and persists an exact Codex conversation reference via
+the native app-server protocol, then starts the interactive CLI with that
+reference. Restart reopens the same conversation rather than selecting a global
+latest conversation. A complete `argv` override bypasses native Codex setup and
+does not provide managed conversation recovery. Live process state is never
+recovered from conversation history.
+
+The runtime starts agent sessions without consuming pending packages. No MCP
+transport exposes the scoped tools to the agent yet, and graph work is not
+injected into terminal input. Those remain separate integration steps.
+
+Command tasks invoke the configured argv with input messages on stdin. Without
+a workspace, the result is stdout; with a workspace, the result is the captured
+checkout. Each result broadcasts to every outgoing
 connection. Human tasks wait for an explicit decision; inboxes keep work pending.
 
-Config changes are sampled before the next task. A kind change stops and
+Command config changes are sampled before the next task. Agent config changes
+stop and replace the process, preserving its node directory and conversation;
+grants and graph scope refresh in place. A kind change stops and
 waits for the previous worker before launching the new kind. A failed task
 retries with capped backoff while the worker continues with other tasks, then
 parks until `flow.retry` or `flow.discard`. Counts persist beside the node's
@@ -178,9 +195,10 @@ execution-bound invocations with explorable context, core's package reads and
 receipts, staged content, private workspaces, and, when granted, transfer and
 retirement through the session. No transport exposes them yet.
 
-Worker PTYs, continuing interactive Codex conversations, node-scoped MCP, and
-node panes remain unimplemented. Manager PTYs are already implemented. The
-current layer does not complete architecture items 1, 7, and 12.
+Worker and manager PTYs use the same terminal backend. Agent lifecycle includes
+cooperative stop, forced cancellation, exit reporting, and explicit resume.
+Node-scoped MCP, incoming-work notification, package handoffs for continuing
+sessions, and node panes remain unimplemented (architecture items 7 and 12).
 
 Other existing limits remain:
 
@@ -211,6 +229,7 @@ Other existing limits remain:
 | Task execution, cancellation, failures, process supervision, workspace constraints | [harness tests](../src/workflow/harness.rs) |
 | Retry backoff, parking, join sets, manager retry/discard, definition changes, durability | [task tests](../src/workflow/tasks.rs), [workflow retry](../tests/workflow_retry.rs) |
 | Node tools: receipts equal sent bytes, metadata-only views, attempts, retries, grants, content and checkouts | [node tool tests](../src/node_tool/tests.rs), [content](../src/node_tool/outputs.rs), [workspaces](../src/node_tool/workspace.rs) |
+| Persistent agent startup, scope updates, config replacement, exit, suspension, and resume | [persistent node tests](../tests/persistent_nodes.rs), [node runtime](../src/node_runtime/mod.rs), [Codex launcher](../src/node_runtime/codex.rs) |
 | Workspace capture/reopen/export and no-clobber/path validation | [artifact tests](../src/workflow/artifacts.rs), [workspace flow](../tests/workflow_artifacts.rs) |
 | Session ownership, scoped targets, manager catalog, initialization recovery | [session ownership](../tests/session_ownership.rs), [catalog tests](../src/catalog.rs) |
 | Detached server lifetime, abrupt death, receipts, stale instances, multiplexing | [server process tests](../tests/server_lifecycle.rs) |

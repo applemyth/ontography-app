@@ -51,7 +51,8 @@ impl DocumentNode {
         self.retry.unwrap_or_default()
     }
 
-    /// Agent and command nodes run tasks; human and inbox nodes do not.
+    /// Agent and command nodes can handle tasks through a worker. Agent
+    /// sessions choose tasks through node tools; commands run them directly.
     pub const fn runs_tasks(&self) -> bool {
         matches!(self.kind, NodeKind::Agent | NodeKind::Command)
     }
@@ -193,7 +194,7 @@ fn validate_node(node: &DocumentNode) -> Result<()> {
         .as_object()
         .ok_or_else(|| error("config must be an object"))?;
     let allowed: &[&str] = match node.kind {
-        NodeKind::Agent => &["prompt", "harness", "argv", "model", "timeout_secs"],
+        NodeKind::Agent => &["prompt", "harness", "argv", "model"],
         NodeKind::Command => &["argv", "timeout_secs"],
         NodeKind::Human => &["prompt"],
         NodeKind::Inbox => &[],
@@ -216,7 +217,7 @@ fn validate_node(node: &DocumentNode) -> Result<()> {
         .is_some_and(|value| value.as_str() != Some("codex"))
     {
         return Err(error(
-            "the supported agent harness is codex; use argv to override its runner",
+            "the supported agent harness is codex; use argv to override its interactive command",
         ));
     }
     if node.kind == NodeKind::Command || config.contains_key("argv") {
@@ -518,6 +519,33 @@ mod tests {
                 "{invalid} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn persistent_agent_configuration_has_no_task_timeout() {
+        let mut configured = document();
+        let agent = configured
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == NodeKind::Agent)
+            .unwrap();
+        agent.config["timeout_secs"] = json!(30);
+        assert!(
+            configured
+                .canonicalized()
+                .unwrap_err()
+                .message
+                .contains("timeout_secs")
+        );
+
+        let mut configured = document();
+        let command = configured
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == NodeKind::Command)
+            .unwrap();
+        command.config["timeout_secs"] = json!(30);
+        assert!(configured.canonicalized().is_ok());
     }
 
     #[test]

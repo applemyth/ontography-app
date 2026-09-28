@@ -43,6 +43,12 @@ struct Options {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Internal cleanup invoked inside a node's owned terminal session.
+    #[command(hide = true)]
+    InternalNodeCleanup {
+        #[arg(long)]
+        owner: i32,
+    },
     /// Internal launcher used by the managed session shell.
     #[command(hide = true)]
     InternalPi {
@@ -130,6 +136,11 @@ fn project(path: Option<PathBuf>) -> Result<PathBuf> {
     )?)
 }
 async fn run(cli: Cli) -> Result<()> {
+    // This helper runs after its server may have died. It needs no data store
+    // or server connection, and can signal only its own inherited OS session.
+    if let Some(Action::InternalNodeCleanup { owner }) = &cli.action {
+        return ontography_app::node_runtime::cleanup_process_session(*owner);
+    }
     let options = cli.options;
     if options.session.is_some() && !matches!(cli.action, None | Some(Action::Call { .. })) {
         return Err(AppError::invalid(
@@ -152,6 +163,7 @@ async fn run(cli: Cli) -> Result<()> {
         None => persistence::default_data_dir()?,
     })?;
     match cli.action {
+        Some(Action::InternalNodeCleanup { .. }) => unreachable!("handled before opening storage"),
         Some(Action::InternalPi {
             session_id,
             generation,

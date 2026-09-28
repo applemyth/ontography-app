@@ -1,5 +1,49 @@
 # Verification
 
+## Persistent Codex node foundation — 2026-09-27
+
+Passed: **228 app Rust tests**, all-target Clippy with warnings denied,
+formatting, and `git diff --check`. The native smoke is ignored by the standard
+suite and passed separately.
+
+```sh
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
+git diff --check
+```
+
+The node runtime binds an agent execution to a managed PTY, persistent private
+working directory, saved native conversation, and shared node-tool context.
+The implementation uses the current sibling core checkout without modifying it.
+
+- [Workflow lifecycle tests](../tests/persistent_nodes.rs) cover startup,
+  suspension/resume, stable identity and working directory, graph/grant updates,
+  config replacement, kind changes, removal, forced cancellation, and visible
+  process failures. Initial input remains pending throughout these checks.
+- [Launcher tests](../src/node_runtime/codex.rs) cover exact conversation
+  resumption, missing or mismatched saved state, custom commands, and cancelled
+  bootstrap cleanup.
+- [Supervisor tests](../src/node_runtime/process.rs) exercise startup permission,
+  lifetime-pipe loss, actual owner-process SIGKILL, terminal event-reader
+  compatibility, and cleanup of jobs in other process groups in the owned
+  terminal session. [Terminal tests](../src/terminal.rs) cover retained views,
+  cancelled launch, natural exit, and explicit shutdown.
+
+Native Codex **0.157.1** opened its resumed composer in the managed PTY and
+resumed the same conversation UUID after shutdown. The ignored smoke test
+creates an empty local conversation and makes no model turn. Its fixture uses
+a process-local trust override for its empty working directory; production
+retains normal native trust, onboarding, and approval behavior.
+
+```sh
+cargo test --locked --lib node_runtime::codex::tests::native_codex_idle_smoke -- --ignored --nocapture
+```
+
+This verifies the process/session foundation. Node MCP, incoming-work delivery,
+package handoffs, and worker terminal panes remain unfinished; these checks do
+not establish end-to-end communication between interactive agents.
+
 ## Persistent shell and session panel — 2026-09-26
 
 Passed: **110 app Rust tests and 31 Pi tests**, TypeScript checking, all-target

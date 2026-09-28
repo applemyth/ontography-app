@@ -700,9 +700,14 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
     };
     let nodes: Vec<_> = state.current.nodes.iter().map(|node| {
         let id = &state.identities.nodes[&node.id];
-        let execution = run.live.as_ref().and_then(|live| live.workers.get(id).and_then(|worker| live.executions.get(&worker.execution_id)));
-        json!({"id":node.id,"kind":node.kind,"pending":counts.as_ref().and_then(|view|view.counts().get(id.as_str())).map_or(0,|count|count.received()),
-            "execution":execution.map(|handle|execution_status(handle.status()))})
+        let worker = run.live.as_ref().and_then(|live| live.workers.get(id));
+        let execution = run.live.as_ref().and_then(|live| worker.and_then(|worker| live.executions.get(&worker.execution_id)));
+        let mut view = json!({"id":node.id,"kind":node.kind,"pending":counts.as_ref().and_then(|view|view.counts().get(id.as_str())).map_or(0,|count|count.received()),
+            "execution":execution.map(|handle|execution_status(handle.status()))});
+        if let Some(runtime) = worker.and_then(|worker| worker.node.as_ref()) {
+            view["session"] = json!(runtime.status());
+        }
+        view
     }).collect();
     // The existing graph view uses workflow names, including intermediate
     // topology during an unfinished edit. No incarnation IDs leave this view.

@@ -1,6 +1,6 @@
 # Session design and implementation
 
-**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Concrete worker nodes and default app editing productions remain deferred. [VERIFICATION.md](VERIFICATION.md) records the evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
+**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions, the fixed editing grammar, and persistent Codex worker sessions are implemented. Worker MCP, incoming-work delivery, and node panes remain unfinished. [VERIFICATION.md](VERIFICATION.md) records the manager release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
 
 ## Ownership invariant
 
@@ -22,11 +22,11 @@ A process ID, connection, or terminal-instance ID is not a durable session ident
 | Ontography session | Group Pi state, project, optional graph binding, and manager terminal. | Implemented. |
 | Graph runtime | Govern nodes, edges, contracts, packages, workflow, authority, and rewrites. Coordinate nodes collectively. | Existing core bindings implemented. |
 | Manager execution | Run native Pi before and after graph initialization; resume the latest active conversation on shell reentry. | Managed launcher inside a persistent Bash PTY. |
-| Node execution | Run a concrete agent associated with a durable graph-node ID. | Registered execution infrastructure exists; concrete Codex adapter deferred. |
-| PTY and terminal state | Host terminal bytes/dimensions; continuously read output and retain a current screen. | `portable-pty` and `vt100` implemented for the manager. |
+| Node execution | Run a concrete agent associated with a durable graph-node ID. | Persistent Codex node runtime binds execution, working directory, native conversation, PTY, and scoped tools. |
+| PTY and terminal state | Host terminal bytes/dimensions; continuously read output and retain a current screen. | `portable-pty` and `vt100` shared by manager and worker sessions. |
 | Pane/view | Display existing execution and route controlling-client input. | Full Pi, shell + session panel, and graph view; worker panes deferred. |
 
-The intended worker relationship remains node → execution → PTY → client view. Each node has an execution inside one collective graph runtime. Node identity persists across process restart and view closure.
+The worker relationship is node → execution → PTY → client view. Each node has an execution inside one collective graph runtime. Node identity persists across process restart and view closure; worker client views are still pending.
 
 ## Implemented launch and initialization
 
@@ -41,7 +41,7 @@ The intended worker relationship remains node → execution → PTY → client v
 
 `session new --no-attach` creates records without starting Pi. Existing runs require explicit adoption into an uninitialized session with the same project; no old Pi ownership is inferred.
 
-Future node creation will commit through core's configured grammar, then reconcile/provision agent execution. Nodes present in initial graphs also need provisioning. A startup failure preserves committed graph state and remains visible for recovery. Opening a worker view must not create a node, edge, or package delivery. These worker mechanisms are not part of the current manager foundation.
+Node creation commits through core's configured grammar, then reconciles agent execution. Initial graphs provision their agent sessions on startup. A startup failure preserves committed graph state and remains visible for recovery with `flow.resume`. Agent config changes restart its process; graph grants and scope update in place. Opening a future worker view must not create a node, edge, or package delivery. See [WORKFLOWS.md](WORKFLOWS.md) for session configuration and delivery limits.
 
 ## Pi integration
 
@@ -91,12 +91,12 @@ Output is read continuously without a client. Reattachment receives current scre
 
 Pi runs full screen. After it exits, the client renders the shell beside a session status panel, with a compact layout on narrow terminals. Explicit manager mode drives layout and PTY resizing; rendered terminal text is never treated as process-state evidence. The private launcher resolves conversation selection on each invocation and rejects stale terminal generations. Server supervision suspends the session when its shell ends, without depending on an attached client.
 
-The current backend hosts the management terminal. Worker terminal creation and views remain unimplemented. Terminal compatibility claims are limited to recorded automated/native-Pi checks, not every terminal extension.
+The same backend hosts management and worker terminals. Worker view integration remains unimplemented. Terminal compatibility claims are limited to recorded automated/native-Pi checks, not every terminal extension.
 
 ## Remaining work
 
-1. Define concrete Codex nodes, workspace/message/union contracts, edge rules, node harnesses, and scoped MCP.
-2. Supply their app editing productions at run creation; implement worker process reconciliation and views.
+1. Expose shared node tooling through MCP and deliver incoming graph work to continuing agent sessions.
+2. Complete persistent-session package handoffs and worker terminal views.
 3. Specify explicit app-session fork/archive/delete, complete artifact-backed export, and optional viewer/takeover behavior.
 4. Runs need the desired grammar at creation. Live grammar replacement remains unavailable; `run.extend` only adds vocabulary and trusted contracts. This WIP uses fresh runs instead of migrating empty-grammar runs.
 

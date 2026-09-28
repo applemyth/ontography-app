@@ -24,13 +24,14 @@ Rust server
     ├── Pi manager state: conversations, active selection, tool preferences
     ├── Server-owned shell and PTY → native Pi when launched
     └── Optional graph run and core runtime
+        └── Agent nodes → managed PTYs → continuing Codex sessions
 ```
 
 | Component | Responsibility |
 | --- | --- |
 | Rust CLI/client | Select a session; attach input/output; display Pi, shell + session panel, or graph. |
 | Pi | Native conversations, model execution, and management tools. |
-| Rust server | Own sessions, manager processes, terminal screen state, graph runtimes, and accepted operations. |
+| Rust server | Own sessions, manager and worker processes, terminal screen state, graph runtimes, and accepted operations. |
 | Core | Enforce graph admission, contracts, authority, workflow commits, rewrites, packages, and durable graph history. |
 | Rust graph view | Render the bound run using Ratatui; closing the view preserves the manager. |
 
@@ -52,7 +53,7 @@ CLI targets accept an exact session ID or a unique exact name. Ambiguous names r
 
 Scoped calls resolve the session's graph and reject conflicting targets. Unscoped calls remain the explicit administration interface. The handshake publishes operation schemas. [examples/flow.json](examples/flow.json) is a logical graph with a configured rewrite; logical nodes can exist before worker implementations are installed.
 
-The management bindings expose definitions, runs, live vocabulary extension, execution, rewrites, workflow, explicit package retirement, packages, workspaces, iroh transfers, scoped invocations/context, inspection, and trusted project applications. [Core update usage](docs/CORE_UPDATE.md) covers the new operations and restart recovery. [The binding inventory](docs/CORE_BINDINGS.md) maps these to core's public API.
+Pi manages workflow documents, runs, edits, task decisions, and artifacts through the workflow tools. Shared node tooling supplies scoped graph and package operations for worker implementations. [The workflow guide](docs/WORKFLOWS.md) describes current behavior; [the binding inventory](docs/CORE_BINDINGS.md) maps it to core's public API.
 
 ## Development and status
 
@@ -68,4 +69,6 @@ npm test
 
 The persistent session foundation is implemented. Final verification and the actual home-directory cutover are recorded separately in [VERIFICATION.md](docs/VERIFICATION.md). [ARCHITECTURE.md](ARCHITECTURE.md) tracks remaining pieces; [SESSION_DESIGN.md](docs/SESSION_DESIGN.md) explains ownership and recovery.
 
-**Concrete worker nodes remain deferred:** Codex execution adapters, node terminal views, message/workspace/union contracts, edge definitions, node harnesses/MCP, and process reconciliation after rewrites. The app's default editing grammar must accompany those definitions. Existing runs retain their original grammar.
+**Persistent Codex node foundations are implemented:** an agent binding owns a managed PTY, continuing Codex conversation, persistent private working directory, and scoped node-tool context. Workflow startup, edits, suspension, and resume reconcile its process. Command, human, and inbox nodes retain their task behavior; message/workspace contracts and the fixed editing grammar already exist.
+
+The node MCP adapter, incoming-work delivery, package handoffs for continuing sessions, and node terminal panes remain unfinished. Agent sessions therefore do not yet consume graph packages or publish terminal output. See [WORKFLOWS.md](docs/WORKFLOWS.md) for configuration and these limits.

@@ -1,4 +1,4 @@
-//! Builtin workers consume scoped inputs and publish through core admission.
+//! Command workers consume scoped inputs and publish through core admission.
 
 use super::{
     document::{DocumentNode, NodeKind, WorkflowPayload},
@@ -67,6 +67,9 @@ pub async fn run(
             return Ok(());
         }
         let node = settings.borrow_and_update().clone();
+        if node.kind == NodeKind::Agent {
+            return Err(failure("Agent nodes require the persistent node runtime"));
+        }
         let definition = node.digest();
         // Failures count against the definition they happen under; renewing
         // here also applies a change that reconcile could not record.
@@ -374,14 +377,6 @@ async fn perform(
     // Preparation records the exact source exposure, including resolved package views.
     invocation.prepare_context().await.map_err(failure)?;
     let mut parts = Vec::new();
-    if node.kind == NodeKind::Agent {
-        parts.push(
-            node.config["prompt"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
-        );
-    }
     let mut workspace = None;
     for payload in payloads {
         match WorkflowPayload::decode(payload).map_err(failure)? {
@@ -673,6 +668,26 @@ fn lease_path(directory: &Path) -> PathBuf {
     directory.join("worker-process.json")
 }
 
+/// Record an owned terminal supervisor before permitting it to launch user code.
+/// Terminal workers use the same verified recovery as command-task workers.
+pub(crate) async fn lease_process(directory: &Path, pid: u32, token: &str) -> WorkerResult<()> {
+    let pid = i32::try_from(pid).map_err(failure)?;
+    let identity = startup_identity(
+        || inspect_process_identity(pid, token),
+        Duration::from_secs(3),
+    )
+    .await?;
+    write_json(
+        &lease_path(directory),
+        &ProcessLease {
+            pid,
+            token: token.into(),
+            identity,
+        },
+    )
+    .map_err(failure)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ProcessIdentity {
     Gone,
@@ -797,6 +812,12 @@ async fn wait_group_gone(pid: i32) -> WorkerResult<()> {
     loop {
         match killpg(Pid::from_raw(pid), None) {
             Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            // macOS can briefly deny this probe while the group's members
+            // are exiting. Keep waiting within the same bound; only ESRCH
+            // establishes that cleanup finished.
+            Err(nix::errno::Errno::EPERM) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             Err(error) => {
                 return Err(failure(format!(
                     "Cannot verify worker group cleanup: {error}"
@@ -831,7 +852,12 @@ pub async fn recover_process(directory: &Path) -> WorkerResult<()> {
                 "Saved worker process identity changed; no process was signalled",
             ));
         }
-        match killpg(Pid::from_raw(lease.pid), Signal::SIGKILL) {
+        // Let the verified supervisor finish its own cleanup before removing
+        // the owner group. PTY agents may have jobs in other process groups;
+        // killing the supervisor first would interrupt their cleanup helper.
+        // If cleanup stalls, retain the lease and refuse to overlap a new
+        // worker rather than bypassing that ownership boundary.
+        match nix::sys::signal::kill(Pid::from_raw(lease.pid), Signal::SIGTERM) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
             Err(error) => return Err(failure(error)),
         }
@@ -966,24 +992,19 @@ async fn process(
         directory,
         input,
     } = request;
-    let last_message = directory.join(format!("{}.last-message", invocation.id()));
-    let native_agent = node.kind == NodeKind::Agent && node.config.get("argv").is_none();
-    let argv: Vec<String> = if native_agent {
-        native_agent_argv(node, &last_message, workspace_receipt.is_some())
-    } else {
-        node.config
-            .get("argv")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| failure("Worker argv is missing"))?
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| failure("Worker argv must contain strings"))
-            })
-            .collect::<WorkerResult<_>>()?
-    };
+    let argv: Vec<String> = node
+        .config
+        .get("argv")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| failure("Worker argv is missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| failure("Worker argv must contain strings"))
+        })
+        .collect::<WorkerResult<_>>()?;
     let timeout = Duration::from_secs(
         node.config
             .get("timeout_secs")
@@ -1040,43 +1061,8 @@ async fn process(
             "Worker exited with status {code}: {stderr}"
         )));
     }
-    let stdout = if native_agent {
-        let file = tokio::fs::File::open(&last_message)
-            .await
-            .map_err(failure)?;
-        let text = String::from_utf8_lossy(&read_bounded(file).await?).into_owned();
-        tokio::fs::remove_file(last_message)
-            .await
-            .map_err(failure)?;
-        text
-    } else {
-        String::from_utf8_lossy(&stdout).into_owned()
-    };
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
     Ok(ProcessOutput { stdout, stderr })
-}
-
-fn native_agent_argv(
-    node: &DocumentNode,
-    last_message: &Path,
-    private_workspace: bool,
-) -> Vec<String> {
-    let mut args = vec![
-        "codex".into(),
-        "exec".into(),
-        "-".into(),
-        "--output-last-message".into(),
-        last_message.to_string_lossy().into_owned(),
-        "--color".into(),
-        "never".into(),
-        "--skip-git-repo-check".into(),
-    ];
-    if private_workspace {
-        args.extend(["--sandbox".into(), "workspace-write".into()]);
-    }
-    if let Some(model) = node.config.get("model").and_then(|value| value.as_str()) {
-        args.extend(["--model".into(), model.into()]);
-    }
-    args
 }
 
 #[cfg(test)]
@@ -1296,66 +1282,6 @@ mod tests {
             .group
             .terminate_with(|_| panic!("A reaped child's group ID must never be signalled"));
         assert!(process.group.0.is_none());
-    }
-
-    #[tokio::test]
-    async fn native_agent_arguments_support_private_non_git_workspaces() {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
-        let fake = directory.path().join("fake-codex");
-        std::fs::write(
-            &fake,
-            r#"#!/bin/sh
-[ "$1" = exec ] || exit 91
-shift
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        -) ;;
-        --skip-git-repo-check) skip=1 ;;
-        --output-last-message) output=$2; shift ;;
-        --sandbox) sandbox=$2; shift ;;
-        --color|--model) shift ;;
-        *) exit 92 ;;
-    esac
-    shift
-done
-[ "$skip" = 1 ] && [ "$sandbox" = workspace-write ] || exit 93
-cat > "$output"
-printf changed > artifact.txt
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let node: DocumentNode = serde_json::from_value(
-            json!({"id":"agent","kind":"agent","config":{"prompt":"work","model":"fixture-model"}}),
-        )
-        .unwrap();
-        let last = directory.path().join("last-message");
-        let mut argv = native_agent_argv(&node, &last, true);
-        argv[0] = fake.to_string_lossy().into_owned();
-        let mut process = spawn_supervised(
-            &argv,
-            directory.path(),
-            directory.path(),
-            b"prompt\n\ninput",
-        )
-        .await
-        .unwrap();
-        permit(&mut process).await;
-        tokio::time::timeout(Duration::from_secs(3), process.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        let status =
-            std::fs::read_to_string(directory.path().join(format!("{}.status", process.token)))
-                .unwrap();
-        assert_eq!(status, format!("{} 0\n", process.token));
-        assert_eq!(std::fs::read_to_string(last).unwrap(), "prompt\n\ninput");
-        assert_eq!(
-            std::fs::read_to_string(directory.path().join("artifact.txt")).unwrap(),
-            "changed"
-        );
-        recover_process(directory.path()).await.unwrap();
     }
 
     #[tokio::test]
@@ -1948,8 +1874,8 @@ printf changed > artifact.txt
             std::fs::read_to_string(temporary.path().join("source/file.txt")).unwrap(),
             "original"
         );
-        // The app owns the checkout: core's policy names no workspace, and the
-        // attempt's evidence records what the command was given.
+        // The app owns the checkout; the attempt's evidence records what the
+        // command was given.
         let invocations = session
             .invocations_page(Some(&ids.nodes["command"]), None, 10)
             .await
@@ -1957,7 +1883,6 @@ printf changed > artifact.txt
         let [invocation] = &invocations[..] else {
             panic!("expected one attempt, got {invocations:?}");
         };
-        assert_eq!(invocation.policy.workspace, None);
         let events = session
             .invocation_events(invocation.id, 0, 100)
             .await

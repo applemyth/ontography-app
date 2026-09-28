@@ -1,12 +1,15 @@
 //! Run ownership and worker reconciliation for document workflows.
 
 use super::{
-    DocumentNode, WorkflowPayload,
+    DocumentNode, NodeKind, WorkflowPayload,
     edit::{self, WorkflowState},
     harness,
     tasks::RetryLedger,
 };
-use crate::{AppError, Result, persistence, state::ManagedRun};
+use crate::{
+    AppError, Result, node_runtime::NodeRuntime, node_tool::NodeScope, persistence,
+    state::ManagedRun,
+};
 use ontography::{ExecutionStatus, InvocationStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +32,10 @@ pub struct InitialWorkflow {
 pub struct Worker {
     pub execution_id: String,
     pub settings: watch::Sender<DocumentNode>,
+    /// Refreshed after every graph edit, including edits to other nodes.
+    pub scope: watch::Sender<NodeScope>,
+    /// A continuing session for agent nodes. Other kinds use the task harness.
+    pub node: Option<Arc<NodeRuntime>>,
     /// Shared with the harness and flow tools. A relaunched worker keeps its
     /// predecessor's instance, so a node never has two writers.
     pub ledger: Arc<RetryLedger>,
@@ -175,14 +182,17 @@ pub async fn reconcile(
         .workers
         .iter()
         .filter(|(id, worker)| {
+            let current = worker.settings.borrow();
             kernel.graph().node(id.as_str()).is_none()
-                || desired
-                    .get(*id)
-                    .is_some_and(|node| node.kind != worker.settings.borrow().kind)
+                || desired.get(*id).is_none_or(|node| {
+                    node.kind != current.kind
+                        || (node.kind == NodeKind::Agent && node.config != current.config)
+                })
         })
         .map(|(id, _)| id.clone())
         .collect();
-    // A replacement of another kind continues its node's retry ledger.
+    // A replacement continues its node's retry ledger. Agent launch settings
+    // require a new process; graph grants and task policy update in place.
     // Each ledger is renewed below with its node's definition, so a changed
     // node gets fresh attempts even if this reconcile stops early.
     let mut ledgers = BTreeMap::new();
@@ -211,9 +221,11 @@ pub async fn reconcile(
         .expect("workflow checked")
         .clone();
     let original_entry = &initial.state.identities.nodes[&initial.state.current.entry];
+    let workflow = Arc::new(state.clone());
     for node in &state.current.nodes {
         let id = &state.identities.nodes[&node.id];
         let definition = node.digest();
+        let scope = NodeScope::new(workflow.clone(), &node.id)?;
         let mut ledger = ledgers.remove(id);
         let existing = run.live()?.workers.get(id).map(|worker| {
             (
@@ -234,6 +246,10 @@ pub async fn reconcile(
                 if changed {
                     worker.settings.send_replace(node.clone());
                 }
+                // Node tools resolve names and grants from the whole graph.
+                // An edge or another node can change without changing this
+                // worker's own definition.
+                worker.scope.send_replace(scope);
                 // After the new settings, so no retried task starts with the old ones.
                 worker.ledger.renew(&definition)?;
                 continue;
@@ -249,6 +265,7 @@ pub async fn reconcile(
         };
         ledger.renew(&definition)?;
         let (settings, receiver) = watch::channel(node.clone());
+        let (scope, scope_receiver) = watch::channel(scope);
         let input = if pending_initial && id == original_entry {
             Some(initial_payload(run).await?)
         } else {
@@ -257,24 +274,41 @@ pub async fn reconcile(
         std::fs::create_dir_all(&directory)?;
         let project = run.manifest.project.clone();
         let session = run.live()?.session.clone();
-        let worker_ledger = ledger.clone();
-        let executable = move |context| {
-            harness::run(
-                context,
-                receiver.clone(),
+        let node_runtime = (node.kind == NodeKind::Agent).then(|| {
+            NodeRuntime::new(
                 project.clone(),
                 directory.clone(),
-                input.clone(),
                 session.clone(),
-                worker_ledger.clone(),
+                scope_receiver,
+                ledger.clone(),
+                input.clone(),
             )
+        });
+        let handle = if let Some(runtime) = &node_runtime {
+            let runtime = runtime.clone();
+            run.live()?
+                .host
+                .launch(id.as_str(), move |context| runtime.clone().run(context))
+                .await
+                .map_err(AppError::core)?
+        } else {
+            let worker_ledger = ledger.clone();
+            run.live()?
+                .host
+                .launch(id.as_str(), move |context| {
+                    harness::run(
+                        context,
+                        receiver.clone(),
+                        project.clone(),
+                        directory.clone(),
+                        input.clone(),
+                        session.clone(),
+                        worker_ledger.clone(),
+                    )
+                })
+                .await
+                .map_err(AppError::core)?
         };
-        let handle = run
-            .live()?
-            .host
-            .launch(id.as_str(), executable)
-            .await
-            .map_err(AppError::core)?;
         let execution_id = uuid::Uuid::new_v4().to_string();
         let live = run.live_mut()?;
         live.executions.insert(execution_id.clone(), handle);
@@ -283,6 +317,8 @@ pub async fn reconcile(
             Worker {
                 execution_id,
                 settings,
+                scope,
+                node: node_runtime,
                 ledger,
             },
         );

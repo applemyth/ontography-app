@@ -69,20 +69,38 @@ connections are rejected. Worker kind does not change core graph rules.
 
 | Kind | Config | What it does |
 | --- | --- | --- |
-| `agent` | Required `prompt`; optional `model`, `timeout_secs`, `harness:"codex"`, or `argv` runner override | Runs noninteractive `codex exec` for each task; supplies prompt and input messages on stdin. |
+| `agent` | Required `prompt`; optional `model`, `harness:"codex"`, or `argv` runner override | Hosts a continuing interactive Codex session in a managed PTY. |
 | `command` | Required nonempty `argv`; optional `timeout_secs` | Runs the command with input messages on stdin. |
 | `human` | Optional `prompt` | Waits for `flow.decide` on the specific task. |
 | `inbox` | Empty config | Holds incoming work for inspection/export. |
 
-Use an agent by replacing the `draft` node with, for example:
+An agent node definition looks like this:
 
 ```json
 {"id":"draft","kind":"agent","config":{"prompt":"Review the input and produce a concise draft."}}
 ```
 
-The server needs Codex installed and authenticated. Workers currently run
-tasks with piped input/output; they do not have interactive terminals, node
-MCP tools, persistent Codex conversations, or attachable node panes.
+The server needs Codex installed and authenticated; a configured `CODEX_HOME`
+must be an absolute path. It establishes a saved
+conversation through Codex's app server without starting a model turn, then
+launches the interactive CLI with that conversation ID. `prompt` supplies its
+standing instructions. The session starts when the node starts and remains
+alive independently of individual graph tasks. Native Codex trust, onboarding,
+and approval prompts retain their normal behavior.
+
+Each agent owns a persistent private working directory under its node's storage
+directory, separate from the workflow project and temporary package checkouts.
+Restarts retain this directory and resume the recorded Codex conversation.
+An `argv` override is the complete interactive command, passed without a shell;
+it bypasses Codex setup and has no managed Codex conversation reference.
+`timeout_secs` belongs to command tasks and is rejected for agent sessions.
+
+This implements the node's process and session foundation. The shared node tools
+are bound to its execution, but no MCP transport exposes them to Codex yet.
+Initial and incoming graph packages remain pending; the session does not
+automatically receive them or publish its terminal output. Incoming-work
+notifications, package handoffs, and attachable node panes remain future work.
+Use command nodes for the end-to-end task workflow above.
 
 ## Edit and recover
 
@@ -93,8 +111,11 @@ MCP tools, persistent Codex conversations, or attachable node panes.
 4. Read status. Use `flow.resume` to recover an interrupted edit or restart
    stopped or failed workers.
 
-A prompt/config change takes effect on the next task. A kind change stops and
-waits for the old worker before launching the replacement. Changing joins or
+A command config change takes effect on the next task. An agent config change
+stops and replaces its process, retaining its node directory and recorded
+conversation. Grants, retry policy, and changes elsewhere in the graph refresh
+the agent's scoped tooling without restarting its process. A kind change stops
+and waits for the old worker before launching the replacement. Changing joins or
 entry status can require replacing core identities and retiring pending work;
 the preview reports that work. The initial entry cannot be replaced before
 its initial task completes.
@@ -119,10 +140,11 @@ as a reusable revision after any pending edit finishes.
 ## Workspaces
 
 Start with `"workspace":"path/to/directory"` instead of `message` to import
-an initial workspace. A worker executes in a private checkout and publishes
-its captured changes. The original directory is preserved. Without a workspace,
-the task runs in the workflow project and publishes stdout (or Codex's last
-message).
+an initial workspace. A command task executes in a private checkout and
+publishes its captured changes. The original directory is preserved. Without a
+workspace, the command runs in the workflow project and publishes stdout.
+Persistent agent sessions do not yet consume workspace packages or capture
+their working directory as graph output.
 
 For a human task, call `flow.workspace` with `action:"open"`, its `node`, and
 the `task_id` from status. This opens that task's current input and rejects
@@ -166,9 +188,16 @@ or `aborted`) and, on failure, `execution.error.class` and `.message`. Error
 messages preserve their original text. When no worker handle exists, `execution`
 is null. A failed task does not fail its worker.
 
+Agent nodes also report `session`: its lifecycle state, terminal status,
+persistent directory and working directory, native conversation ID when managed
+by Codex, and any startup or process error. A failed or exited agent session
+stays stopped until `flow.resume` or a change to that node's definition; its
+process is not restarted by the task retry policy. Status is available even
+though the graph UI does not yet expose node terminal panes.
+
 ## Failed tasks
 
-An agent or command task fails when its process exits nonzero, times out, or
+A command task fails when its process exits nonzero, times out, or
 exceeds an output limit, when core rejects its result, or when the task cannot
 start as delivered. Its worker keeps running: the task waits out a backoff and
 is attempted again, while other tasks at the node proceed. At an `all` node, a
@@ -232,9 +261,10 @@ attempt.
   parks until the manager retries or discards it. An interrupted attempt is not
   counted. External command effects may repeat if a previous attempt ran but
   did not publish to core.
-- Config updates do not interrupt a task already running. Removing a node or
-  changing its kind stops its old worker during reconciliation.
-- Task timeout defaults to five minutes. Captured stdout/stderr are bounded
+- Command config updates do not interrupt a task already running. Agent config
+  updates restart its session process. Removing a node or changing its kind
+  stops its old worker during reconciliation.
+- Command task timeout defaults to five minutes. Captured stdout/stderr are bounded
   to 1 MiB each; status/output previews truncate long text. Export retrieves
   the complete accepted message or workspace.
 - `flow.decide` completes human tasks; it is not arbitrary message injection

@@ -19,11 +19,12 @@ authority, package/workflow state, and persistence.
   and a diff/retirement preview.
 - Process reconciliation and node terminal views.
 
-The document/compiler, edit recovery, and task harness are implemented. The
-harness runs noninteractive Codex or command tasks, waits for human decisions,
-and holds results in inboxes. Worker terminals, node MCP, and node panes remain
-unfinished parts of the agreed scope. Pi remains the management harness. Core
-is unchanged by this work.
+The document/compiler, edit recovery, task harness, and persistent Codex node
+runtime are implemented. Agent nodes own interactive Codex sessions in managed
+PTYs; command nodes run individual tasks, human nodes wait for decisions, and
+inboxes hold results. Node MCP, notification of incoming work, and node panes
+remain unfinished. Agent sessions therefore do not yet consume or publish graph
+packages. Pi remains the management harness. Core is unchanged by this work.
 
 ## The picture
 
@@ -31,10 +32,11 @@ is unchanged by this work.
 manager (Pi)
  └─ workflow document          named nodes, settings, joins, connections
      ├─ translator → core      graph declaration + fixed rewrite grammar
-     ├─ bindings → harness     run tasks, deliver inputs, publish results
+     ├─ agent → node runtime   managed PTY + continuing Codex session + scoped tools
+     ├─ other kinds → harness command tasks, human decisions, inboxes
      └─ editor → core          preview changes, save target, apply/recover
 
-core commits graph and package state; the harness reconciles worker processes
+core commits graph and package state; workflow runtime reconciles worker processes
 ```
 
 | Piece | Job | Items | Status |
@@ -44,7 +46,7 @@ core commits graph and package state; the harness reconciles worker processes
 | Workflow document | Named nodes, kind/config, joins, directed edges, and entry. | 10 | Implemented. |
 | Compiler + library | Fixed vocabulary, declaration expansion, edit grammar, and diff. | 2–5, 9 | Implemented using existing core APIs. |
 | Core | Enforces graph and package/workflow semantics. | — | Existing dependency; no additions in scope. |
-| Nodes | Execute tasks, deliver inputs, and publish outputs. | 1, 6, 7 | Task harness and node tools implemented; interactive worker terminals and the node MCP transport remain. |
+| Nodes | Host continuing agents or execute tasks using scoped graph tools. | 1, 6, 7 | Codex PTY runtime, task harness, and node tools implemented; MCP and incoming-work notification remain. |
 
 ## Workflow document
 
@@ -91,9 +93,11 @@ variants come from join (`any`/`all`) and root status, not worker kind. The
 generated grammar has 40 productions: eight node rules, 24 connection rules,
 and eight self-loop rules.
 
-Config changes take effect on the next task. Changing kind stops and waits for
-the old worker before launching its replacement. These are harness operations;
-a prompt or kind change alone does not rewrite the core graph.
+Command config changes take effect on the next task. Agent config changes stop
+and replace the running session process, preserving its recorded conversation
+and working directory. Grants and topology refresh its tooling scope in place.
+Changing kind stops and waits for the old worker before launching its replacement.
+A prompt or kind change alone does not rewrite the core graph.
 
 ## Process
 
@@ -101,7 +105,9 @@ Define, compile, run, inspect, edit.
 
 1. **Describe.** Say what the workflow should do. The manager writes the document.
 2. **Compile.** The document becomes a definition, or plain errors.
-3. **Run.** Start with an input. Each node runs when its inputs arrive.
+3. **Run.** Start with an input. Command tasks run when inputs arrive; agent
+   sessions start with the graph and remain running. Delivery to those sessions
+   awaits the node MCP and notification work.
 4. **Watch.** Read graph status, pending tasks, and committed outputs. Node
    terminal panes remain future work.
 5. **Edit.** Change the document, inspect the edit steps and retirement preview,
@@ -111,9 +117,9 @@ Define, compile, run, inspect, edit.
 
 Checkboxes indicate implementation, not completion of final release gates.
 
-- [ ] **1. Codex node definition**
+- [x] **1. Codex node definition**
 
-   Partially implemented: an `agent` binding launches noninteractive `codex exec` for each task, using the configured prompt and delivered messages. Core supplies the node's identity and workflow rules. A persistent interactive Codex session in a server-owned `portable-pty` terminal, and its node pane, remain unimplemented. The manager already uses this terminal backend; the worker task runner does not.
+   An `agent` binding launches a persistent interactive Codex session in a server-owned `portable-pty` terminal. The node runtime binds its core identity, persistent private working directory, configuration, native conversation reference, and `NodeToolContext`. Startup establishes a durable Codex conversation through its app server, then launches the interactive CLI with that exact conversation ID. Stop, process exit, definition changes, and resume reconcile these resources. An `argv` override hosts another interactive command without managed Codex conversation recovery. Node panes belong to item 12; graph calls and incoming-work delivery remain follow-up work under item 7.
 
 - [x] **2. Workspace package**
 
@@ -121,7 +127,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **3. Message package definition**
 
-   A message is `{"message":"text"}`. The contract validates it; the task harness supplies its text on stdin and records delivery receipts. Agent tasks include their configured prompt. Injecting messages into a continuing interactive Codex conversation remains part of item 1.
+   A message is `{"message":"text"}`. The contract validates it; the command task harness supplies its text on stdin and records delivery receipts. Delivering graph messages to a continuing interactive Codex conversation remains unfinished.
 
 - [x] **4. Union package definition**
 
@@ -133,11 +139,11 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **6. Node harness**
 
-   Prepares invocation context and private workspaces, delivers messages, runs agent/command tasks, captures outputs, and publishes through core. Human nodes wait for `flow.decide`; inboxes hold input without executing. Core validates publication and input consumption. The harness reconciles workers after edits and restart: stop, keep, update settings, or launch. A failed task retries with capped backoff while other tasks proceed, then parks until the manager retries or discards it; failure counts are durable. A change to the node's definition grants fresh attempts. Worker PTYs and node MCP remain separate unfinished items.
+   Prepares invocation context and private workspaces, delivers messages, runs command tasks, captures outputs, and publishes through core. Human nodes wait for `flow.decide`; inboxes hold input without executing. Core validates publication and input consumption. Workflow runtime reconciles workers after edits and restart: stop, keep, update settings, or launch. A failed command task retries with capped backoff while other tasks proceed, then parks until the manager retries or discards it; failure counts are durable. A change to the node's definition grants fresh attempts. Agent bindings use the persistent node runtime instead of the per-task harness.
 
 - [ ] **7. Node-scoped MCP interface**
 
-   Partially implemented: the node tools behind it exist in [`src/node_tool`](src/node_tool), as described in [NODE_TOOLS.md](docs/NODE_TOOLS.md). One context serves one execution at one node. It exposes the node's identity and neighbors by name, its waiting inputs and retry-aware next task, attempts that begin, read, compose, check out, submit, or fail, and grant-gated origination, deferred sending, and retirement. While an attempt stays open, its successful replies are exactly the bytes core recorded as receipts; core governs publication and accepted results. The MCP transport that relays calls, and a worker kind that hosts the tools, remain.
+   Partially implemented: the node tools behind it exist in [`src/node_tool`](src/node_tool), as described in [NODE_TOOLS.md](docs/NODE_TOOLS.md). One context serves one execution at one node. It exposes the node's identity and neighbors by name, its waiting inputs and retry-aware next task, attempts that begin, read, compose, check out, submit, or fail, and grant-gated origination, deferred sending, and retirement. While an attempt stays open, its successful replies are exactly the bytes core recorded as receipts; core governs publication and accepted results. The Codex node runtime owns and refreshes this context. The MCP transport and notification of incoming work remain.
 
 - [x] **8. Graph TUI and native management harness**
 
@@ -190,8 +196,9 @@ Checkboxes indicate implementation, not completion of final release gates.
    Attach a client to a node's terminal the way the manager terminal works today. Opening or closing a pane has no graph effect.
 
 **Build status.** The document, fixed vocabulary, translator/editor, task
-harness, and Pi surface are implemented. The remaining execution/UI work is
-interactive worker terminals (1), node-scoped MCP (7), and node panes (12).
+harness, persistent Codex runtime (1), and Pi surface are implemented. Remaining
+execution/UI work includes node-scoped MCP and incoming-work delivery (7),
+persistent-session package handoffs, and node panes (12).
 Core remains an existing dependency; no composite-production API was added.
 
 ## Session foundation
@@ -227,7 +234,7 @@ A definition is reusable configuration; starting it creates a run. Rewriting cha
 
 ## Policies and remaining work
 
-The app now makes explicit choices: broadcast each result to all successors,
+The command task harness makes explicit choices: broadcast each result to all successors,
 allow one workspace per task, retry a failed task with capped backoff and then
 park it for the manager, and apply new config at the next task boundary.
 Workspace workers currently need an outgoing edge; an inbox provides a terminal
@@ -235,8 +242,8 @@ result holder. These are app policies, not restrictions imposed by worker kinds
 or new core semantics.
 
 Remaining within the agreed scope: interactive Codex conversation delivery,
-worker terminal lifecycle, the node MCP transport over the node tools, and node
-panes.
+the node MCP transport over the node tools, package handoffs for continuing
+sessions, and node panes.
 [WORKFLOWS.md](docs/WORKFLOWS.md) describes current behavior and recovery limits.
 
 ## Tentative ideas
@@ -272,4 +279,5 @@ config changes, and worker reconciliation. See
 The remaining full acceptance flow is interactive: create two Codex nodes,
 deliver messages and workspaces through core, edit with a retirement preview,
 and attach to each worker terminal. Verify detach/restart and resumed execution.
-The current noninteractive runner and fixture tests do not complete that gate.
+Persistent-process fixtures establish lifecycle behavior, but do not complete
+that graph-communication and interactive-terminal gate.

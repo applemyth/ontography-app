@@ -6,9 +6,9 @@ inputs, run attempts at its tasks, and publish results. They live in
 execution's context. Workers name nodes and connections by their workflow
 names and pending work by opaque handles; the tools never ask for or report
 core package, activation, node, or edge identities. A transport, such as the
-node MCP of architecture item 7, lists the tools and relays calls. That
-transport and the interactive worker kind that hosts it are not implemented
-yet.
+node MCP of architecture item 7, lists the tools and relays calls. The persistent
+Codex node runtime now owns and refreshes this context; the transport that
+exposes it to the running agent remains unimplemented.
 
 ## Hosting
 

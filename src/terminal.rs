@@ -3,7 +3,7 @@
 //! `vt100` owns terminal interpretation and screen serialization. Its callbacks
 //! answer terminal queries locally, including while no client is attached.
 use crate::{AppError, Result, protocol};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -333,6 +333,180 @@ impl Drop for SocketPath {
     }
 }
 
+/// Holds the child PID until its process group has been stopped. In particular,
+/// dropping a cancelled blocking launch must not leave its child running.
+struct PtyChild {
+    child: Box<dyn Child + Send + Sync>,
+    pid: Option<nix::unistd::Pid>,
+    reaped: bool,
+    cleanup_error: Option<String>,
+}
+
+impl PtyChild {
+    fn new(child: Box<dyn Child + Send + Sync>) -> Self {
+        let pid = child
+            .process_id()
+            .map(|pid| nix::unistd::Pid::from_raw(pid as i32));
+        Self {
+            child,
+            pid,
+            reaped: false,
+            cleanup_error: None,
+        }
+    }
+
+    fn request_stop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        if let Some(pid) = self.pid {
+            // Interactive programs can put their own jobs in other process
+            // groups. The unreaped terminal leader still reserves the session
+            // identity, so only groups proven to belong to it may be stopped.
+            if let Err(error) = signal_session_groups(pid) {
+                self.cleanup_error = Some(format!("Terminal session cleanup failed: {error}"));
+            }
+            // The child has not been reaped, so its PID cannot identify a new
+            // process. Child::kill may reap internally; signal before calling
+            // any portable-pty wait/kill method instead.
+            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        } else {
+            let _ = self.child.kill();
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if !self.reaped
+            && let Some(pid) = self.pid
+        {
+            use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+            // Observe exit without releasing the PID, then stop descendants
+            // before reaping the terminal leader. A naturally exited leader
+            // must not leave background writers alive.
+            match waitid(
+                WaitId::Pid(Pid::from_raw(pid.as_raw()).expect("child PID is positive")),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            ) {
+                Ok(None) => return Ok(None),
+                Ok(Some(_)) => self.request_stop(),
+                Err(error) => {
+                    if error == rustix::io::Errno::CHILD {
+                        self.reaped = true;
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        let result = self.child.try_wait();
+        if matches!(result, Ok(Some(_))) {
+            self.reaped = true;
+        }
+        result
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.request_stop();
+        let result = self.child.wait();
+        if result.is_ok() {
+            self.reaped = true;
+        }
+        result
+    }
+}
+
+/// Stop other process groups belonging to a still-owned terminal session.
+/// The owner group is left for the caller to stop after this helper returns.
+pub(crate) fn signal_session_groups(owner: nix::unistd::Pid) -> std::io::Result<()> {
+    use nix::{
+        sys::signal::{Signal, killpg},
+        unistd::{Pid, getpgid, getpgrp, getsid},
+    };
+    use std::{collections::BTreeMap, os::fd::AsRawFd, process::Stdio, time::Instant};
+
+    // Bound process enumeration even when called from a cancellation guard.
+    // The caller can be the server or the supervisor's cleanup helper; its own
+    // process group is excluded from signals below.
+    let mut process = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let enumerated = (|| {
+        let mut reader = process.stdout.take().expect("piped process list");
+        nix::fcntl::fcntl(
+            reader.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    if let Some(status) = process.try_wait()? {
+                        return if status.success() {
+                            Ok(output)
+                        } else {
+                            Err(std::io::Error::other("process enumeration failed"))
+                        };
+                    }
+                }
+                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+            if output.len() > 1024 * 1024 || Instant::now() >= deadline {
+                return Err(std::io::Error::other(
+                    "process enumeration exceeded its limit",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })();
+    if enumerated.is_err() {
+        let _ = process.kill();
+        let _ = process.wait();
+    }
+    let output = enumerated?;
+    let mut groups = BTreeMap::new();
+    for member in String::from_utf8_lossy(&output)
+        .split_whitespace()
+        .filter_map(|pid| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 1)
+        .map(Pid::from_raw)
+    {
+        if getsid(Some(member)) == Ok(owner)
+            && let Ok(group) = getpgid(Some(member))
+            && group != owner
+            && group != getpgrp()
+        {
+            groups.insert(group, member);
+        }
+    }
+    for (group, member) in groups {
+        // Refresh membership immediately before signalling; stale enumeration
+        // alone never establishes authority over a process group.
+        if getsid(Some(member)) == Ok(owner) && getpgid(Some(member)) == Ok(group) {
+            match killpg(group, Signal::SIGKILL) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.wait();
+        }
+    }
+}
+
 pub struct Terminal {
     id: String,
     socket: SocketPath,
@@ -340,8 +514,8 @@ pub struct Terminal {
     session_id: String,
     pid: Option<u32>,
     shared: Arc<Shared>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    child: Arc<Mutex<PtyChild>>,
     input: mpsc::SyncSender<Vec<u8>>,
     attached: AtomicBool,
     graph: broadcast::Sender<Control>,
@@ -367,7 +541,7 @@ impl Terminal {
         };
         std::fs::set_permissions(&socket.path, std::fs::Permissions::from_mode(0o600))?;
         let spawn_spec = spec.clone();
-        let (master, child, mut reader, mut writer) = tokio::task::spawn_blocking(move || {
+        let (master, mut reader, mut writer, child) = tokio::task::spawn_blocking(move || {
             let pair = native_pty_system()
                 .openpty(PtySize {
                     rows: spawn_spec.rows,
@@ -410,13 +584,16 @@ impl Terminal {
                 )
                 .map_err(pty_error)?;
             }
-            let child = pair.slave.spawn_command(command).map_err(pty_error)?;
+            let child = PtyChild::new(pair.slave.spawn_command(command).map_err(pty_error)?);
             drop(pair.slave);
-            Ok::<_, AppError>((pair.master, child, reader, writer))
+            // If the launch future was cancelled, close every PTY descriptor
+            // before the child guard waits. A dying process may otherwise wait
+            // for terminal closure while its owner waits for that process.
+            Ok::<_, AppError>((pair.master, reader, writer, child))
         })
         .await
         .map_err(pty_error)??;
-        let pid = child.process_id();
+        let pid = child.pid.map(|pid| pid.as_raw() as u32);
         let (changed, _) = watch::channel(0);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -466,6 +643,9 @@ impl Terminal {
         std::thread::spawn(move || {
             let mut bytes = [0u8; 8192];
             loop {
+                if reader_shared.stopping.load(Ordering::Acquire) {
+                    break;
+                }
                 match reader.read(&mut bytes) {
                     Ok(0) => break,
                     Ok(count) => {
@@ -499,10 +679,13 @@ impl Terminal {
         let reaper_shared = shared.clone();
         std::thread::spawn(move || {
             loop {
-                let result = reaper_child
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .try_wait();
+                let (result, cleanup_error) = {
+                    let mut child = reaper_child.lock().unwrap_or_else(|p| p.into_inner());
+                    (child.try_wait(), child.cleanup_error.take())
+                };
+                if let Some(error) = cleanup_error {
+                    reaper_shared.fault(error);
+                }
                 match result {
                     Ok(Some(status)) => {
                         reaper_shared.update(|state| state.exit_code = Some(status.exit_code()));
@@ -525,7 +708,7 @@ impl Terminal {
             session_id: spec.session_id,
             pid,
             shared,
-            master: Mutex::new(master),
+            master: Mutex::new(Some(master)),
             child,
             input,
             attached: AtomicBool::new(false),
@@ -557,14 +740,16 @@ impl Terminal {
         self.master
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .process_group_leader()
+            .as_ref()
+            .and_then(|master| master.process_group_leader())
     }
 
     pub fn tty_name(&self) -> Option<PathBuf> {
         self.master
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .tty_name()
+            .as_ref()
+            .and_then(|master| master.tty_name())
     }
 
     /// Recover the virtual terminal when an abruptly killed foreground owner
@@ -651,6 +836,8 @@ impl Terminal {
         self.master
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .ok_or_else(|| AppError::new("terminal_stopping", "This terminal is stopping"))?
             .resize(PtySize {
                 rows,
                 cols,
@@ -846,60 +1033,52 @@ impl Terminal {
         outcome
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
+    /// Stop the process even when attachment or observation handles still hold
+    /// the terminal. Safe to use in an execution's cancellation/drop guard.
+    pub fn request_stop(&self) {
         self.shutdown.send_replace(true);
-        let child = self.child.clone();
-        let pid = self.pid;
-        let reaping = tokio::task::spawn_blocking(move || {
-            let mut child = child.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(status) = child.try_wait()? {
-                return Ok::<_, std::io::Error>(status);
-            }
-            if let Some(pid) = pid {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGHUP,
-                );
-            }
-            child.kill()?;
-            if let Some(pid) = pid {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            child.wait()
-        });
-        let status = tokio::time::timeout(Duration::from_secs(3), reaping)
-            .await
-            .map_err(|_| AppError::new("terminal_stop_timeout", "Terminal termination did not finish within three seconds; inspect its process before retrying"))?
-            .map_err(pty_error)??;
-        self.shared
-            .update(|state| state.exit_code = Some(status.exit_code()));
         self.shared.stopping.store(true, Ordering::Release);
         let _ = self.input.try_send(Vec::new());
+        let cleanup_error = {
+            let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+            child.request_stop();
+            child.cleanup_error.take()
+        };
+        if let Some(error) = cleanup_error {
+            self.shared.fault(error);
+        }
+        // Closing a process's terminal cannot depend on every view releasing
+        // its Arc. The reader/writer also stop; their cloned descriptors close
+        // as those threads finish.
+        self.master.lock().unwrap_or_else(|p| p.into_inner()).take();
         self.socket.remove();
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.request_stop();
+        let mut changed = self.shared.changed.subscribe();
+        // The existing reaper owns waiting. Holding the child's mutex across a
+        // blocking wait would prevent request_stop/Drop from releasing a stuck
+        // terminal after the timeout.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if self.status().exit_code.is_some() {
+                    break;
+                }
+                if changed.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+            .await
+            .map_err(|_| AppError::new("terminal_stop_timeout", "Terminal termination did not finish within three seconds; inspect its process before retrying"))?;
         Ok(())
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        self.shutdown.send_replace(true);
-        self.shared.stopping.store(true, Ordering::Release);
-        let _ = self.input.try_send(Vec::new());
-        if let Ok(mut child) = self.child.lock()
-            && matches!(child.try_wait(), Ok(None))
-        {
-            let _ = child.kill();
-            if let Some(pid) = self.pid {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            let _ = child.wait();
-        }
+        self.request_stop();
     }
 }
 
@@ -1406,6 +1585,139 @@ mod tests {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
             Err(nix::errno::Errno::ESRCH)
         );
+    }
+
+    #[tokio::test]
+    async fn stop_terminates_an_attached_terminal_with_retained_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (spec, socket) = fixture(directory.path(), "trap '' HUP; read line");
+        let terminal = Terminal::launch(spec, socket.clone()).await.unwrap();
+        let retained = terminal.clone();
+        let _attachment = attach(&terminal).await;
+        let pid = terminal.status().pid.unwrap();
+
+        terminal.request_stop();
+        drop(terminal);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while retained.status().exit_code.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!retained.status().running);
+        assert!(!socket.exists());
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        retained.request_stop();
+        retained.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn naturally_exited_terminal_stops_its_background_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (spec, socket) = fixture(
+            directory.path(),
+            "trap '' HUP; set -m; sleep 60 & printf '%s' \"$!\" > descendant.pid; exit 0",
+        );
+        let terminal = Terminal::launch(spec, socket).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while terminal.status().exit_code.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pid = std::fs::read_to_string(directory.path().join("descendant.pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(terminal.status().exit_code, Some(0));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                != Err(nix::errno::Errno::ESRCH)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        terminal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_terminal_also_stops_jobs_in_other_groups_of_its_session() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (spec, socket) = fixture(
+            directory.path(),
+            "trap '' HUP TERM; set -m; sleep 60 & printf '%s' \"$!\" > job.pid; wait",
+        );
+        let terminal = Terminal::launch(spec, socket).await.unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(directory.path().join("job.pid"))
+                    && let Ok(pid) = pid.parse::<i32>()
+                {
+                    break nix::unistd::Pid::from_raw(pid);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let owner = nix::unistd::Pid::from_raw(terminal.status().pid.unwrap() as i32);
+        assert_eq!(nix::unistd::getsid(Some(job)).unwrap(), owner);
+        assert_ne!(nix::unistd::getpgid(Some(job)).unwrap(), owner);
+        terminal.request_stop();
+        terminal.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while nix::sys::signal::kill(job, None) != Err(nix::errno::Errno::ESRCH) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            terminal.status().fault.is_none(),
+            "{:?}",
+            terminal.status().fault
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_blocking_launch_result_kills_and_reaps_its_child() {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = mpsc::channel();
+        let launching = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+                let mut command = CommandBuilder::new("/bin/sh");
+                command.args(["-c", "trap '' HUP; exec sleep 60"]);
+                let child = PtyChild::new(pair.slave.spawn_command(command).unwrap());
+                started.send(child.pid.unwrap()).unwrap();
+                wait_release.recv().unwrap();
+                // The receiver was cancelled while spawning. Its undelivered
+                // value must still own process cleanup, as Terminal::launch does.
+                (pair, child)
+            })
+            .await
+        });
+        let pid = ready.await.unwrap();
+        launching.abort();
+        assert!(matches!(launching.await, Err(error) if error.is_cancelled()));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while nix::sys::signal::kill(pid, None) != Err(nix::errno::Errno::ESRCH) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

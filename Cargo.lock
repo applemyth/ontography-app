@@ -2773,7 +2773,6 @@ dependencies = [
  "ontography-calculus",
  "ontography-content",
  "ontography-runtime",
- "ontography-workspace",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2816,7 +2815,6 @@ dependencies = [
  "ontography-calculus",
  "ontography-content",
  "ontography-runtime",
- "ontography-workspace",
 ]
 
 [[package]]
@@ -2832,18 +2830,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
- "uuid",
-]
-
-[[package]]
-name = "ontography-workspace"
-version = "0.1.0"
-dependencies = [
- "ontography-content",
- "reflink-copy",
- "thiserror 2.0.20",
- "tokio",
- "unicode-normalization",
  "uuid",
 ]
 
