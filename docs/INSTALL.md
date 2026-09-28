@@ -123,6 +123,11 @@ npm test
 
 Pi development dependencies are local and pinned. Tests use temporary stores, Unix sockets, PTYs, and local iroh endpoints; environments that prohibit these resources need the relevant execution permission. Most tests make no model calls.
 
-Builds embed app/core source fingerprints. Clients require the server's exact app/core builds; persistent runs require their stored core build and declaration identities. There is no cross-core-build migration. Use the matching client to stop an older server before changing app builds; stopping it does not change its saved core format.
+Builds embed app/core source fingerprints. Clients require the server's exact app/core builds; rebuilding the executable does not replace a running server. After a rebuild, use `ontography server stop` with the same data directory, then retry your command to start the current build. Explicit shutdown accepts a different app/core build when its wire protocol matches; ordinary commands still require an exact build match. Shutdown suspends graph resources and stops managers while preserving saved state. Persistent runs still require their stored core build and declaration identities; stopping the server does not migrate saved core data.
 
 For startup failures, inspect the Pi version, project/data paths, `server status`, and the server log. Missing previously saved conversation history is reported explicitly. Empty initial conversations have reserved IDs and can be resumed before Pi writes their first history file.
+
+Session recovery errors name the record that could not be loaded. A session
+directory without `session.json` is not a recoverable session, even if runtime
+cache files remain inside it. These directories are retained for inspection;
+healthy sessions remain available.

@@ -6,6 +6,37 @@ fn declaration() -> Value {
 }
 
 #[tokio::test]
+async fn missing_session_record_names_its_path_and_preserves_remaining_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths::initialize(directory.path().join("data")).unwrap();
+    let sessions = ontography_app::sessions::Sessions::open(&paths).unwrap();
+    let healthy = sessions
+        .create(directory.path().into(), None)
+        .await
+        .unwrap();
+    let missing = uuid::Uuid::new_v4().to_string();
+    let orphan = paths.root.join("sessions").join(&missing);
+    let cache = orphan.join("runtimes/cache");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, b"retained runtime data").unwrap();
+    drop(sessions);
+
+    let recovered = ontography_app::sessions::Sessions::open(&paths).unwrap();
+    assert_eq!(recovered.list().await.len(), 1);
+    assert_eq!(recovered.list().await[0].session_id, healthy.session_id);
+    let error = &recovered.recovery_errors[&missing];
+    assert_eq!(error.code, "io_error");
+    assert!(
+        error
+            .message
+            .contains(orphan.join("session.json").to_str().unwrap())
+    );
+    assert_eq!(std::fs::read(cache).unwrap(), b"retained runtime data");
+    assert!(!orphan.join("session.json").exists());
+    let _ = std::fs::remove_dir(paths.socket.parent().unwrap());
+}
+
+#[tokio::test]
 async fn malformed_partial_and_missing_manifests_do_not_block_healthy_runs() {
     let directory = tempfile::tempdir().unwrap();
     let paths = Paths::initialize(directory.path().join("data")).unwrap();

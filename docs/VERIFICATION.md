@@ -1,5 +1,19 @@
 # Verification
 
+## Rebuild recovery and explicit server shutdown — 2026-09-27
+
+Passed: **242 app Rust tests** (`cargo test --locked --quiet`), all-target
+Clippy with warnings denied, formatting, and `git diff --check`.
+
+- Ordinary connections still reject a different app/core build before sending
+  operations. CLI tests cover `ls`, `server status`, and `server start`.
+- Explicit `server stop` can shut down an older build with the same wire
+  protocol. The request targets the server instance observed in its handshake;
+  mismatched protocol versions and identities still fail. Automatic startup
+  does not stop or replace an incompatible server.
+- Missing session records name their exact path in recovery errors. Healthy
+  sessions still load, and orphaned runtime files remain untouched.
+
 ## Persistent Codex app-server and incoming messages — 2026-09-27
 
 Passed: **239 app Rust tests** and **4 opt-in native Codex tests**, run

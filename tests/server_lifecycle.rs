@@ -315,6 +315,126 @@ async fn incompatible_server_handshake_is_reported_before_any_operation() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn cli_can_explicitly_stop_an_old_build_without_allowing_other_operations() {
+    let fixture = Fixture::new();
+    let listener = UnixListener::bind(&fixture.paths.socket).unwrap();
+    let (requests, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Request = serde_json::from_slice(
+                &protocol::read_frame(&mut BufReader::new(&mut stream))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let result = match request.operation.as_str() {
+                "system.hello" => json!({
+                    "protocol_version":protocol::VERSION,"server_id":"old-server",
+                    "app_version":"old-app","core_version":"old-core",
+                    "app_build":"old-app-build","core_build":"old-core-build"
+                }),
+                "server.stop" => {
+                    assert_eq!(request.expected_server_id.as_deref(), Some("old-server"));
+                    assert!(request.app_session_id.is_none());
+                    assert_eq!(request.args, json!({}));
+                    json!({"stopped":true})
+                }
+                other => panic!("an incompatible client dispatched {other}"),
+            };
+            protocol::write_frame(
+                &mut stream,
+                &Response::new("old-server", &request.request_id, Ok(result)),
+            )
+            .await
+            .unwrap();
+            requests.send(request.operation.clone()).unwrap();
+            if request.operation == "server.stop" {
+                break;
+            }
+        }
+    });
+    for args in [
+        vec!["ls"],
+        vec!["server", "status"],
+        vec!["server", "start"],
+    ] {
+        let output = Command::new(BIN)
+            .arg("--data-dir")
+            .arg(&fixture.paths.root)
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("incompatible_server"), "{error}");
+        assert!(error.contains("ontography server stop"), "{error}");
+    }
+    assert_eq!(
+        command(&fixture.paths.root, &["server", "stop"]).await,
+        json!({"stopped":true})
+    );
+    server.await.unwrap();
+    let mut methods = Vec::new();
+    while let Some(method) = observed.recv().await {
+        methods.push(method);
+    }
+    assert_eq!(
+        methods,
+        [
+            "system.hello",
+            "system.hello",
+            "system.hello",
+            "system.hello",
+            "server.stop"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn explicit_shutdown_still_requires_matching_protocol_and_server_identity() {
+    for (version, identity) in [
+        (protocol::VERSION + 1, "old-server"),
+        (protocol::VERSION, "different-server"),
+    ] {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = directory.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Request = serde_json::from_slice(
+                &protocol::read_frame(&mut BufReader::new(&mut stream))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(request.operation, "system.hello");
+            protocol::write_frame(
+                &mut stream,
+                &Response::new(
+                    "old-server",
+                    &request.request_id,
+                    Ok(json!({
+                        "protocol_version":version,"server_id":identity,
+                        "app_build":"old-app-build","core_build":"old-core-build"
+                    })),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            Client::stop_server(&socket).await.unwrap_err().code,
+            "protocol_error"
+        );
+        server.await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completing_one_request_does_not_drop_the_partial_frame_of_the_next() {
     let fixture = Fixture::new();

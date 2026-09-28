@@ -109,7 +109,15 @@ impl Sessions {
                 continue;
             }
             let loaded = (|| {
-                let mut record: SessionRecord = read_json(&entry.path().join("session.json"))?;
+                let manifest = entry.path().join("session.json");
+                let mut record: SessionRecord = read_json(&manifest).map_err(|mut error| {
+                    error.message = format!(
+                        "Cannot load session record {}: {}",
+                        manifest.display(),
+                        error.message
+                    );
+                    error
+                })?;
                 uuid(&record.session_id, "session_id")?;
                 if record.version != 1
                     || entry.file_name() != std::ffi::OsStr::new(&record.session_id)

@@ -18,6 +18,27 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(socket: impl AsRef<Path>) -> Result<Self> {
+        let (client, hello) = Self::handshake(socket).await?;
+        if hello["app_version"] != env!("CARGO_PKG_VERSION")
+            || hello["core_version"] != ontography::VERSION
+            || hello["app_build"] != crate::APP_BUILD
+            || hello["core_build"] != crate::CORE_BUILD
+        {
+            return Err(AppError::new("incompatible_server", "the existing server uses a different app/core build; run `ontography server stop` with the same --data-dir, then retry to start the current build")
+                .details(serde_json::json!({"server_id":client.server_id,"expected_app":env!("CARGO_PKG_VERSION"),"actual_app":hello["app_version"],"expected_core":ontography::VERSION,"actual_core":hello["core_version"],"expected_app_build":crate::APP_BUILD,"actual_app_build":hello["app_build"],"expected_core_build":crate::CORE_BUILD,"actual_core_build":hello["core_build"]})));
+        }
+        Ok(client)
+    }
+
+    /// Explicit administrative shutdown needs compatible framing and server
+    /// identity, but no app/core data compatibility. Never expose this connection
+    /// to callers for arbitrary operations or use it during automatic startup.
+    pub async fn stop_server(socket: impl AsRef<Path>) -> Result<Value> {
+        let (client, _) = Self::handshake(socket).await?;
+        client.call("server.stop", serde_json::json!({})).await
+    }
+
+    async fn handshake(socket: impl AsRef<Path>) -> Result<(Self, Value)> {
         let mut client = Self {
             socket: socket.as_ref().into(),
             client_id: uuid::Uuid::new_v4().to_string(),
@@ -41,21 +62,16 @@ impl Client {
         })??;
         client.server_id = response.server_id.clone();
         let hello = response.into_result()?;
-        if hello["protocol_version"] != VERSION || hello["server_id"] != client.server_id {
+        if client.server_id.is_empty()
+            || hello["protocol_version"] != VERSION
+            || hello["server_id"] != client.server_id
+        {
             return Err(AppError::new(
                 "protocol_error",
                 "server handshake identity/version mismatch",
             ));
         }
-        if hello["app_version"] != env!("CARGO_PKG_VERSION")
-            || hello["core_version"] != ontography::VERSION
-            || hello["app_build"] != crate::APP_BUILD
-            || hello["core_build"] != crate::CORE_BUILD
-        {
-            return Err(AppError::new("incompatible_server", "the existing server uses a different app/core build; use its matching client or explicitly stop it before upgrading")
-                .details(serde_json::json!({"server_id":client.server_id,"expected_app":env!("CARGO_PKG_VERSION"),"actual_app":hello["app_version"],"expected_core":ontography::VERSION,"actual_core":hello["core_version"],"expected_app_build":crate::APP_BUILD,"actual_app_build":hello["app_build"],"expected_core_build":crate::CORE_BUILD,"actual_core_build":hello["core_build"]})));
-        }
-        Ok(client)
+        Ok((client, hello))
     }
 
     pub fn server_id(&self) -> &str {

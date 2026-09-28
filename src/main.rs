@@ -189,23 +189,15 @@ async fn run(cli: Cli) -> Result<()> {
             result
         }
         Some(Action::Server { action }) => {
+            if matches!(action, ServerAction::Stop) {
+                return print(Client::stop_server(&paths.socket).await?);
+            }
             let client = if matches!(action, ServerAction::Start) {
                 launcher::ensure_server(&paths).await?
             } else {
                 Client::connect(&paths.socket).await?
             };
-            print(
-                client
-                    .call(
-                        if matches!(action, ServerAction::Stop) {
-                            "server.stop"
-                        } else {
-                            "system.status"
-                        },
-                        json!({}),
-                    )
-                    .await?,
-            )
+            print(client.call("system.status", json!({})).await?)
         }
         Some(Action::Call {
             operation,
