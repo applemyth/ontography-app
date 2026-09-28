@@ -160,7 +160,13 @@ ontography session attach SESSION_UUID
 
 Adoption preserves its run ID and history. Pi state begins with the new app session unless history is explicitly imported. Ownership is never inferred from project paths, names, or old transcripts.
 
-Each run retains the rewrite grammar supplied at creation. An empty grammar still prevents topology edits. The default app grammar is deferred until concrete node/edge/package definitions exist. Editing a saved declaration cannot retrofit a runtime's grammar.
+A declaration sets which edits its run accepts: `"edits": "fixed"`, the default, keeps the graph as declared, and `"any"` accepts any edit core admits. `rewrite.prepare` takes an explicit edit as its `request`. [examples/remove-receiver.json](../examples/remove-receiver.json) removes node `B` and its edge from [examples/flow.json](../examples/flow.json):
+
+```json
+{"remove_nodes": ["B"], "remove_edges": ["A_to_B"]}
+```
+
+Removing a node requires removing its edges. `add` holds new nodes and edges, with identities never used in the run, and their roots and authority transitions; a surviving node or edge cannot change, so replace it instead. An edit the run's `edits` do not allow reports `edit_denied`. New declarations cannot contain rewrite productions; runs saved with them still open, but their graphs are fixed. A run keeps the declaration it started with, so editing a saved declaration does not change what a running graph accepts.
 
 ## Lifecycle and recovery
 

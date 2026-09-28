@@ -1,6 +1,6 @@
 # Session design and implementation
 
-**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions, the fixed editing grammar, persistent Codex worker sessions, and node-scoped MCP are implemented. Incoming work is delivered through persistent Codex app-servers; Enter in the graph opens the selected agent's terminal. [VERIFICATION.md](VERIFICATION.md) records release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
+**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions and edits, persistent Codex worker sessions, and node-scoped MCP are implemented. Incoming work is delivered through persistent Codex app-servers; Enter in the graph opens the selected agent's terminal. [VERIFICATION.md](VERIFICATION.md) records release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
 
 ## Ownership invariant
 
@@ -41,7 +41,7 @@ The worker relationship is node → execution → PTY → client view. Each node
 
 `session new --no-attach` creates records without starting Pi. Existing runs require explicit adoption into an uninitialized session with the same project; no old Pi ownership is inferred.
 
-Node creation commits through core's configured grammar, then reconciles agent execution. Initial graphs provision their agent sessions on startup. A startup failure preserves committed graph state and remains visible for recovery with `flow.resume`. Agent config changes restart its process; graph grants and scope update in place. Opening a worker view does not create a node, edge, or package delivery. See [WORKFLOWS.md](WORKFLOWS.md) for session configuration and delivery limits.
+Node creation commits through one core graph edit under the workflow edit policy, then reconciles agent execution. Initial graphs provision their agent sessions on startup. A startup failure preserves committed graph state and remains visible for recovery with `flow.resume`. Agent config changes restart its process; graph grants and scope update in place. Opening a worker view does not create a node, edge, or package delivery. See [WORKFLOWS.md](WORKFLOWS.md) for session configuration and delivery limits.
 
 ## Pi integration
 
@@ -69,7 +69,7 @@ The migration command implements an exclusive journaled cutover: archive existin
 
 Initialization persists the chosen run ID, operation arguments, resolved definition, and initial application input before core creation. Recovery handles an intent without a run, an empty reserved directory, or an existing run awaiting session binding. Existing application state resumes without replaying its fresh input. Unopenable partial core storage remains an explicit error.
 
-Accepted vocabulary additions are stored in each run's `extensions.json`, with one pending intent persisted before the core commit. Recovery resolves whether that commit occurred before launching workers and reconstructs the extended binding. The original declaration and rewrite grammar remain fixed. See [CORE_UPDATE.md](CORE_UPDATE.md).
+A run's vocabulary, including its node types, is fixed when it is created. The earlier `extensions.json` journal for vocabulary additions was removed; [CORE_UPDATE.md](CORE_UPDATE.md) records it.
 
 General accepted-operation receipts remain bounded and server-instance-local. Session initialization has a durable intent; arbitrary mutations do not gain automatic durable replay. After server replacement, refresh graph state and reconcile unknown outcomes. Prepared rewrites, invocation capabilities, and other live handles expire.
 
@@ -98,7 +98,7 @@ The same backend hosts management and worker terminals. Worker view integration 
 1. Wake continuing agent sessions when graph work arrives; tools already support discovering and processing it.
 2. Verify a full interactive multi-agent project flow against live models.
 3. Specify explicit app-session fork/archive/delete, complete artifact-backed export, and optional viewer/takeover behavior.
-4. Runs need the desired grammar at creation. Live grammar replacement remains unavailable; `run.extend` only adds vocabulary and trusted contracts. This WIP uses fresh runs instead of migrating empty-grammar runs.
+4. Runs need their accepted edits and node types declared at creation; neither can be replaced on a live run. This WIP uses fresh runs instead of migrating fixed-graph runs.
 
 ## Historical baseline
 

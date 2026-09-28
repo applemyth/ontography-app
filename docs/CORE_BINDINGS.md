@@ -22,23 +22,37 @@ harness handles initial input and workspace preparation. The older native
 
 Nodes place components, using core's project model (`ontography::project`).
 Built-in and library components implement `ProjectComponent`: each
-`ComponentDescription` gives the node's core node type, and `bind` turns the
+`ComponentDescription` gives the node's core node types, and `bind` turns the
 placement's settings into a `BoundComponent`, the trusted implementation kind
 and exact configuration. Library and document specifications load through a
 `ComponentProvider` named `ontography`. The bound kind and configuration
 become the node's execution binding. A run stores its bindings with its
 document, so a later library change reaches a node only through an edit.
 
-Each node's role is its core node type: `Agent`, `Command`, `Human`, or
-`Inbox`, all declared in the run's schema. Every node shares one result
-contract, edge rule, and authority tag, and connections require no endpoint
-type. Core matches a rewrite's nodes exactly, so the fixed grammar has one
-rule for each node type, ingress (`any`/`all`), and root variant: 448
-productions, including self loops. A node's type never changes; an edit to
-another type replaces the node. Runs created before node types keep one
-shared `WorkflowNode` type and their original 40 productions, which the app
-reads from the run's schema. Reusable documents live under
-`definitions/workflows/<revision>.json`, separately from legacy graph drafts.
+A binding carries the node's types: labels such as `Agent` or `Reviewer` that
+core records on the node. Built-in components give one each (`Agent`,
+`Command`, `Human`, or `Inbox`); library and document specifications may add
+more, which accumulate along `extends` chains. Types never choose behavior;
+the implementation does. A new run's schema declares every type any component
+in its catalog can give, placed or not, so later edits can place any of them;
+an edit that needs an undeclared type fails with `unknown_node_type`. Every
+node shares one result contract, edge rule, and authority tag, and connections
+require no endpoint type. A node keeps its types, join, and entry status for
+life: an edit that changes any of them replaces the node. Runs created before
+node types keep one shared `WorkflowNode` type on every node, which their
+connections require at both ends; the app reads this from the run's schema.
+Reusable documents live under `definitions/workflows/<revision>.json`,
+separately from legacy graph drafts.
+
+A workflow edit is one explicit core `GraphEdit`: it adds the target's nodes
+and connections that core lacks and removes those the target lacks. Workflow
+runs admit edits under the policy in [`edit.rs`](../src/workflow/edit.rs):
+only principal `workflow`, the app's editor, may edit, and only into a
+workflow. Added nodes produce workflow payloads, added edges are
+`WorkflowConnection`s carrying workflow payloads under the `workflow`
+authority tag, no edit changes authority, and the graph keeps exactly one
+entry, with workflow authority. Other principals are denied. Runs created
+before node types are edited the same way.
 
 The app persists its document, identity map, and edit intentions alongside
 core storage. It never reads or modifies core's private SQLite representation.
@@ -59,7 +73,7 @@ Schemas are available through the session-scoped `system.hello` handshake.
 | `flow.start` | Document or revision, message or workspace directory → run | `GraphDeclaration`, persistent runtime/session, reserved initialization, app worker bindings. |
 | `flow.status` | Run → document, named graph, pending edit, worker state, tasks, failures | Current kernel/frontier, app edit state, hosted execution status, per-node retry ledgers. |
 | `flow.output` | Node and optional task/work selection → ready input, last result, or inbox page | Accepted invocation/publication evidence, bounded pending queries, and content reads. |
-| `flow.edit` | Updated document → plan and exact retirement preview | Cloned state and configured core rewrite preparation. |
+| `flow.edit` | Updated document → plan, count of graph changes, and exact retirement preview | `SessionHandle::prepare_rewrite` of one `GraphEdit`, without committing it. |
 | `flow.commit` | Plan ID → completed or recoverable edit | Revision-fenced `SessionHandle::prepare_rewrite` / `commit_rewrite`, persisted target and identities. |
 | `flow.resume` | Run → recovered edit and restarted workers | Core reopening, saved target recovery, worker reconciliation. |
 | `flow.decide` | Human node/task ID, message or saved workspace → publication | Node-bound invocation, accepted result and outgoing emissions. |
@@ -93,11 +107,22 @@ rewrite list/inspect, and unused workspace operations are removed. Internal
 workspace import/restore remain available to `flow.workspace` without public
 registrations.
 
-The backend retains graph declaration, run lifecycle, configured rewrite
+The backend retains graph declaration, run lifecycle, rewrite
 prepare/commit/discard, workflow/inspection, hosted execution, and six workspace
 operations (open, checkout, capture, checkpoint, release, list). They serve
 existing infrastructure and tests. Raw mutations reject document-owned runs,
 so they cannot bypass a saved edit or publish outside the workflow harness.
+
+A graph or application declaration sets which edits its run accepts:
+`"edits": "fixed"`, the default, keeps the graph as declared, and `"any"`
+accepts any edit core admits. `rewrite.prepare` takes an explicit edit as
+`request`: `remove_nodes`, `remove_edges`, and an `add` fragment of `nodes`,
+`edges`, `roots`, and `authority_transitions`. Removing a node requires
+removing its edges; added nodes and edges take identities never used in the
+run, and only they may carry definitions, roots, or transitions. The edit is
+made as principal `operator`; one the policy refuses reports `edit_denied`. New
+declarations with rewrite productions are rejected; declarations saved with
+them keep their fingerprints and still open, but their graphs are fixed.
 
 Package resolution/retention, workspace checkout/capture, invocation context,
 and execution supervision remain necessary capabilities. Checkout/capture is
@@ -109,7 +134,8 @@ The native application module also remains available internally; its project
 tool wrappers do not.
 
 Implementation: [document](../src/workflow/document.rs),
-[grammar](../src/workflow/grammar.rs), [editor](../src/workflow/edit.rs),
+[components](../src/workflow/components/mod.rs),
+[editor and edit policy](../src/workflow/edit.rs),
 [runtime ownership](../src/workflow/runtime.rs),
 [persistent node runtime](../src/node_runtime/mod.rs),
 [Codex session launcher](../src/node_runtime/codex.rs),
@@ -144,14 +170,18 @@ Implementation: [document](../src/workflow/document.rs),
 
 ## Edit recovery and artifact export
 
-Before the first edit transition, the app saves the target document, its
-allocated identities, and approved retirements. Each core transition is
-atomic; the complete edit is not. Existing workers continue while steps apply.
-Recovery compares the saved target with the actual core graph, prepares the
-next step at the current revision, and resumes forward. It cannot undo
-retirements. Additional retirements stop recovery for a fresh preview of the
-same target. The last completed document is replaced only after all steps
-succeed; worker reconciliation then applies the new bindings.
+Before changing core, the app saves the target document, its allocated
+identities, and approved retirements. The edit is one atomic core transition,
+and existing workers continue while it is prepared and committed. Recovery
+computes the edit again from the actual core graph and finds either the whole
+edit or nothing left to do. A commit that worker activity makes stale is
+prepared again; after eight stale attempts, recovery stops with
+`workflow_busy` and keeps the saved intention. It cannot undo retirements.
+Additional retirements stop recovery for a fresh preview of the same target
+(`retirement_preview_required`). A settings-only edit never repairs unexpected
+graph changes (`workflow_drift`). The last completed document is replaced only
+after the edit succeeds; worker reconciliation then applies the new bindings.
+Plans saved with the earlier `steps` count still load.
 
 Accepted initial input is not replayed merely because an app completion cache
 was lost. Publication/output recovery checks accepted core invocations. This
@@ -225,9 +255,11 @@ acceptance run with live models remains outstanding.
 
 Other existing limits remain:
 
-- Grammar replacement and live vocabulary extension are not app operations.
-  The vocabulary and grammar are fixed at creation. Previously extended runs
-  are not supported by the fixed-definition reopening path.
+- Changing a run's declared `edits` and live vocabulary extension are not app
+  operations. A run's vocabulary, including its node types, is fixed at
+  creation; an edit that needs an undeclared type fails with
+  `unknown_node_type`. Previously extended runs are not supported by the
+  fixed-definition reopening path.
 - Some historical inspection adapters materialize a full snapshot before
   returning bounded results.
 - Workspace checkout needs supported OS copy-on-write behavior. Read-only
@@ -245,8 +277,9 @@ Other existing limits remain:
 | Boundary | Tests |
 | --- | --- |
 | Document validation, common annotations, binding expansion | [document tests](../src/workflow/document.rs) |
-| Every allowed ingress/root variant and self loop in the fixed grammar | [grammar tests](../src/workflow/grammar.rs) |
-| Retirement previews, stale plans, partial edits, saved-target recovery | [editor tests](../src/workflow/edit.rs), [workflow recovery](../tests/workflow_recovery.rs) |
+| Node types, identity across type changes, declared vocabulary, and the workflow edit policy | [editor tests](../src/workflow/edit.rs), [component tests](../src/workflow/components/mod.rs) |
+| Retirement previews, stale plans, interrupted edits, saved-target recovery | [editor tests](../src/workflow/edit.rs), [workflow recovery](../tests/workflow_recovery.rs) |
+| Declared `edits`, explicit graph edits, declarations saved with productions | [declaration tests](../src/declarations.rs), [retirement tests](../tests/retirement.rs) |
 | Command → human → inbox, config changes, added workers, repeated commits | [workflow flow](../tests/workflow_flow.rs) |
 | Repeated reviews, exact inbox selection, pagination, structured failure status | [workflow outputs](../tests/workflow_outputs.rs) |
 | Task execution, cancellation, failures, process supervision, workspace constraints | [harness tests](../src/workflow/harness.rs), [supervisor tests](../src/process/) |

@@ -7,15 +7,15 @@ preserve references from other documents; build order is stated separately.
 ## Goal
 
 Run Codex nodes in managed terminals, exchange message and workspace packages
-through governed edges, and edit the live graph through core's rewrite rules.
-Pi manages the graph using Ontography tools. Core supplies admission, contracts,
-authority, package/workflow state, and persistence.
+through governed edges, and edit the live graph through explicit core graph
+edits. Pi manages the graph using Ontography tools. Core supplies admission,
+contracts, authority, package/workflow state, and persistence.
 
 ## Current scope
 
 - The original pieces 1–8: Codex node, workspace/message/union definitions,
   edges, node harness, node MCP, and the Pi management/session foundation.
-- A document and compiler to assemble those pieces, with the app edit grammar
+- A document and compiler to assemble those pieces, with the app edit policy
   and a diff/retirement preview.
 - Process reconciliation and node terminal views.
 
@@ -32,7 +32,7 @@ unchanged by this work.
 ```text
 manager (Pi)
  └─ workflow document          named nodes, settings, joins, connections
-     ├─ translator → core      graph declaration + fixed rewrite grammar
+     ├─ translator → core      graph declaration + workflow edit policy
      ├─ agent → node runtime   Codex app-server + native PTY client + queued input + scoped tools
      ├─ other kinds → harness command tasks, human decisions, inboxes
      └─ editor → core          preview changes, save target, apply/recover
@@ -45,7 +45,7 @@ core commits graph and package state; workflow runtime reconciles worker process
 | Shell + UI | Where you sit. Attach, detach, look at the graph and the panes. | 8, 12 | Manager terminal, graph view, and selected agent terminal implemented. |
 | Manager | Creates documents, starts runs, reads status, and requests edits. | 8, 11 | Document tools and Pi allowlist implemented. |
 | Workflow document | Named nodes placing components with settings, joins, directed edges, and entry. | 10 | Implemented. |
-| Compiler + library | Fixed vocabulary, declaration expansion, edit grammar, and diff. | 2–5, 9 | Implemented using existing core APIs. |
+| Compiler + library | Fixed vocabulary, declaration expansion, edit policy, and diff. | 2–5, 9 | Implemented using existing core APIs. |
 | Core | Enforces graph and package/workflow semantics. | — | Existing dependency; no additions in scope. |
 | Nodes | Host continuing agents or execute tasks using scoped graph tools. | 1, 6, 7 | Persistent Codex server, attached PTY client, incoming conversation messages, task harness, selected tools, and MCP implemented. |
 
@@ -85,27 +85,30 @@ The app supplies the initial vocabulary and defaults.
   `claude` presets, in a terminal or headless), `command`, `human`, and
   `inbox`. The user's `library.json` and a document's own `components` add
   components that extend these with defaults, and MCP servers by name.
-- Node types, one per role: `Agent`, `Command`, `Human`, and `Inbox`.
+- Node types: each built-in component gives one (`Agent`, `Command`, `Human`,
+  or `Inbox`); library and document components can add more, such as
+  `Reviewer`.
 - Package types: `workspace` (item 2), `message` (item 3), `union` (item 4).
 - One edge rule accepting `union` (item 5).
 - One implicit authority tag on every edge and root.
-- One fixed grammar installed on every document run: add/remove nodes and
-  add/remove connections, including self loops. Replacement uses removal and
-  addition (item 9).
+- One edit policy on every document run: only the app's workflow editor may
+  edit it, and only into a workflow. An edit adds and removes nodes and
+  connections, including self loops, in one transition. Replacement uses
+  removal and addition (item 9).
 
-Each node's role is its core node type; every node shares the result contract,
-edge rule, and tag. A component binds a node to a trusted implementation and
-exact configuration, which become its execution binding. Core matches rewrite
-nodes exactly, so the core variants come from node type, join (`any`/`all`),
-and root status. The generated grammar has 448 productions: 32 node rules, 384
-connection rules, and 32 self-loop rules. Runs created before node types keep
-one shared type and their original 40 rules.
+Node types label what a node is; its implementation decides what runs. Every
+node shares the result contract, edge rule, and tag. A component binds a node
+to a trusted implementation and exact configuration, which become its execution
+binding. A new run declares every type its components can give, so later edits
+can place any of them. A node keeps its types, join (`any`/`all`), and entry
+status for life; changing any of them replaces the node. Runs created before
+node types keep one shared `WorkflowNode` type.
 
 Command config changes take effect on the next task. A change to an agent's
 binding stops and replaces the running session process, preserving its recorded
 conversation and working directory. Grants and topology refresh its tooling
-scope in place. A settings change alone does not rewrite the core graph;
-changing a node's type replaces its core node.
+scope in place. A settings change alone does not change the core graph;
+changing a node's types replaces its core node.
 
 ## Process
 
@@ -118,8 +121,9 @@ Define, compile, run, inspect, edit.
    and process it through MCP tools.
 4. **Watch.** Read graph status, pending tasks, and committed outputs. Select an
    agent in the graph and press Enter to use its terminal.
-5. **Edit.** Change the document, inspect the edit steps and retirement preview,
-   and commit. Reconcile node processes with the committed graph.
+5. **Edit.** Change the document, inspect the edit's graph changes and
+   retirement preview, and commit. Reconcile node processes with the committed
+   graph.
 
 ## Pieces
 
@@ -171,9 +175,9 @@ Checkboxes indicate implementation, not completion of final release gates.
 
    | Core capability | Responsibility |
    | --- | --- |
-   | Definitions/admission | Validate the generated schema, graph, contracts, authority rules, and rewrite grammar. |
+   | Definitions/admission | Validate the generated schema, graph, contracts, and authority rules. |
    | Run lifecycle | Create/open, inspect, suspend, resume, and terminally close runs; supervise executable tasks. |
-   | Graph rewriting | Prepare and commit configured productions with revision checks and retirement evidence. |
+   | Graph edits | Prepare and commit explicit graph edits under an edit policy, with revision checks and retirement evidence. |
    | Workflow | Commit results and governed deliveries; consume or retire pending work with recorded reasons. |
    | Content/packages | Import/read/retain, compose/resolve, and export artifacts. |
    | Invocation/context | Issue scoped invocations, prepare grants, enforce budgets, and record observed exposure/delivery evidence. |
@@ -183,11 +187,11 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **9. Vocabulary and compiler**
 
-   Expands the document into the existing `GraphDeclaration` with app-owned `ExecutionBinding` settings and the fixed grammar. It does not add another graph representation or depend on native `ApplicationDeclaration` factories. The workflow harness owns initial input, workspace setup, and process reconciliation. Existing non-document runs retain their original declarations and grammar.
+   Expands the document into the existing `GraphDeclaration` with app-owned `ExecutionBinding` settings; the run declares every node type its components can give. It does not add another graph representation or depend on native `ApplicationDeclaration` factories. The workflow harness owns initial input, workspace setup, and process reconciliation. Existing non-document runs retain their original declarations; those saved with rewrite productions still open, but their graphs are fixed.
 
-   The editor compares documents and previews ordered rewrites against cloned core state. It saves the target document, allocated identities, and the exact approved retirements before applying changes. Stable names map to persisted core identities; removed identities are never reused. The last completed document and any pending target are explicit app metadata; core's actual graph records which transitions committed.
+   The editor compares documents and previews one core graph edit without changing core: it adds the target's nodes and connections that core lacks and removes those the target lacks. It saves the target document, allocated identities, and the exact approved retirements before changing core. Stable names map to persisted core identities; removed identities are never reused. The last completed document and any pending target are explicit app metadata; core's actual graph records whether the edit committed.
 
-   Each rewrite is atomic; a whole edit can span several transitions. Workers continue during that edit. Recovery reads the actual graph, prepares the next step at the current revision, and proceeds toward the saved target. It stops if a step would retire work absent from the preview. The manager must review that same target again before continuing; recovery never rolls back committed transitions or silently approves additional retirements. Process reconciliation follows successful completion.
+   Each edit is one atomic transition. Workers continue during it; if their work makes the prepared edit stale, the editor prepares it again. Recovery computes the edit again from the actual graph and finds either the whole edit or nothing left to do. It stops if the edit would retire work absent from the preview. The manager must review that same target again before continuing; recovery never rolls back a committed edit or silently approves additional retirements. Process reconciliation follows successful completion.
 
 - [x] **10. Workflow document**
 
@@ -206,7 +210,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 **Build status.** The document, fixed vocabulary, translator/editor, task
 harness, persistent Codex runtime (1), and Pi surface are implemented. Remaining
 execution/UI work includes a live-model project acceptance run.
-Core remains an existing dependency; no composite-production API was added.
+Core remains an existing dependency.
 
 ## Session foundation
 
@@ -228,16 +232,16 @@ The [session guide](docs/SESSIONS.md) documents commands and storage. [SESSION_D
 
 ## Management status
 
-- [x] **Per-user app-home support.** Default storage is `~/.ontography/`, with existing explicit/environment/XDG overrides. A journaled migration archives legacy home contents, moves the stopped previous store, and leaves an alias at its old path. It preserves existing run identities; storage migration does not replace a core build or grammar.
+- [x] **Per-user app-home support.** Default storage is `~/.ontography/`, with existing explicit/environment/XDG overrides. A journaled migration archives legacy home contents, moves the stopped previous store, and leaves an alias at its old path. It preserves existing run identities; storage migration does not replace a core build or declaration.
 - [x] **Live home migration and final rollout verification.** Automated gates and native Pi/terminal checks passed. The legacy home was archived, the current store moved to `~/.ontography`, and all three prior runs preserved and resumed. [VERIFICATION.md](docs/VERIFICATION.md) records the evidence.
 - [x] **Graph display inside the Pi interaction.** `/graph` and `--ui` use the same server-owned native Pi manager and the session's bound run; there is no second management conversation.
 - [x] **Unified Ontography session.** Durable manager state, graph initialization/adoption, conversation ownership, selection, lifecycle commands, and scoped dispatch are implemented. App-session fork/archive/delete remain deferred.
 - [x] **Rust manager terminal backend.** Server-owned PTY, terminal parsing, attachment snapshots, input/resize ownership, detach/reconnect, and manager supervision are implemented. This replaces the proposed tmux backend.
 - [x] **Persistent session shell.** Launch into Pi, return to shell + session status on `/quit`, resume the active conversation with shell `pi`, and suspend the session when its shell exits. Structured process leases distinguish manager state from terminal state.
 
-The app's dynamic vocabulary extension adapter is removed. Document workflows keep their vocabulary and grammar fixed. Previously extended runs are not supported by the fixed-definition reopening path; stored runs must match the selected core build and declaration. This layer adds no storage migration. [CORE_UPDATE.md](docs/CORE_UPDATE.md) records earlier integration work, including operations that are no longer exposed.
+The app's dynamic vocabulary extension adapter is removed. Document workflows keep their vocabulary fixed. Previously extended runs are not supported by the fixed-definition reopening path; stored runs must match the selected core build and declaration. This layer adds no storage migration. [CORE_UPDATE.md](docs/CORE_UPDATE.md) records earlier integration work, including operations that are no longer exposed.
 
-A definition is reusable configuration; starting it creates a run. Rewriting changes that run's current graph and preserves its history under the configured grammar. Core commits graph/package state; the worker supervisor reconciles external processes separately and exposes partial failures. Opening or closing a terminal view has no graph-topology effect.
+A definition is reusable configuration; starting it creates a run. Editing changes that run's current graph and preserves its history, under the run's edit policy. Core commits graph/package state; the worker supervisor reconciles external processes separately and exposes partial failures. Opening or closing a terminal view has no graph-topology effect.
 
 ## Policies and remaining work
 
@@ -277,9 +281,9 @@ being added to the plan.
 
 ## Proof
 
-Automated coverage exercises document validation, all grammar variants,
-preview/recovery, command → human → inbox execution, workspace capture/export,
-config changes, and worker reconciliation. See
+Automated coverage exercises document validation, node types and the edit
+policy, preview/recovery, command → human → inbox execution, workspace
+capture/export, config changes, and worker reconciliation. See
 [CORE_BINDINGS.md](docs/CORE_BINDINGS.md#verification-evidence).
 
 The remaining full acceptance flow is interactive: create two Codex nodes,

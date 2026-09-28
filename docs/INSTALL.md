@@ -81,7 +81,7 @@ The migration archives an existing legacy `~/.ontography/` as `~/.ontography.arc
 ontography migrate --from /absolute/path/to/old-store --to /absolute/path/to/new-store
 ```
 
-`migrate` defaults are based on `HOME`; supply `--from`/`--to` for custom or XDG locations. Migrating storage preserves run IDs and core data. Existing runs have no inferred Pi owner: create an app session and adopt a selected run explicitly. Storage migration does not replace a run's core build or rewrite grammar.
+`migrate` defaults are based on `HOME`; supply `--from`/`--to` for custom or XDG locations. Migrating storage preserves run IDs and core data. Existing runs have no inferred Pi owner: create an app session and adopt a selected run explicitly. Storage migration does not replace a run's core build or declaration.
 
 **Local cutover completed on 2026-09-25.** The legacy home was archived, the current store moved, and all three previously active runs resumed with unchanged identities and graph state. See [VERIFICATION.md](VERIFICATION.md#completed-local-storage-migration) for the archive path and evidence. Other installations use the explicit migration procedure above.
 

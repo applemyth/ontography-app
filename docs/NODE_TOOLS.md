@@ -44,7 +44,7 @@ pending.
 
 | Tool | What it does | Grant |
 | --- | --- | --- |
-| `inspect_node` | This node's name, type, component, settings, join, grants, retry policy, neighbors, and open attempts. | |
+| `inspect_node` | This node's name, types, component, settings, join, grants, retry policy, neighbors, and open attempts. | |
 | `inspect_graph` | Current nodes and connections, by name. | |
 | `list_inputs` | Pages the inputs waiting here. At an `any` node each input is a task, shown with its retry state. | |
 | `next_trigger` | The next task that may begin: the initial input, one input, or a complete join. | |

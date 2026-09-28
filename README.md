@@ -51,11 +51,11 @@ Server stop suspends graph resources and stops managers. Explicit attachment aft
 
 CLI targets accept an exact session ID or a unique exact name. Ambiguous names require an ID. The `session …` command forms remain supported; `session list` retains its raw JSON output.
 
-Scoped calls resolve the session's graph and reject conflicting targets. Unscoped calls remain the explicit administration interface. The handshake publishes operation schemas. [examples/flow.json](examples/flow.json) is a logical graph with a configured rewrite; logical nodes can exist before worker implementations are installed.
+Scoped calls resolve the session's graph and reject conflicting targets. Unscoped calls remain the explicit administration interface. The handshake publishes operation schemas. [examples/flow.json](examples/flow.json) is a logical graph that accepts any edit (`"edits": "any"`; the default, `"fixed"`, keeps a graph as declared). [examples/remove-receiver.json](examples/remove-receiver.json) is an explicit edit for `rewrite.prepare`. Logical nodes can exist before worker implementations are installed.
 
 Pi manages workflow documents, runs, edits, task decisions, and artifacts through the workflow tools. Shared node tooling supplies scoped graph and package operations for worker implementations. [The workflow guide](docs/WORKFLOWS.md) describes current behavior; [the binding inventory](docs/CORE_BINDINGS.md) maps it to core's public API.
 
-Each node places a component, following core's project model. The built-in components are `agent` (with `codex` and `claude` presets), `command`, `human`, and `inbox`; each gives its node a core node type (its role) and binds the node's settings to what runs there. Agents run in a terminal you can open from the graph, or headless with `"pty": false`. Put your own components and MCP servers in `~/.ontography/library.json`; `flow.library` lists everything a document can place. See [Components](docs/WORKFLOWS.md#components).
+Each node places a component, following core's project model. The built-in components are `agent` (with `codex` and `claude` presets), `command`, `human`, and `inbox`; each gives its node a core node type, a label such as `Agent`, and binds the node's settings to what runs there. Agents run in a terminal you can open from the graph, or headless with `"pty": false`. Put your own components and MCP servers in `~/.ontography/library.json`; `flow.library` lists everything a document can place. See [Components](docs/WORKFLOWS.md#components).
 
 ## Development and status
 
@@ -71,6 +71,6 @@ npm test
 
 The persistent session foundation is implemented. Final verification and the actual home-directory cutover are recorded separately in [VERIFICATION.md](docs/VERIFICATION.md). [ARCHITECTURE.md](ARCHITECTURE.md) tracks remaining pieces; [SESSION_DESIGN.md](docs/SESSION_DESIGN.md) explains ownership and recovery.
 
-**Persistent Codex node foundations are implemented:** an agent binding owns a persistent Codex app-server, an attached native terminal client in a managed PTY, a continuing conversation, a private working directory, and scoped node tools. Workflow startup, edits, suspension, and resume reconcile its process. Command, human, and inbox nodes retain their task behavior; message/workspace contracts and the fixed editing grammar already exist.
+**Persistent Codex node foundations are implemented:** an agent binding owns a persistent Codex app-server, an attached native terminal client in a managed PTY, a continuing conversation, a private working directory, and scoped node tools. Workflow startup, edits, suspension, and resume reconcile its process. Command, human, and inbox nodes retain their task behavior; message/workspace contracts and workflow edits already exist.
 
 The [node MCP adapter](docs/NODE_MCP.md) exposes shared graph tools to managed Codex sessions, with an optional per-node `tools` allowlist and existing grants enforced. Initial and incoming work is queued into the Codex conversation automatically; agents publish graph replies through tools. Enter in the graph attaches to an agent's existing terminal. See [WORKFLOWS.md](docs/WORKFLOWS.md) for configuration.

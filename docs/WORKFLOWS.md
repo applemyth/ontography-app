@@ -71,15 +71,16 @@ connections are rejected.
 
 ## Components
 
-A node places a component, as in core's project model: the component says what
-the node is and binds the placement's settings to a trusted implementation and
-its exact configuration. What a node is, its role, is its core node type:
-`Agent`, `Command`, `Human`, or `Inbox`. Core records each node's type, and a
-graph edit must name it, so changing a node to a component of another type
-replaces that node (see [Edit and recover](#edit-and-recover)). Any node may
-connect to any other.
+A node places a component, as in core's project model: the component gives
+the node its types and binds the placement's settings to a trusted
+implementation and its exact configuration. Node types are labels, such as
+`Agent` or `Reviewer`, that core records on the node. A node keeps its types
+for life, so switching it to a component with other types replaces it (see
+[Edit and recover](#edit-and-recover)). Types never choose behavior; the
+implementation does: agent and command nodes run tasks, people decide human
+tasks, and inboxes hold work. Any node may connect to any other.
 
-| Component | Node type | Settings | What runs |
+| Component | Node types | Settings | What runs |
 | --- | --- | --- | --- |
 | `agent` | Agent | Required `prompt`; optional `harness` (`codex`, the default, or `claude`), `model`, `pty`, `mcp`, `permission_mode`, or an `argv` program | A continuing agent conversation |
 | `codex` | Agent | As `agent`, with `harness:"codex"` | A Codex conversation |
@@ -88,8 +89,9 @@ connect to any other.
 | `human` | Human | Optional `prompt` | Waits for `flow.decide` on each task |
 | `inbox` | Inbox | None | Holds incoming work for inspection and export |
 
-`flow.library` lists every component a document can place, with its node type,
-description, and settings schema, and the library's MCP servers.
+`flow.library` lists every component a document can place, with its node types,
+description, and settings schema, and the library's MCP servers. `flow.status`
+shows `types` for each node and task.
 
 An agent node looks like this:
 
@@ -117,7 +119,7 @@ Agent settings:
 
 `library.json` in the data directory (`~/.ontography/library.json` by default)
 holds MCP servers that agents load by name, and components that extend others
-with default settings:
+with node types and default settings:
 
 ```json
 {
@@ -129,6 +131,7 @@ with default settings:
       "provider": "ontography",
       "extends": "claude",
       "description": "Reviews changes for security issues.",
+      "types": ["Reviewer"],
       "config": {"prompt": "Review the change for security issues.", "mcp": ["github"], "permission_mode": "plan"}
     }
   }
@@ -136,9 +139,13 @@ with default settings:
 ```
 
 A component specification names its `provider` (`ontography`, the default)
-and the component it `extends`, which may be another library component. A
-node's settings are merged over its component's `config` as a JSON merge
-patch: objects merge by key, `null` removes a key, and other values replace.
+and the component it `extends`, which may be another library component.
+`types` adds node types to those of the component it extends, so a `reviewer`
+node has the types `Agent` and `Reviewer` and still runs Claude. A component
+that extends `reviewer` keeps both and may add more. Type names use letters,
+digits, `-`, or `_`; `WorkflowNode` is reserved. A node's settings are merged
+over its component's `config` as a JSON merge patch: objects merge by key,
+`null` removes a key, and other values replace.
 A list of MCP server names is read as a map first, so a node can add a server
 to its component's (`"mcp":{"docs":true}`) or remove one
 (`"mcp":{"github":null}`). Library components cannot reuse a built-in name.
@@ -151,6 +158,12 @@ components; their names cannot reuse an existing component's.
 A run keeps the bindings made when it was started or last edited, so changing
 the library does not change a running node. Submit the document again with
 `flow.edit` to apply library changes.
+
+A new run declares every node type its components can give: the built-in
+components', the library's, and the document's own, placed or not. It keeps
+that vocabulary for life, so later edits can place any of those components.
+An edit that needs a type the run never declared, such as one added to the
+library later, fails with `unknown_node_type`; start a new run to use it.
 
 ## Agent sessions
 
@@ -244,8 +257,9 @@ usual; `bypassPermissions` also shows Claude's own confirmation when it starts.
 ## Edit and recover
 
 1. Read `flow.status` and change its document.
-2. Call `flow.edit` with the updated `document`. Inspect `retirements`: pending
-   work the proposed graph change would discard.
+2. Call `flow.edit` with the updated `document`. Inspect `changes`, the number
+   of nodes and connections the edit adds or removes (0 when the graph stays
+   the same), and `retirements`: pending work the edit would discard.
 3. Call `flow.commit` with the returned `plan_id`.
 4. Read status. Use `flow.resume` to recover an interrupted edit or restart
    stopped or failed workers.
@@ -255,17 +269,23 @@ agent node is bound to (its settings over its component's defaults) stops and
 replaces its process, retaining its node directory and recorded conversation.
 Tool selection, grants, retry policy, and changes elsewhere in the graph refresh
 the agent's scoped tooling without restarting its process. Changing a node's
-node type, join, or entry status replaces its core node, which retires its
+types, join, or entry status replaces its core node, which retires its
 pending work; the preview reports that work, and the old worker stops before
-its replacement starts. The initial entry cannot be replaced before its
-initial task completes.
+its replacement starts. In runs created before node types, every node has one
+shared `WorkflowNode` type, so only a join or entry change replaces a node.
+The initial entry cannot be replaced before its initial task completes.
 
-Each graph transition is atomic. A multi-step edit is not: existing workers
-continue, and a failed edit may leave some graph changes committed. The app
-saves the target and identities before applying steps. Recovery reads the
-actual graph and proceeds toward that target. If new work would be retired,
-it stops; preview the same target again and review the additional retirements.
+Each edit is one atomic core graph edit: it adds the target's nodes and
+connections that core lacks and removes those the target lacks. Existing
+workers continue meanwhile. The app saves the target and its new identities
+before changing core. Recovery computes the edit again from core's graph and
+finds either the whole edit or nothing left to do. If new work would be
+retired, it stops with `retirement_preview_required`; preview the same target
+again and review the additional retirements. If ongoing work makes the edit
+stale eight times, it stops with `workflow_busy`; `flow.resume` continues it.
 There is no rollback or substitution of an unrelated target mid-recovery.
+Core accepts edits to a workflow run only from this editor, and only edits
+that keep the graph a workflow.
 
 A stale topology preview before the edit starts needs a new preview. Config-only
 edits tolerate unrelated tasks completing, but still reject a changed document
@@ -403,8 +423,8 @@ attempt.
   counted. External command effects may repeat if a previous attempt ran but
   did not publish to core.
 - Command config updates do not interrupt a task already running. A change to
-  an agent's binding restarts its session process. Removing a node or changing
-  its node type stops its old worker during reconciliation.
+  an agent's binding restarts its session process. Removing or replacing a
+  node stops its old worker during reconciliation.
 - Command task timeout defaults to five minutes. Captured stdout/stderr are bounded
   to 1 MiB each; status/output previews truncate long text. Export retrieves
   the complete accepted message or workspace.
