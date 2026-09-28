@@ -25,6 +25,8 @@ use tokio::{
 
 pub const VERSION: u32 = 2;
 const INPUT_LIMIT: usize = 64 * 1024;
+/// Input the server writes itself, such as work pasted into an agent.
+const SERVER_INPUT_LIMIT: usize = 1024 * 1024;
 const SCROLLBACK: usize = 1_000;
 
 #[derive(Clone, Debug)]
@@ -87,6 +89,15 @@ pub struct Snapshot {
     pub fault: Option<String>,
     /// Present only while this attachment browses a frozen copy of history.
     pub history: Option<HistoryPosition>,
+}
+
+/// Input typed through attached clients, as opposed to input the server writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientInput {
+    /// Input frames received from clients since the terminal started.
+    pub count: u64,
+    /// When the most recent frame arrived.
+    pub last: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -523,6 +534,7 @@ pub struct Terminal {
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     child: Arc<Mutex<PtyChild>>,
     input: mpsc::SyncSender<Vec<u8>>,
+    client_input: Mutex<ClientInput>,
     attached: AtomicBool,
     graph: broadcast::Sender<Control>,
     shutdown: watch::Sender<bool>,
@@ -717,6 +729,7 @@ impl Terminal {
             master: Mutex::new(Some(master)),
             child,
             input,
+            client_input: Mutex::default(),
             attached: AtomicBool::new(false),
             graph,
             shutdown,
@@ -879,6 +892,23 @@ impl Terminal {
         Ok(())
     }
 
+    /// Write input on the server's own behalf. Unlike client input, it is not
+    /// counted as someone typing.
+    pub fn send_input(&self, bytes: Vec<u8>) -> Result<()> {
+        if bytes.len() > SERVER_INPUT_LIMIT {
+            return Err(AppError::new(
+                "input_too_large",
+                "Server terminal input exceeds 1 MiB",
+            ));
+        }
+        self.queue_input(bytes)
+    }
+
+    /// Typing received from attached clients.
+    pub fn client_input(&self) -> ClientInput {
+        *self.client_input.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn input(&self, bytes: Vec<u8>) -> Result<()> {
         if bytes.len() > INPUT_LIMIT {
             return Err(AppError::new(
@@ -886,6 +916,14 @@ impl Terminal {
                 "Terminal input frame exceeds 64 KiB",
             ));
         }
+        self.queue_input(bytes)?;
+        let mut input = self.client_input.lock().unwrap_or_else(|p| p.into_inner());
+        input.count += 1;
+        input.last = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    fn queue_input(&self, bytes: Vec<u8>) -> Result<()> {
         if *self.shutdown.borrow() {
             return Err(AppError::new(
                 "terminal_stopping",
