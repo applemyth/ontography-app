@@ -1,5 +1,40 @@
 # Verification
 
+## Node MCP and tool selection — 2026-09-27
+
+Passed: **238 app Rust tests**, all-target Clippy with warnings denied,
+formatting, and `git diff --check`. Two native checks are opt-in and excluded
+from that count; the Codex MCP interoperability check passed separately on
+Codex **0.157.1**.
+
+```sh
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
+git diff --check
+cargo test --locked --lib node_tool::tests::mcp::native_codex_discovers_and_calls_the_selected_node_tools -- --ignored --nocapture
+```
+
+- [MCP tests](../src/node_tool/tests/mcp.rs) launch the real stdio proxy and
+  verify selected catalogs, grant enforcement, invalid calls, live list-change
+  notifications, concurrent waits, cancellation, and partial-frame handling.
+- A package is delivered, read, and published through MCP against a real core
+  fixture. Receipt tests compare exact returned text with core's recorded
+  digest and verify that sent marks wait for proxy delivery acknowledgement.
+  Lost replies remain prepared; accepted mutations settle after disconnection.
+- Connection tests reject another execution's token, expire stopped endpoints,
+  preserve the node across client loss, and exit the proxy after server loss
+  even with stdin still open. [Workflow tests](../tests/persistent_nodes.rs)
+  verify automatic provisioning, selection changes without process restart,
+  and revocation during suspension.
+- The installed Codex MCP client discovers only the selected `inspect_node`
+  tool and successfully calls it. This uses an ephemeral thread and fixture
+  data, with no model turn or user-config changes.
+
+The implementation and limits are described in [NODE_MCP.md](NODE_MCP.md).
+Automatic incoming-work wakeups, worker panes, and a full interactive
+multi-agent project acceptance run remain outstanding.
+
 ## Persistent Codex node foundation — 2026-09-27
 
 Passed: **228 app Rust tests**, all-target Clippy with warnings denied,

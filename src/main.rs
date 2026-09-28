@@ -43,6 +43,8 @@ struct Options {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Serve this execution's shared node tools over MCP stdio.
+    NodeMcp,
     /// Internal cleanup invoked inside a node's owned terminal session.
     #[command(hide = true)]
     InternalNodeCleanup {
@@ -136,6 +138,9 @@ fn project(path: Option<PathBuf>) -> Result<PathBuf> {
     )?)
 }
 async fn run(cli: Cli) -> Result<()> {
+    if matches!(cli.action, Some(Action::NodeMcp)) {
+        return ontography_app::node_mcp::run_stdio().await;
+    }
     // This helper runs after its server may have died. It needs no data store
     // or server connection, and can signal only its own inherited OS session.
     if let Some(Action::InternalNodeCleanup { owner }) = &cli.action {
@@ -163,6 +168,7 @@ async fn run(cli: Cli) -> Result<()> {
         None => persistence::default_data_dir()?,
     })?;
     match cli.action {
+        Some(Action::NodeMcp) => unreachable!("handled before opening storage"),
         Some(Action::InternalNodeCleanup { .. }) => unreachable!("handled before opening storage"),
         Some(Action::InternalPi {
             session_id,

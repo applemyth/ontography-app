@@ -286,7 +286,7 @@ impl NodeToolContext {
         self.scope.borrow().clone()
     }
 
-    pub(super) fn scope_changes(&self) -> watch::Receiver<NodeScope> {
+    pub(crate) fn scope_changes(&self) -> watch::Receiver<NodeScope> {
         self.scope.clone()
     }
 

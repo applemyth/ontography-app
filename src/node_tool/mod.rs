@@ -121,11 +121,21 @@ pub fn tools() -> &'static [NodeTool] {
 }
 
 impl NodeToolContext {
-    /// The tools this node may call, given its current grants.
+    /// The selected tools this node may call, given its current grants.
     pub fn catalog(&self) -> Vec<&'static NodeTool> {
+        let scope = self.scope();
         tools()
             .iter()
-            .filter(|tool| tool.grant.is_none_or(|grant| self.granted(grant)))
+            .filter(|tool| {
+                scope
+                    .node
+                    .tools
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(tool.name))
+                    && tool
+                        .grant
+                        .is_none_or(|grant| scope.node.grants.contains(&grant))
+            })
             .collect()
     }
 
@@ -140,6 +150,18 @@ impl NodeToolContext {
                     format!("There is no node tool named {name:?}"),
                 )
             })?;
+        if self
+            .scope()
+            .node
+            .tools
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(name))
+        {
+            return Err(AppError::new(
+                "tool_disabled",
+                format!("Node tool {name:?} is not enabled for this node"),
+            ));
+        }
         if let Some(grant) = tool.grant {
             self.require(grant)?;
         }

@@ -1,6 +1,6 @@
 # Session design and implementation
 
-**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions, the fixed editing grammar, and persistent Codex worker sessions are implemented. Worker MCP, incoming-work delivery, and node panes remain unfinished. [VERIFICATION.md](VERIFICATION.md) records the manager release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
+**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions, the fixed editing grammar, persistent Codex worker sessions, and node-scoped MCP are implemented. Automatic incoming-work wakeups and node panes remain unfinished. [VERIFICATION.md](VERIFICATION.md) records release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
 
 ## Ownership invariant
 
@@ -95,8 +95,8 @@ The same backend hosts management and worker terminals. Worker view integration 
 
 ## Remaining work
 
-1. Expose shared node tooling through MCP and deliver incoming graph work to continuing agent sessions.
-2. Complete persistent-session package handoffs and worker terminal views.
+1. Wake continuing agent sessions when graph work arrives; tools already support discovering and processing it.
+2. Complete worker terminal views and verify a full interactive multi-agent project flow.
 3. Specify explicit app-session fork/archive/delete, complete artifact-backed export, and optional viewer/takeover behavior.
 4. Runs need the desired grammar at creation. Live grammar replacement remains unavailable; `run.extend` only adds vocabulary and trusted contracts. This WIP uses fresh runs instead of migrating empty-grammar runs.
 

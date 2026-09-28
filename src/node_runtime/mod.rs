@@ -1,11 +1,12 @@
 //! One continuing agent execution at a graph node. Terminals are views of this
-//! execution; its scoped tools are ready for a future transport to host.
+//! execution; its selected scoped tools are exposed through the node MCP adapter.
 
 pub mod codex;
 mod process;
 
 use crate::{
     AppError, Result,
+    node_mcp::NodeMcp,
     node_tool::{NodeScope, NodeToolContext},
     terminal::{LaunchSpec, Terminal, TerminalStatus},
     workflow::{harness, tasks::RetryLedger},
@@ -158,15 +159,35 @@ impl NodeRuntime {
             .await?,
         );
         lock(&self.state).tools = Arc::downgrade(&tools);
+        // Keep local sockets short enough for Unix sockaddr paths. Each MCP
+        // execution gets a fresh endpoint and capability, including on resume.
+        let identity = format!(
+            "{:x}",
+            Sha256::digest(self.directory.as_os_str().as_encoded_bytes())
+        );
+        let endpoint = PathBuf::from("/tmp").join(format!(
+            "ontography-node-{}-{}",
+            nix::unistd::geteuid(),
+            &identity[..20]
+        ));
+        private_directory(&endpoint)?;
+        resources.mcp = Some(NodeMcp::bind(&endpoint, tools.clone())?);
         resources.tools = Some(tools);
         let node = self.scope.borrow().node.clone();
-        let prepared = tokio::select! {
+        let mut prepared = tokio::select! {
             () = stop.requested() => {
                 lock(&self.state).status.state = "stopped";
                 return Ok(());
             }
             prepared = codex::prepare(&node, &self.directory, &cwd) => prepared?,
         };
+        let mcp = resources.mcp.as_ref().expect("bound node MCP");
+        if prepared.conversation_id.is_some() {
+            prepared
+                .args
+                .splice(0..0, ["-c".into(), mcp.codex_config()?]);
+        }
+        prepared.env.extend(mcp.environment());
         lock(&self.state).status.conversation_id = prepared.conversation_id;
         let mut env = prepared.env;
         env.insert("ONTOGRAPHY_NODE_NAME".into(), node.id.clone());
@@ -191,17 +212,6 @@ impl NodeRuntime {
         let lifetime = process::Lifetime::new(&self.directory)?;
         let spec = lifetime.supervise(spec);
         resources.lifetime = Some(lifetime);
-        // Unix socket path limits are smaller than typical run/node paths.
-        let identity = format!(
-            "{:x}",
-            Sha256::digest(self.directory.as_os_str().as_encoded_bytes())
-        );
-        let endpoint = PathBuf::from("/tmp").join(format!(
-            "ontography-node-{}-{}",
-            nix::unistd::geteuid(),
-            &identity[..20]
-        ));
-        private_directory(&endpoint)?;
         let terminal = Terminal::launch(spec, endpoint.join("terminal.sock")).await?;
         {
             let mut state = lock(&self.state);
@@ -251,6 +261,7 @@ struct Resources<'a> {
     terminal: Option<Arc<Terminal>>,
     tools: Option<Arc<NodeToolContext>>,
     lifetime: Option<process::Lifetime>,
+    mcp: Option<NodeMcp>,
 }
 
 impl<'a> Resources<'a> {
@@ -260,10 +271,14 @@ impl<'a> Resources<'a> {
             terminal: None,
             tools: None,
             lifetime: None,
+            mcp: None,
         }
     }
 
     async fn close(&mut self) -> Result<()> {
+        if let Some(mut mcp) = self.mcp.take() {
+            mcp.shutdown().await;
+        }
         if let Some(lifetime) = &mut self.lifetime {
             lifetime.disconnect();
         }
@@ -290,6 +305,7 @@ impl<'a> Resources<'a> {
 
 impl Drop for Resources<'_> {
     fn drop(&mut self) {
+        self.mcp.take();
         if let Some(lifetime) = &mut self.lifetime {
             lifetime.disconnect();
         }

@@ -161,9 +161,10 @@ latest conversation. A complete `argv` override bypasses native Codex setup and
 does not provide managed conversation recovery. Live process state is never
 recovered from conversation history.
 
-The runtime starts agent sessions without consuming pending packages. No MCP
-transport exposes the scoped tools to the agent yet, and graph work is not
-injected into terminal input. Those remain separate integration steps.
+The runtime starts agent sessions without consuming pending packages. A private
+[MCP adapter](NODE_MCP.md) exposes the selected scoped tools to Codex. Agents can
+use them to process work; automatic turns and terminal-input delivery remain
+separate integration steps.
 
 Command tasks invoke the configured argv with input messages on stdin. Without
 a workspace, the result is stdout; with a workspace, the result is the captured
@@ -172,7 +173,7 @@ connection. Human tasks wait for an explicit decision; inboxes keep work pending
 
 Command config changes are sampled before the next task. Agent config changes
 stop and replace the process, preserving its node directory and conversation;
-grants and graph scope refresh in place. A kind change stops and
+tool selection, grants, and graph scope refresh in place. A kind change stops and
 waits for the previous worker before launching the new kind. A failed task
 retries with capped backoff while the worker continues with other tasks, then
 parks until `flow.retry` or `flow.discard`. Counts persist beside the node's
@@ -193,12 +194,14 @@ reused.
 Node tools ([NODE_TOOLS.md](NODE_TOOLS.md)) bind a worker to its own node:
 execution-bound invocations with explorable context, core's package reads and
 receipts, staged content, private workspaces, and, when granted, transfer and
-retirement through the session. No transport exposes them yet.
+retirement through the session. The MCP adapter lists their schemas, forwards
+calls, and marks replies sent only after its stdio proxy flushes them to Codex.
 
 Worker and manager PTYs use the same terminal backend. Agent lifecycle includes
 cooperative stop, forced cancellation, exit reporting, and explicit resume.
-Node-scoped MCP, incoming-work notification, package handoffs for continuing
-sessions, and node panes remain unimplemented (architecture items 7 and 12).
+Automatic incoming-work wakeups and node panes remain unimplemented. MCP and
+tool-mediated package handoffs are available; a full interactive multi-agent
+acceptance run remains outstanding.
 
 Other existing limits remain:
 

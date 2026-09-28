@@ -44,6 +44,10 @@ pub struct DocumentNode {
     /// Node-tool operations beyond the base set.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub grants: BTreeSet<Grant>,
+    /// Shared node tools to expose. Absent means every tool allowed by grants;
+    /// an empty set exposes none. This does not configure harness built-ins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<BTreeSet<String>>,
 }
 
 impl DocumentNode {
@@ -240,10 +244,22 @@ fn validate_node(node: &DocumentNode) -> Result<()> {
     {
         return Err(error("timeout_secs must be a positive integer"));
     }
-    if !node.runs_tasks() && (node.retry.is_some() || !node.grants.is_empty()) {
+    if !node.runs_tasks()
+        && (node.retry.is_some() || !node.grants.is_empty() || node.tools.is_some())
+    {
         return Err(error(
-            "retry and grants apply only to agent and command nodes",
+            "retry, grants, and tools apply only to agent and command nodes",
         ));
+    }
+    if let Some(selected) = &node.tools {
+        for name in selected {
+            if !crate::node_tool::tools()
+                .iter()
+                .any(|tool| tool.name == name)
+            {
+                return Err(error(&format!("unknown node tool {name:?}")));
+            }
+        }
     }
     if let Some(retry) = &node.retry {
         retry.validate().map_err(error)?;
@@ -546,6 +562,38 @@ mod tests {
             .unwrap();
         command.config["timeout_secs"] = json!(30);
         assert!(configured.canonicalized().is_ok());
+    }
+
+    #[test]
+    fn tool_selection_is_validated_and_preserves_omitted_and_empty_semantics() {
+        let text = r#"{"name":"tools","entry":"worker","nodes":[{"id":"worker","kind":"agent","config":{"prompt":"Observe"},"tools":["inspect_node","inspect_graph"]}]}"#;
+        let configured = Document::parse(text).unwrap();
+        let mut reversed: Value = serde_json::from_str(text).unwrap();
+        reversed["nodes"][0]["tools"] = json!(["inspect_graph", "inspect_node"]);
+        assert_eq!(Document::parse(&reversed.to_string()).unwrap(), configured);
+        let mut default = configured.clone();
+        default.nodes[0].tools = None;
+        let mut empty = default.clone();
+        empty.nodes[0].tools = Some(BTreeSet::new());
+        assert_ne!(default.nodes[0].digest(), empty.nodes[0].digest());
+        assert!(
+            serde_json::to_value(default).unwrap()["nodes"][0]
+                .get("tools")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(empty).unwrap()["nodes"][0]["tools"],
+            json!([])
+        );
+        reversed["nodes"][0]["tools"] = json!(["invented_tool"]);
+        assert!(
+            Document::parse(&reversed.to_string())
+                .unwrap_err()
+                .message
+                .contains("invented_tool")
+        );
+        reversed["nodes"][0] = json!({"id":"worker","kind":"inbox","tools":[]});
+        assert!(Document::parse(&reversed.to_string()).is_err());
     }
 
     #[test]

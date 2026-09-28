@@ -71,4 +71,4 @@ The persistent session foundation is implemented. Final verification and the act
 
 **Persistent Codex node foundations are implemented:** an agent binding owns a managed PTY, continuing Codex conversation, persistent private working directory, and scoped node-tool context. Workflow startup, edits, suspension, and resume reconcile its process. Command, human, and inbox nodes retain their task behavior; message/workspace contracts and the fixed editing grammar already exist.
 
-The node MCP adapter, incoming-work delivery, package handoffs for continuing sessions, and node terminal panes remain unfinished. Agent sessions therefore do not yet consume graph packages or publish terminal output. See [WORKFLOWS.md](docs/WORKFLOWS.md) for configuration and these limits.
+The [node MCP adapter](docs/NODE_MCP.md) exposes shared graph tools to managed Codex sessions, with an optional per-node `tools` allowlist and existing grants enforced. Automatic incoming-work wakeups and node terminal panes remain unfinished. Starting a node does not start a model turn or publish terminal output. See [WORKFLOWS.md](docs/WORKFLOWS.md) for configuration.

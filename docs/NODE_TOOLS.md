@@ -5,10 +5,9 @@ inputs, run attempts at its tasks, and publish results. They live in
 [`src/node_tool`](../src/node_tool) and run against core through one
 execution's context. Workers name nodes and connections by their workflow
 names and pending work by opaque handles; the tools never ask for or report
-core package, activation, node, or edge identities. A transport, such as the
-node MCP of architecture item 7, lists the tools and relays calls. The persistent
-Codex node runtime now owns and refreshes this context; the transport that
-exposes it to the running agent remains unimplemented.
+core package, activation, node, or edge identities. The [node MCP adapter](NODE_MCP.md)
+lists selected tools and relays calls from Codex. The persistent Codex node
+runtime owns and refreshes the context and its private transport endpoint.
 
 ## Hosting
 
@@ -17,7 +16,7 @@ One `NodeToolContext` serves one execution at one node:
 ```text
 executable launched at a node
 └── NodeToolContext::new(execution, session, scope, ledger, node directory, initial input)
-    ├── catalog()           tools this node may call, given its grants
+    ├── catalog()           selected tools this node may call, given its grants
     ├── call(name, args)    → Reply
     │   └── transport sends reply.bytes() unchanged, then reply.sent()
     └── close()             when the execution stops
@@ -54,7 +53,10 @@ pending.
 | `retire_package` | Discards an input waiting here or an outbound package; core records the retirement. | `retire` |
 
 Grants are set per agent or command node in the workflow document:
-`"grants": ["send_later"]`. The catalog hides tools a node may not call. A node
+`"grants": ["send_later"]`. Optional `"tools": ["inspect_node", "list_inputs"]`
+restricts the shared tool catalog and calls to those names; omitted means all
+tools allowed by grants, and `[]` means none. The list never adds grants. Live
+edits refresh the context and notify connected MCP clients. A node
 cannot originate work while the run's initial input is still pending at it.
 Beginning attempts, transfers, and retirements run one at a time, so a package
 is never both sent and retired.

@@ -38,6 +38,7 @@ impl Tool for InspectNode {
             "config": node.config,
             "join": node.join,
             "grants": node.grants,
+            "tools": context.catalog().iter().map(|tool| tool.name).collect::<Vec<_>>(),
             "retry": node.retry_policy(),
             "entry": kernel.root_ceiling(context.node_id()).is_some(),
             "incoming": context.predecessors(&kernel, &names),

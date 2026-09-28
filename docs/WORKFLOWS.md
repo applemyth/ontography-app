@@ -61,6 +61,7 @@ start and `run_id` afterward; a stable UUID `start_id` makes startup retryable.
 | `nodes[].join` | `any` by default, or `all`; belongs to the receiving node. |
 | `nodes[].retry` | Agent and command nodes only; see [Failed tasks](#failed-tasks). |
 | `nodes[].grants` | Agent and command nodes only: node-tool powers beyond the base set (`originate`, `send_later`, `retire`); see [Node tools](NODE_TOOLS.md). |
+| `nodes[].tools` | Optional shared node-tool allowlist for agent/command nodes. Omitted uses the grant-filtered default; `[]` exposes none. |
 | `edges` | Directed `{from,to}` connections; defaults to `[]`. |
 
 `any` takes one available incoming package. `all` waits for one package on
@@ -95,11 +96,12 @@ An `argv` override is the complete interactive command, passed without a shell;
 it bypasses Codex setup and has no managed Codex conversation reference.
 `timeout_secs` belongs to command tasks and is rejected for agent sessions.
 
-This implements the node's process and session foundation. The shared node tools
-are bound to its execution, but no MCP transport exposes them to Codex yet.
-Initial and incoming graph packages remain pending; the session does not
-automatically receive them or publish its terminal output. Incoming-work
-notifications, package handoffs, and attachable node panes remain future work.
+The [node MCP adapter](NODE_MCP.md) exposes the selected shared tools to Codex
+automatically, bound to this execution. The agent can use those tools to inspect
+and process graph packages. Initial and incoming packages remain pending until
+the agent begins and submits work; startup does not start a model turn, inject
+packages into terminal input, or publish terminal output. Automatic incoming-work
+wakeups and attachable node panes remain future work.
 Use command nodes for the end-to-end task workflow above.
 
 ## Edit and recover
@@ -113,7 +115,7 @@ Use command nodes for the end-to-end task workflow above.
 
 A command config change takes effect on the next task. An agent config change
 stops and replaces its process, retaining its node directory and recorded
-conversation. Grants, retry policy, and changes elsewhere in the graph refresh
+conversation. Tool selection, grants, retry policy, and changes elsewhere in the graph refresh
 the agent's scoped tooling without restarting its process. A kind change stops
 and waits for the old worker before launching the replacement. Changing joins or
 entry status can require replacing core identities and retiring pending work;
@@ -143,8 +145,9 @@ Start with `"workspace":"path/to/directory"` instead of `message` to import
 an initial workspace. A command task executes in a private checkout and
 publishes its captured changes. The original directory is preserved. Without a
 workspace, the command runs in the workflow project and publishes stdout.
-Persistent agent sessions do not yet consume workspace packages or capture
-their working directory as graph output.
+Persistent agents use the selected node tools to open workspace packages in
+attempt checkouts, capture changes, and submit them. Their persistent session
+working directory is not automatically captured as graph output.
 
 For a human task, call `flow.workspace` with `action:"open"`, its `node`, and
 the `task_id` from status. This opens that task's current input and rejects

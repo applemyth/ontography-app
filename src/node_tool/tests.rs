@@ -1,5 +1,7 @@
 //! Node tools hosted in a real core execution, as a transport would host them.
 
+mod mcp;
+
 use super::{NodeScope, NodeToolContext};
 use crate::workflow::{
     Document, Grant, IdentityMap, WorkflowPayload, edge_key,
@@ -220,6 +222,68 @@ pub(super) fn message(text: &str) -> ontography::Payload {
     }
     .encode()
     .unwrap()
+}
+
+#[tokio::test]
+async fn selected_tools_limit_catalog_and_dispatch_without_adding_grants() {
+    let fixture = Fixture::new(
+        document(json!({"tools":["inspect_node", "retire_package"]})),
+        "worker",
+        None,
+    )
+    .await;
+    assert_eq!(
+        fixture
+            .tools
+            .catalog()
+            .iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>(),
+        ["inspect_node"]
+    );
+    let inspected = fixture.ok("inspect_node", json!({})).await;
+    assert_eq!(inspected["tools"], json!(["inspect_node"]));
+    assert_eq!(
+        fixture.error("begin_invocation", json!({})).await.code,
+        "tool_disabled"
+    );
+    assert_eq!(
+        fixture.error("retire_package", json!({})).await.code,
+        "not_granted"
+    );
+    assert!(
+        fixture
+            .session
+            .invocations_page(Some(fixture.tools.node_id()), None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    fixture.grant(&[Grant::Retire]);
+    assert!(
+        fixture
+            .tools
+            .catalog()
+            .iter()
+            .any(|tool| tool.name == "retire_package")
+    );
+    fixture
+        .scope
+        .send_modify(|scope| scope.node.tools = Some(Default::default()));
+    assert!(fixture.tools.catalog().is_empty());
+    assert_eq!(
+        fixture.error("inspect_node", json!({})).await.code,
+        "tool_disabled"
+    );
+    fixture.scope.send_modify(|scope| scope.node.tools = None);
+    assert!(
+        fixture
+            .tools
+            .catalog()
+            .iter()
+            .any(|tool| tool.name == "begin_invocation")
+    );
+    fixture.stop().await;
 }
 
 /// Begins an attempt at the next task.

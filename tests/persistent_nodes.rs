@@ -407,3 +407,114 @@ async fn process_exit_is_visible_and_resume_retries_without_consuming_work() {
     assert!(runtime::initial_pending(&*run.lock().await).await.unwrap());
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn runtime_provisions_mcp_refreshes_selection_and_revokes_it_on_suspend() {
+    use ontography_app::protocol;
+    use std::process::Stdio;
+    use tokio::io::BufReader;
+    async fn read(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> Value {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), protocol::read_frame(reader))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let service = Service::new(Paths::initialize(temporary.path().join("data")).unwrap()).unwrap();
+    let mut definition = document();
+    definition["nodes"][0]["tools"] = json!(["inspect_node"]);
+    definition["nodes"][0]["config"]["argv"] = json!([
+        "/bin/sh",
+        "-c",
+        "umask 077; printf '%s\n%s\n' \"$ONTOGRAPHY_NODE_MCP_SOCKET\" \"$ONTOGRAPHY_NODE_MCP_TOKEN\" > mcp-endpoint; exec /bin/cat"
+    ]);
+    let run_id = start(&service, temporary.path(), definition.clone()).await;
+    let status = running(&service, &run_id).await;
+    let (_, worker, _) = resources(&service, &run_id).await;
+    let terminal_id = worker.terminal().unwrap().id().to_owned();
+    let path =
+        Path::new(node(&status, "worker")["session"]["cwd"].as_str().unwrap()).join("mcp-endpoint");
+    let endpoint = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(&path)
+                && value.lines().count() == 2
+            {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut lines = endpoint.lines();
+    let socket = lines.next().unwrap();
+    let token = lines.next().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ontography"))
+        .arg("node-mcp")
+        .env("ONTOGRAPHY_NODE_MCP_SOCKET", socket)
+        .env("ONTOGRAPHY_NODE_MCP_TOKEN", token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    protocol::write_frame(&mut input, &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).await.unwrap();
+    assert_eq!(
+        read(&mut output).await["result"]["serverInfo"]["name"],
+        "ontography-node"
+    );
+    protocol::write_frame(
+        &mut input,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await
+    .unwrap();
+    protocol::write_frame(
+        &mut input,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read(&mut output).await["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    definition["nodes"][0]["tools"] = json!(["inspect_node", "inspect_graph"]);
+    edit(&service, &run_id, definition).await;
+    assert_eq!(
+        read(&mut output).await["method"],
+        "notifications/tools/list_changed"
+    );
+    protocol::write_frame(
+        &mut input,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read(&mut output).await["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(worker.terminal().unwrap().id(), terminal_id);
+    call(&service, "run.suspend", json!({"run_id":run_id})).await;
+    assert!(!Path::new(socket).exists());
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    service.shutdown().await.unwrap();
+}
