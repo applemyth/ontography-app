@@ -55,9 +55,10 @@ start and `run_id` afterward; a stable UUID `start_id` makes startup retryable.
 | --- | --- |
 | `name` | Name for the reusable workflow. |
 | `entry` | The node receiving the initial message or workspace. |
+| `components` | Optional: this document's own components; see [The library](#the-library). |
 | `nodes[].id` | Unique name used by tools and connections. |
-| `nodes[].kind` | `agent`, `command`, `human`, or `inbox`. |
-| `nodes[].config` | Worker settings; defaults to `{}`. |
+| `nodes[].component` | The component the node places: a built-in, one from the library, or one from `components`. Documents saved with `kind` still load. |
+| `nodes[].config` | This placement's settings, merged over its component's defaults; defaults to `{}`. |
 | `nodes[].join` | `any` by default, or `all`; belongs to the receiving node. |
 | `nodes[].retry` | Agent and command nodes only; see [Failed tasks](#failed-tasks). |
 | `nodes[].grants` | Agent and command nodes only: node-tool powers beyond the base set (`originate`, `send_later`, `retire`); see [Node tools](NODE_TOOLS.md). |
@@ -66,35 +67,98 @@ start and `run_id` afterward; a stable UUID `start_id` makes startup retryable.
 
 `any` takes one available incoming package. `all` waits for one package on
 every incoming connection. Cycles and self loops are supported; duplicate
-connections are rejected. Worker kind does not change core graph rules.
+connections are rejected.
 
-| Kind | Config | What it does |
-| --- | --- | --- |
-| `agent` | Required `prompt`; optional `model`, `harness:"codex"`, or `argv` runner override | Hosts a continuing interactive Codex session in a managed PTY. |
-| `command` | Required nonempty `argv`; optional `timeout_secs` | Runs the command with input messages on stdin. |
-| `human` | Optional `prompt` | Waits for `flow.decide` on the specific task. |
-| `inbox` | Empty config | Holds incoming work for inspection/export. |
+## Components
 
-An agent node definition looks like this:
+A node places a component, as in core's project model: the component says what
+the node is and binds the placement's settings to a trusted implementation and
+its exact configuration. What a node is, its role, is its core node type:
+`Agent`, `Command`, `Human`, or `Inbox`. Core records each node's type, and a
+graph edit must name it, so changing a node to a component of another type
+replaces that node (see [Edit and recover](#edit-and-recover)). Any node may
+connect to any other.
+
+| Component | Node type | Settings | What runs |
+| --- | --- | --- | --- |
+| `agent` | Agent | Required `prompt`; optional `harness` (`codex`, the default, or `claude`), `model`, `pty`, `mcp`, `permission_mode`, or an `argv` program | A continuing agent conversation |
+| `codex` | Agent | As `agent`, with `harness:"codex"` | A Codex conversation |
+| `claude` | Agent | As `agent`, with `harness:"claude"` | A Claude Code conversation |
+| `command` | Command | Required nonempty `argv`; optional `timeout_secs` | The command once per task, with input messages on stdin |
+| `human` | Human | Optional `prompt` | Waits for `flow.decide` on each task |
+| `inbox` | Inbox | None | Holds incoming work for inspection and export |
+
+`flow.library` lists every component a document can place, with its node type,
+description, and settings schema, and the library's MCP servers.
+
+An agent node looks like this:
 
 ```json
-{"id":"draft","kind":"agent","config":{"prompt":"Review the input and produce a concise draft."}}
+{"id":"draft","component":"claude","config":{"prompt":"Review the input and produce a concise draft.","mcp":["github"]}}
 ```
 
-The server needs Codex installed and authenticated; a configured `CODEX_HOME`
-must be absolute. Each native agent owns a long-lived `codex app-server` on a
-private Unix socket. A Codex terminal client joins that server with `--remote`
-and resumes the exact saved conversation. `prompt` supplies standing
-instructions, followed by the graph delivery instructions. Closing the native
-terminal interface leaves the server running; Enter reconnects the interface.
-Suspending or replacing the node stops both processes and their child jobs.
+Agent settings:
 
-Each agent owns a persistent private working directory under its node's storage
-directory, separate from the workflow project and temporary package checkouts.
-Restarts retain this directory and resume the recorded conversation. An `argv`
-override is the complete interactive command: it receives MCP connection
-variables but bypasses managed Codex setup and automatic conversation delivery.
-`timeout_secs` belongs to command tasks and is rejected for agent sessions.
+- `prompt` supplies standing instructions, followed by the graph delivery
+  instructions.
+- `pty` (default `true`) runs the agent in a terminal you can open from the
+  graph. `false` runs it headless, reachable only through the graph.
+- `mcp` loads MCP servers besides the node tools: a list of library server
+  names, or a map from a name to `true` (the library's server) or a
+  `{command, args, env}` definition. Your own configured servers still load.
+- `permission_mode` (Claude only) sets Claude's permission mode: `acceptEdits`,
+  `auto`, `bypassPermissions`, `dontAsk`, `manual`, or `plan`. Unset keeps
+  your own setting.
+- `argv` replaces the agent with that interactive program in the node's
+  terminal. It receives MCP connection variables but no managed conversation
+  or automatic delivery, so only `argv` changes restart it.
+
+### The library
+
+`library.json` in the data directory (`~/.ontography/library.json` by default)
+holds MCP servers that agents load by name, and components that extend others
+with default settings:
+
+```json
+{
+  "servers": {
+    "github": {"command": "github-mcp-server", "args": ["stdio"]}
+  },
+  "components": {
+    "reviewer": {
+      "provider": "ontography",
+      "extends": "claude",
+      "description": "Reviews changes for security issues.",
+      "config": {"prompt": "Review the change for security issues.", "mcp": ["github"], "permission_mode": "plan"}
+    }
+  }
+}
+```
+
+A component specification names its `provider` (`ontography`, the default)
+and the component it `extends`, which may be another library component. A
+node's settings are merged over its component's `config` as a JSON merge
+patch: objects merge by key, `null` removes a key, and other values replace.
+A list of MCP server names is read as a map first, so a node can add a server
+to its component's (`"mcp":{"docs":true}`) or remove one
+(`"mcp":{"github":null}`). Library components cannot reuse a built-in name.
+Server `env` values are stored in each workflow that uses them; keep secrets
+in the server's own environment instead.
+
+A document's own `components` use the same format and may extend library
+components; their names cannot reuse an existing component's.
+
+A run keeps the bindings made when it was started or last edited, so changing
+the library does not change a running node. Submit the document again with
+`flow.edit` to apply library changes.
+
+## Agent sessions
+
+Each agent owns a persistent private working directory under its node's
+storage directory, separate from the workflow project and temporary package
+checkouts. Restarts retain this directory and resume the recorded
+conversation. `timeout_secs` belongs to command tasks and is rejected for
+agents.
 
 Initial and incoming graph work is delivered automatically as user messages in
 that conversation. The host begins an attempt using the existing join and retry
@@ -104,13 +168,28 @@ payloads is included inline; larger messages retain handles for `read_package`.
 Workspaces retain handles for `open_workspace`. Delivery is independent of the
 node's tool allowlist; graph operations still enforce that allowlist and grants.
 At most eight attempts are open before automatic delivery waits for capacity.
+Agents use the [node MCP adapter](NODE_MCP.md) to work on the supplied attempt
+and publish results with `submit_invocation`. Terminal text and ordinary chat
+answers are not automatically published.
+
+In the graph UI, select a node with a terminal and press Enter to use it.
+Ctrl-B D or G returns to the graph without stopping the agent; see
+[Session controls](SESSIONS.md#graph-display). Suspending or replacing the node
+stops its processes and their child jobs.
+
+### Codex
+
+The server needs Codex installed and authenticated; a configured `CODEX_HOME`
+must be absolute. Each Codex agent owns a long-lived `codex app-server` on a
+private Unix socket. With a terminal, a Codex client joins that server with
+`--remote` and resumes the exact saved conversation; closing that client
+leaves the server running, and Enter reconnects it. Headless, the server runs
+alone and logs to `codex-server.log` in the node's directory.
 
 Codex queues new messages while a turn is active and starts queued work when
-idle. It uses the [node MCP adapter](NODE_MCP.md) to work on the supplied attempt
-and publish results with `submit_invocation`. Terminal text and ordinary chat
-answers are not automatically published. A completed turn may leave its attempt
-open for later conversation; failed/interrupted turns fail their still-open
-delivered attempts under the normal retry policy.
+idle. A completed turn may leave its attempt open for later conversation;
+failed/interrupted turns fail their still-open delivered attempts under the
+normal retry policy.
 
 Codex's native approval settings still apply, including MCP tool approvals.
 A tool with a destructive annotation can require approval even when
@@ -124,9 +203,43 @@ A lost acknowledgement stops the execution without replaying the request.
 On explicit resume, pending graph tasks receive fresh attempts; old graph queue
 entries are withdrawn because their attempt handles expired. History remains,
 so a task may be presented again after restart. This is not an exactly-once
-model execution guarantee. In the graph UI, select an agent and press Enter to
-use its existing terminal. Ctrl-B D or G returns to the graph without stopping
-the agent; see [Session controls](SESSIONS.md#graph-display).
+model execution guarantee.
+
+### Claude
+
+The server needs Claude Code installed and signed in. Each Claude agent keeps
+one conversation for life: its ID is saved in the node's directory, and every
+launch continues it. Claude loads the node tools with `--mcp-config`,
+alongside your own MCP servers, and the node's prompt with
+`--append-system-prompt`, re-read on every request so a changed prompt applies
+after a restart. It works in the node's private folder and may also use the
+node tools' checkouts. Variables an enclosing Claude Code session exports are
+removed, so a server started inside Claude Code still runs independent agents.
+
+With a terminal, Claude runs in the node's terminal and reports what it is
+doing through hooks. Graph work is typed into its prompt only while it is idle:
+a short request, the recorded envelope as a paste, then Enter. The delivery is
+marked sent when Claude's prompt hook reports it. While someone attached to the
+terminal is typing, delivery waits until they have stopped for ten seconds. A
+draft left in the input box is stashed (Ctrl+S) first, and Claude restores it
+after the delivery; if a draft is already stashed, delivery waits until you
+restore it. Input Claude does not take within twenty seconds fails its attempt,
+which retries under the node's policy. A turn that fails (an API error) or is
+interrupted fails the attempts it carried. Exiting Claude leaves the node
+running; press Enter in its terminal to resume the conversation.
+
+Claude asks whether to trust a folder it has not seen and runs no hooks until
+you answer; its default answer exits. Node folders live in the data directory,
+so trust it once: run `claude` in `~/.ontography` and accept. Folders inside a
+trusted folder are trusted. Until then the node's status says it is waiting.
+
+Headless, Claude runs with `-p`, reading and writing stream JSON. Each message
+is sent once the previous turn has finished, and a turn that ends in an error
+fails its attempt. Nothing can answer a permission prompt, so whatever would
+prompt is denied: allow the node tools in your Claude settings (for example
+`"permissions": {"allow": ["mcp__ontography_node"]}`), or set
+`permission_mode`. In a terminal, Claude's permission prompts appear there as
+usual; `bypassPermissions` also shows Claude's own confirmation when it starts.
 
 ## Edit and recover
 
