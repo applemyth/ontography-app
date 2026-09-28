@@ -9,8 +9,9 @@ use crate::{
     AppError, Result,
     node_mcp::NodeMcp,
     node_tool::{NodeScope, NodeToolContext},
+    process::recover_process,
     terminal::{LaunchSpec, Terminal, TerminalStatus},
-    workflow::{harness, tasks::RetryLedger},
+    workflow::tasks::RetryLedger,
 };
 use ontography::{ExecutionContext, ExecutionFailure, Payload, SessionHandle, SessionStatus};
 use serde::Serialize;
@@ -147,9 +148,7 @@ impl NodeRuntime {
         private_directory(&self.directory)?;
         // Reclaim any previous task/terminal supervisor before lending out this
         // identity or cleaning its abandoned attempt workspaces.
-        harness::recover_process(&self.directory)
-            .await
-            .map_err(worker_error)?;
+        recover_process(&self.directory).await?;
         let cwd = self.directory.join("workspace");
         private_directory(&cwd)?;
         let tools = Arc::new(
@@ -445,9 +444,7 @@ impl<'a> Resources<'a> {
         }
         stopped?;
         if self.lifetime.is_some() {
-            harness::recover_process(&self.owner.directory)
-                .await
-                .map_err(worker_error)?;
+            recover_process(&self.owner.directory).await?;
         }
         Ok(())
     }
@@ -473,10 +470,6 @@ impl Drop for Resources<'_> {
         state.terminal = Weak::new();
         state.tools = Weak::new();
     }
-}
-
-fn worker_error(error: ExecutionFailure) -> AppError {
-    AppError::new(error.class(), error.message())
 }
 
 /// Internal helper called from a terminal supervisor after loss of its owner.

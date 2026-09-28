@@ -47,3 +47,10 @@ impl From<serde_json::Error> for AppError {
         Self::invalid(error.to_string())
     }
 }
+
+/// Hosted executions report app failures under the same classification.
+impl From<AppError> for ontography::ExecutionFailure {
+    fn from(error: AppError) -> Self {
+        Self::new(error.code, error.message)
+    }
+}

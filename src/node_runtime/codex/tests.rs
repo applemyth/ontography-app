@@ -252,9 +252,7 @@ async fn native_codex_server_and_pane_share_a_thread() {
             std::fs::read_to_string(dir.path().join("codex-server.log")).unwrap()
         )
     });
-    crate::workflow::harness::recover_process(dir.path())
-        .await
-        .unwrap();
+    crate::process::recover_process(dir.path()).await.unwrap();
     let resumed = Plan::with_home(&node(), dir.path(), &cwd, dir.path(), &home).unwrap();
     let mut lifetime = Lifetime::new(dir.path()).unwrap();
     let terminal = Terminal::launch(

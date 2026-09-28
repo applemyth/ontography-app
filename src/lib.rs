@@ -15,6 +15,7 @@ pub mod node_mcp;
 pub mod node_runtime;
 pub mod node_tool;
 pub mod persistence;
+pub mod process;
 pub mod protocol;
 pub mod registry;
 pub mod server;
