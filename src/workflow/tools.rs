@@ -1,13 +1,14 @@
 //! The manager's complete workflow interface. Core identities stay behind it.
 
 use super::{
-    Catalog, Document, DocumentNode, IdentityMap, NodeType, WorkflowPayload, artifacts, edit,
-    expand, output, runtime,
+    Binding, Catalog, Document, DocumentNode, IdentityMap, Implementation, WorkflowPayload,
+    artifacts, edit, expand, output, runtime,
     tasks::{self, RetryLedger, TaskKey},
 };
 use crate::{
     AppError, Result,
     catalog::Operation,
+    definition::RunDefinition,
     persistence,
     state::{ManagedRun, Service},
     views,
@@ -19,7 +20,10 @@ use ontography::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 pub fn operations() -> Vec<Operation> {
     let text = json!({"type":"string"});
@@ -201,9 +205,16 @@ pub fn prepare_start(
     if args.get("message").is_some() && args.get("workspace").is_some() {
         return Err(AppError::invalid("Supply message or workspace, not both"));
     }
-    let bindings = components(service)?.bind(&document)?;
+    let catalog = components(service)?;
+    let bindings = catalog.bind(&document)?;
     let identities = IdentityMap::fresh(&document);
-    let declaration = expand(&document, &bindings, id, &identities)?;
+    let declaration = expand(
+        &document,
+        &bindings,
+        &catalog.node_types(&document)?,
+        id,
+        &identities,
+    )?;
     declaration.compile().map_err(AppError::core)?;
     let state = edit::WorkflowState::new(document, bindings, identities)?;
     let input = json!({"message":optional_str(args,"message")?.unwrap_or("")});
@@ -276,13 +287,14 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
                 ));
             }
             initial = original.clone();
-            // An incomplete core creation is recovered by the reserved start path.
-            let declaration = expand(
-                &initial.state.current,
-                &initial.state.bindings,
-                &id,
-                &initial.state.identities,
-            )?;
+            // An incomplete core creation is recovered by the reserved start
+            // path, from the declaration this start saved.
+            let RunDefinition::Logical(declaration) = run.manifest.declaration.clone() else {
+                return Err(AppError::new(
+                    "initialization_conflict",
+                    "This start_id names a different run",
+                ));
+            };
             drop(run);
             service
                 .start_workflow_reserved(&id, declaration, project, initial)
@@ -413,8 +425,8 @@ fn plan_path(run: &ManagedRun, id: &str) -> Result<PathBuf> {
 pub struct TaskView {
     pub node: String,
     pub task_id: String,
-    #[serde(rename = "type")]
-    pub node_type: NodeType,
+    /// The node's types.
+    pub types: BTreeSet<String>,
     pub input: Value,
     pub work_ids: Vec<String>,
     #[serde(skip)]
@@ -426,7 +438,7 @@ pub struct TaskView {
 /// A task the manager may select, before its input is read.
 pub(super) struct Candidate<'a> {
     pub node: &'a DocumentNode,
-    pub node_type: NodeType,
+    pub binding: &'a Binding,
     pub task: tasks::Task,
 }
 
@@ -474,7 +486,7 @@ pub(super) async fn node_tasks<'a>(
         {
             selectable.push(Candidate {
                 node: failed.node,
-                node_type: state.binding(&failed.node.id)?.node_type,
+                binding: state.binding(&failed.node.id)?,
                 task: failed.task,
             });
         }
@@ -511,8 +523,8 @@ async fn ready_tasks<'a>(
             continue;
         }
         let holds_initial = initial == Some(id.as_str());
-        let node_type = state.binding(&node.id)?.node_type;
-        let task = if node_type.runs_tasks() {
+        let binding = state.binding(&node.id)?;
+        let task = if binding.implementation.runs_tasks() {
             // Exactly what its worker runs next; failed tasks that wait or are
             // parked appear among the failures instead.
             let Some(worker) = live.workers.get(id) else {
@@ -546,7 +558,7 @@ async fn ready_tasks<'a>(
         };
         ready.push(Candidate {
             node,
-            node_type,
+            binding,
             task,
         });
     }
@@ -556,7 +568,7 @@ async fn ready_tasks<'a>(
 pub(super) async fn task_view(run: &ManagedRun, candidate: Candidate<'_>) -> Result<TaskView> {
     let Candidate {
         node,
-        node_type,
+        binding,
         task,
     } = candidate;
     let raw_input = if task.is_initial() {
@@ -575,7 +587,7 @@ pub(super) async fn task_view(run: &ManagedRun, candidate: Candidate<'_>) -> Res
     Ok(TaskView {
         node: node.id.clone(),
         task_id: task.key.to_string(),
-        node_type,
+        types: binding.types.clone(),
         input: payload_view(&raw_input),
         raw_input,
         work_ids: task
@@ -651,16 +663,16 @@ async fn failed_tasks<'a>(
 }
 
 /// The core node and retry ledger of the node a manager request names. Only
-/// agent and command tasks fail.
+/// tasks that workers run fail.
 fn failure_ledger<'a>(
     run: &'a ManagedRun,
     state: &'a edit::WorkflowState,
     args: &Value,
 ) -> Result<(&'a str, &'a RetryLedger)> {
     let node = views::field(args, "node")?;
-    if !state.binding(node)?.node_type.runs_tasks() {
+    if !state.binding(node)?.implementation.runs_tasks() {
         return Err(AppError::invalid(
-            "Only agent and command tasks fail and retry",
+            "Only tasks that workers run fail and retry",
         ));
     }
     let id = &state.identities.nodes[node];
@@ -754,7 +766,7 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
         let worker = run.live.as_ref().and_then(|live| live.workers.get(id));
         let execution = run.live.as_ref().and_then(|live| worker.and_then(|worker| live.executions.get(&worker.execution_id)));
         let binding = &state.bindings[&node.id];
-        let mut view = json!({"id":node.id,"type":binding.node_type,"component":node.component,
+        let mut view = json!({"id":node.id,"types":binding.types,"component":node.component,
             "implementation":binding.implementation.kind(),
             "pending":counts.as_ref().and_then(|view|view.counts().get(id.as_str())).map_or(0,|count|count.received()),
             "execution":execution.map(|handle|execution_status(handle.status()))});
@@ -811,7 +823,10 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
                 "This task is no longer ready; read status again",
             )
         })?;
-    if task.node_type != NodeType::Human {
+    if !matches!(
+        state.binding(node)?.implementation,
+        Implementation::Human(_)
+    ) {
         return Err(AppError::invalid("Only human tasks accept decisions"));
     }
     let result = match (args.get("message"), args.get("workspace_id")) {

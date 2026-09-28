@@ -1,8 +1,8 @@
 //! Components that start from another component's settings.
 //!
-//! A preset keeps its base component's node type and implementation and adds
-//! default settings. A placement's settings are merged over those defaults as
-//! a JSON merge patch (RFC 7386): objects merge by key, `null` removes a key,
+//! A preset keeps its base component's implementation and node types, and can
+//! add node types and default settings. A placement's settings are merged over
+//! those defaults as a JSON merge patch (RFC 7386): objects merge by key, `null` removes a key,
 //! and any other value replaces. MCP server lists are read as maps first, so
 //! a placement can add a server to its preset's or remove one with `null`.
 //!
@@ -14,12 +14,14 @@ use ontography::project::{
     BoundComponent, ComponentBindings, ComponentDescription, ProjectComponent,
 };
 use serde_json::{Map, Value};
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 pub(super) struct Preset {
     identity: String,
     description: String,
     base: Arc<dyn ProjectComponent>,
+    /// Node types beyond the base component's.
+    types: BTreeSet<String>,
     defaults: Value,
 }
 
@@ -28,12 +30,14 @@ impl Preset {
         identity: impl Into<String>,
         description: impl Into<String>,
         base: Arc<dyn ProjectComponent>,
+        types: BTreeSet<String>,
         defaults: Value,
     ) -> Result<Self, String> {
         Ok(Self {
             identity: identity.into(),
             description: description.into(),
             base,
+            types,
             defaults: settings(defaults)?,
         })
     }
@@ -41,10 +45,13 @@ impl Preset {
 
 impl ProjectComponent for Preset {
     fn description(&self) -> ComponentDescription {
+        let base = self.base.description();
+        let types: BTreeSet<_> = base.types.iter().chain(&self.types).cloned().collect();
         ComponentDescription {
             identity: self.identity.clone(),
             description: self.description.clone(),
-            ..self.base.description()
+            types: types.into_iter().collect(),
+            ..base
         }
     }
 

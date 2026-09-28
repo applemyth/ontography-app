@@ -4,21 +4,23 @@
 //! accept loose placement settings and produce these exact configurations.
 //! Every field here is already validated and defaulted.
 
-use super::{super::NodeType, is_name};
+use super::is_name;
 use crate::{AppError, Result};
 use ontography::project::BoundComponent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The node tools' own MCP server name; configured servers cannot take it.
 pub const NODE_TOOLS_SERVER: &str = "ontography_node";
 
-/// A node's role in core together with what runs there.
+/// A node's types in core together with what runs there.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
-    pub node_type: NodeType,
+    /// What the node is, as core's schema names it: labels such as `Agent`
+    /// or `Reviewer`. They never choose what runs; the implementation does.
+    pub types: BTreeSet<String>,
     pub implementation: Implementation,
 }
 
@@ -79,6 +81,13 @@ impl Implementation {
             Self::Command(command) => Some(command),
             _ => None,
         }
+    }
+
+    /// Whether a worker takes the node's tasks, so that retry policies,
+    /// grants, and node tools apply. People decide human tasks, and inboxes
+    /// only hold work.
+    pub const fn runs_tasks(&self) -> bool {
+        !matches!(self, Self::Human(_) | Self::Inbox(_))
     }
 
     /// Whether a continuing session runs at the node, rather than the task harness.

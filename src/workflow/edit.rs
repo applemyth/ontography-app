@@ -587,7 +587,6 @@ fn request(edit: GraphEdit) -> RewriteRequest {
 mod tests {
     use super::*;
     use crate::declarations::{GraphEditDeclaration, IngressDeclaration};
-    use crate::workflow::NodeType;
     use crate::workflow::document::{SHARED_NODE_TYPE, expand_builtin as expand};
     use ontography::{
         ActivationProposal, Emission, OutputAuthority, ProposalDecision, ProposalRuntime,
@@ -632,27 +631,22 @@ mod tests {
         session.commit_rewrite(prepared).await.unwrap().unwrap();
     }
 
-    fn fixture() -> (
+    type Fixture = (
         tempfile::TempDir,
         ProposalRuntime,
         SessionHandle,
         WorkflowState,
-    ) {
-        fixture_typed(Typing::Component)
+    );
+
+    fn fixture() -> Fixture {
+        fixture_with(document(), Typing::Component)
     }
 
-    /// A run created with `typing`. Runs created before node types have one
-    /// shared type.
-    fn fixture_typed(
-        typing: Typing,
-    ) -> (
-        tempfile::TempDir,
-        ProposalRuntime,
-        SessionHandle,
-        WorkflowState,
-    ) {
+    /// A run of `doc` created with `typing`. Runs created before node types
+    /// have one shared type.
+    fn fixture_with(doc: Document, typing: Typing) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
-        let doc = document().canonicalized().unwrap();
+        let doc = doc.canonicalized().unwrap();
         let ids = IdentityMap::fresh(&doc);
         let mut declaration = expand(&doc, "edit-test", &ids).unwrap();
         if typing == Typing::Shared {
@@ -729,7 +723,10 @@ mod tests {
         assert_eq!(plan.identities.nodes["writer"], original.nodes["writer"]);
         assert_ne!(plan.identities.nodes["review"], original.nodes["review"]);
         assert_eq!(plan.bindings["writer"].implementation.kind(), "claude");
-        assert_eq!(plan.bindings["review"].node_type, NodeType::Human);
+        assert_eq!(
+            plan.bindings["review"].types,
+            BTreeSet::from(["Human".to_owned()])
+        );
         // One edit adds the human and its connection and removes the inbox
         // and its connection.
         assert_eq!(plan.changes, 4);
@@ -737,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_created_before_node_types_keep_one_shared_type() {
-        let (directory, _runtime, session, mut state) = fixture_typed(Typing::Shared);
+        let (directory, _runtime, session, mut state) = fixture_with(document(), Typing::Shared);
         let path = directory.path().join("workflow.json");
         let original = state.identities.clone();
         let mut next = state.current.clone();
@@ -767,6 +764,53 @@ mod tests {
                 .collect::<Vec<&str>>(),
             [SHARED_NODE_TYPE]
         );
+    }
+
+    #[tokio::test]
+    async fn edits_place_nodes_of_any_type_the_run_declares() {
+        let node_types = |kernel: &Kernel, id: &str| -> Vec<String> {
+            let node = kernel.node_definition(id).unwrap();
+            node.types().iter().map(ToString::to_string).collect()
+        };
+        // A run declares the types of every component it could place,
+        // including its document's own that it doesn't place yet.
+        let mut doc = document();
+        doc.components.insert(
+            "archive".into(),
+            json!({"extends":"inbox","types":["Archive"]}),
+        );
+        let (directory, _runtime, session, mut state) = fixture_with(doc, Typing::Component);
+        let path = directory.path().join("workflow.json");
+        let mut next = state.current.clone();
+        next.nodes
+            .push(serde_json::from_value(json!({"id":"archive","component":"archive"})).unwrap());
+        // Another type replaces a node: the review inbox becomes an archive.
+        next.nodes
+            .iter_mut()
+            .find(|node| node.id == "review")
+            .unwrap()
+            .component = "archive".into();
+        let before = state.identities.clone();
+        let plan = preview(&session, &state, next).await.unwrap();
+        assert_ne!(plan.identities.nodes["review"], before.nodes["review"]);
+        commit(&session, &mut state, &path, plan).await.unwrap();
+        let kernel = session.kernel().await.unwrap();
+        for node in ["archive", "review"] {
+            assert_eq!(
+                node_types(&kernel, &state.identities.nodes[node]),
+                ["Archive", "Inbox"]
+            );
+        }
+        // A type the run never declared needs a new run.
+        let mut later = state.current.clone();
+        later
+            .components
+            .insert("audit".into(), json!({"extends":"inbox","types":["Audit"]}));
+        later
+            .nodes
+            .push(serde_json::from_value(json!({"id":"audit","component":"audit"})).unwrap());
+        let error = preview(&session, &state, later).await.unwrap_err();
+        assert_eq!(error.code, "unknown_node_type");
     }
 
     #[tokio::test]

@@ -1,10 +1,12 @@
 //! Components: pre-configured nodes that a workflow document places.
 //!
 //! This follows core's project model (`ontography::project`). A component
-//! describes a node, including its core node type, and binds each placement's
-//! settings to a trusted implementation and its exact configuration. The
+//! describes a node, including its core node types, and binds each placement's
+//! settings to a trusted implementation and its exact configuration. Types
+//! label what a node is; its implementation alone decides what runs. The
 //! built-in components are this app's; the user's library and a document's
-//! own `components` add specifications that extend them with defaults.
+//! own `components` add specifications that extend them with types and
+//! defaults.
 //!
 //! A run keeps the bindings made when its document was started or edited, so
 //! changing the library never silently changes a running node.
@@ -20,14 +22,18 @@ pub use config::{
 };
 pub use library::{LIBRARY_FILE, Library, PROVIDER};
 
-use super::{Document, DocumentNode, NodeType};
+use super::{Document, DocumentNode, document::SHARED_NODE_TYPE};
 use crate::{AppError, Result};
 use ontography::{
     IngressMode,
     project::{ComponentBindings, ComponentDescription, ProjectComponent},
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 /// Each node's binding, by node name.
 pub type Bindings = BTreeMap<String, Binding>;
@@ -65,6 +71,28 @@ impl Catalog {
 
     /// Bind every node of `document`, including to its own components.
     pub fn bind(&self, document: &Document) -> Result<Bindings> {
+        let catalog = self.with_document(document)?;
+        document
+            .nodes
+            .iter()
+            .map(|node| Ok((node.id.clone(), catalog.bind_node(document, node)?)))
+            .collect()
+    }
+
+    /// Every node type a component here or in `document` gives its nodes:
+    /// the vocabulary a new run declares, so later edits can place any of
+    /// these components.
+    pub fn node_types(&self, document: &Document) -> Result<BTreeSet<String>> {
+        let catalog = self.with_document(document)?;
+        let mut types = BTreeSet::new();
+        for (name, component) in &catalog.components {
+            types.extend(component_types(name, &component.description())?);
+        }
+        Ok(types)
+    }
+
+    /// This catalog with `document`'s own components.
+    fn with_document(&self, document: &Document) -> Result<Self> {
         let loaded = library::Provider {
             scope: "document",
             known: &self.components,
@@ -73,12 +101,7 @@ impl Catalog {
         .map_err(|error| AppError::new("invalid_workflow_document", error))?;
         let mut components = self.components.clone();
         components.extend(loaded);
-        let catalog = Self { components };
-        document
-            .nodes
-            .iter()
-            .map(|node| Ok((node.id.clone(), catalog.bind_node(document, node)?)))
-            .collect()
+        Ok(Self { components })
     }
 
     /// What each component is, for the manager choosing one.
@@ -101,11 +124,8 @@ impl Catalog {
             .get(&node.component)
             .ok_or_else(|| error(format!("unknown component {:?}", node.component)))?;
         let description = component.description();
-        let node_type = match description.types.as_slice() {
-            [name] => NodeType::from_core(name),
-            _ => None,
-        }
-        .ok_or_else(|| error("its component must give exactly one workflow node type".into()))?;
+        let types = component_types(&node.component, &description)
+            .map_err(|failure| error(failure.message))?;
         let ingress = IngressMode::from(node.join);
         if !description.ingress_modes.contains(&ingress) {
             return Err(error(format!(
@@ -116,18 +136,50 @@ impl Catalog {
         let bound = component
             .bind(node.config.clone(), &placement(document, node, ingress))
             .map_err(error)?;
-        if !node_type.runs_tasks()
+        let implementation = Implementation::from_bound(bound)?;
+        if !implementation.runs_tasks()
             && (node.retry.is_some() || !node.grants.is_empty() || node.tools.is_some())
         {
             return Err(error(
-                "retry, grants, and tools apply only to agent and command nodes".into(),
+                "retry, grants, and tools apply only to nodes that run tasks".into(),
             ));
         }
         Ok(Binding {
-            node_type,
-            implementation: Implementation::from_bound(bound)?,
+            types,
+            implementation,
         })
     }
+}
+
+/// The node types a component gives: at least one, each a valid type name.
+fn component_types(name: &str, description: &ComponentDescription) -> Result<BTreeSet<String>> {
+    let invalid = |message: String| {
+        AppError::new(
+            "invalid_component",
+            format!("Component {name:?}: {message}"),
+        )
+    };
+    if description.types.is_empty() {
+        return Err(invalid("it gives its nodes no type".into()));
+    }
+    for node_type in &description.types {
+        check_type(node_type).map_err(invalid)?;
+    }
+    Ok(description.types.iter().cloned().collect())
+}
+
+/// A node type's name must suit core's schema and other programs' labels.
+/// The one type of runs created before node types is reserved.
+fn check_type(name: &str) -> std::result::Result<(), String> {
+    if !is_name(name) {
+        return Err(format!(
+            "node type {name:?} must use letters, digits, '-' or '_'"
+        ));
+    }
+    if name == SHARED_NODE_TYPE {
+        return Err(format!("node type {name:?} is reserved"));
+    }
+    Ok(())
 }
 
 /// A node's connections as core's component binder sees them. Workflow
@@ -228,6 +280,10 @@ mod tests {
         Catalog::with_library(&serde_json::from_value(value).unwrap()).unwrap()
     }
 
+    fn types<const N: usize>(names: [&str; N]) -> BTreeSet<String> {
+        names.into_iter().map(str::to_owned).collect()
+    }
+
     fn agent(binding: &Binding) -> (&'static str, &AgentConfig) {
         match &binding.implementation {
             Implementation::Codex(config) => ("codex", config),
@@ -237,14 +293,14 @@ mod tests {
     }
 
     #[test]
-    fn built_in_components_bind_their_roles_and_implementations() {
+    fn built_in_components_bind_their_types_and_implementations() {
         let catalog = Catalog::builtin();
         let codex = bind_one(
             &catalog,
             json!({"component":"agent","config":{"prompt":"p"}}),
         )
         .unwrap();
-        assert_eq!(codex.node_type, NodeType::Agent);
+        assert_eq!(codex.types, types(["Agent"]));
         let (harness, config) = agent(&codex);
         assert_eq!((harness, config.pty, config.mcp.len()), ("codex", true, 0));
         let claude = bind_one(
@@ -268,9 +324,9 @@ mod tests {
             })
         );
         for (component, node_type) in [
-            ("command", NodeType::Command),
-            ("human", NodeType::Human),
-            ("inbox", NodeType::Inbox),
+            ("command", "Command"),
+            ("human", "Human"),
+            ("inbox", "Inbox"),
         ] {
             let config = if component == "command" {
                 json!({"argv":["true"]})
@@ -279,7 +335,7 @@ mod tests {
             };
             let binding =
                 bind_one(&catalog, json!({"component":component,"config":config})).unwrap();
-            assert_eq!(binding.node_type, node_type);
+            assert_eq!(binding.types, types([node_type]));
             assert_eq!(binding.implementation.kind(), component);
         }
     }
@@ -353,8 +409,10 @@ mod tests {
             },
             "components": {
                 "reviewer": {"provider":"ontography","extends":"claude","description":"Reviews changes.",
+                    "types":["Reviewer"],
                     "config":{"prompt":"Review for security.","model":"opus","mcp":["github","docs"]}},
-                "strict-reviewer": {"extends":"reviewer","config":{"permission_mode":"plan"}}
+                "strict-reviewer": {"extends":"reviewer","types":["Strict","Agent"],
+                    "config":{"permission_mode":"plan"}}
             }
         }));
         let binding = bind_one(
@@ -362,6 +420,8 @@ mod tests {
             json!({"component":"strict-reviewer","config":{"mcp":{"docs":null,"local":{"command":"serve"}}}}),
         )
         .unwrap();
+        // Types accumulate along the chain of components.
+        assert_eq!(binding.types, types(["Agent", "Reviewer", "Strict"]));
         let (harness, config) = agent(&binding);
         assert_eq!(harness, "claude");
         assert_eq!(config.prompt, "Review for security.");
@@ -372,7 +432,11 @@ mod tests {
         let descriptions = catalog.describe();
         assert_eq!(descriptions["reviewer"].description, "Reviews changes.");
         assert_eq!(descriptions["reviewer"].identity, "library.reviewer");
-        assert_eq!(descriptions["strict-reviewer"].types, ["Agent"]);
+        assert_eq!(descriptions["reviewer"].types, ["Agent", "Reviewer"]);
+        assert_eq!(
+            descriptions["strict-reviewer"].types,
+            ["Agent", "Reviewer", "Strict"]
+        );
     }
 
     #[test]
@@ -399,6 +463,14 @@ mod tests {
                 "object",
             ),
             (json!({"components":{"a b":{"extends":"agent"}}}), "letters"),
+            (
+                json!({"components":{"a":{"extends":"agent","types":["Code Reviewer"]}}}),
+                "letters",
+            ),
+            (
+                json!({"components":{"a":{"extends":"agent","types":["WorkflowNode"]}}}),
+                "reserved",
+            ),
         ] {
             let library: Library = serde_json::from_value(value.clone()).unwrap();
             let error = Catalog::with_library(&library).err().unwrap();
@@ -430,6 +502,20 @@ mod tests {
                 .unwrap()
                 .describe()
                 .contains_key("mine")
+        );
+    }
+
+    #[test]
+    fn a_new_run_declares_every_type_its_components_give() {
+        let catalog =
+            library(json!({"components":{"reviewer":{"extends":"codex","types":["Reviewer"]}}}));
+        let document = document(
+            json!([{"id":"a","component":"inbox"}]),
+            json!({"auditor":{"extends":"human","types":["Auditor"]}}),
+        );
+        assert_eq!(
+            catalog.node_types(&document).unwrap(),
+            types(["Agent", "Auditor", "Command", "Human", "Inbox", "Reviewer"])
         );
     }
 
@@ -468,7 +554,7 @@ mod tests {
         )
         .unwrap();
         let saved = serde_json::to_value(&binding).unwrap();
-        assert_eq!(saved["node_type"], "Agent");
+        assert_eq!(saved["types"], json!(["Agent"]));
         assert_eq!(saved["implementation"]["kind"], "claude");
         assert_eq!(serde_json::from_value::<Binding>(saved).unwrap(), binding);
         assert_eq!(

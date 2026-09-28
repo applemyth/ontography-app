@@ -11,7 +11,7 @@ use super::{
     },
     preset::Preset,
 };
-use crate::workflow::{NodeType, document::CONTRACT};
+use crate::workflow::document::CONTRACT;
 use ontography::{
     IngressMode,
     project::{BoundComponent, ComponentBindings, ComponentDescription, ProjectComponent},
@@ -19,7 +19,10 @@ use ontography::{
 use schemars::JsonSchema;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// Permission modes the installed Claude Code accepts for `--permission-mode`.
 const PERMISSION_MODES: [&str; 6] = [
@@ -42,6 +45,7 @@ pub(super) fn components(
                 identity(name),
                 description,
                 agent.clone(),
+                BTreeSet::new(),
                 json!({"harness": name}),
             )
             .expect("built-in preset settings are an object"),
@@ -67,11 +71,13 @@ fn identity(name: &str) -> String {
     format!("ontography.{name}")
 }
 
-fn description<T: JsonSchema>(name: &str, text: &str, node_type: NodeType) -> ComponentDescription {
+/// A built-in component's description. Each gives its nodes one type, named
+/// for what they are; library components can add more.
+fn description<T: JsonSchema>(name: &str, text: &str, node_type: &str) -> ComponentDescription {
     ComponentDescription {
         identity: identity(name),
         description: text.into(),
-        types: vec![node_type.as_str().into()],
+        types: vec![node_type.into()],
         result_contract: CONTRACT.into(),
         // Workflow connections are not ports: any node may connect to any other.
         inputs: BTreeMap::new(),
@@ -147,7 +153,7 @@ impl ProjectComponent for Agent {
         description::<AgentSettings>(
             "agent",
             "A continuing agent conversation; harness chooses Codex (default) or Claude.",
-            NodeType::Agent,
+            "Agent",
         )
     }
 
@@ -245,11 +251,7 @@ struct Command;
 
 impl ProjectComponent for Command {
     fn description(&self) -> ComponentDescription {
-        description::<CommandSettings>(
-            "command",
-            "Runs a program once per task.",
-            NodeType::Command,
-        )
+        description::<CommandSettings>("command", "Runs a program once per task.", "Command")
     }
 
     fn bind(&self, config: Value, _: &ComponentBindings) -> Result<BoundComponent, String> {
@@ -280,7 +282,7 @@ impl ProjectComponent for Human {
         description::<HumanSettings>(
             "human",
             "Waits for a person's decision on each task.",
-            NodeType::Human,
+            "Human",
         )
     }
 
@@ -304,7 +306,7 @@ impl ProjectComponent for Inbox {
         description::<InboxSettings>(
             "inbox",
             "Holds incoming work for inspection and export.",
-            NodeType::Inbox,
+            "Inbox",
         )
     }
 

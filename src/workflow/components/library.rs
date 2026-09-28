@@ -4,8 +4,8 @@
 //! load by name and component specifications. Specifications follow core's
 //! project format: each names its `provider`, and that provider validates the
 //! rest. This app's provider, `ontography`, reads specifications that extend
-//! another component with default settings; a document's own `components`
-//! use the same format.
+//! another component with node types and default settings; a document's own
+//! `components` use the same format.
 
 use super::{config::McpServer, preset::Preset};
 use crate::{AppError, Result, declarations::parse_json};
@@ -15,7 +15,11 @@ use ontography::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 pub const LIBRARY_FILE: &str = "library.json";
 pub const PROVIDER: &str = "ontography";
@@ -63,10 +67,14 @@ struct Spec {
     /// Defaults to this app's provider.
     #[serde(default = "provider")]
     provider: String,
-    /// The component whose node type and implementation this one keeps.
+    /// The component whose node types and implementation this one keeps.
     extends: String,
     /// What the component is for; defaults to its base's description.
     description: Option<String>,
+    /// Node types this component's nodes have besides its base's, such as
+    /// `Reviewer`. Types are labels: they never change what runs.
+    #[serde(default)]
+    types: BTreeSet<String>,
     /// Default settings, which each placement's settings are merged over.
     #[serde(default = "no_settings")]
     config: Value,
@@ -108,6 +116,13 @@ impl ComponentProvider for Provider<'_> {
                 }
                 let spec: Spec = serde_json::from_value(spec.clone())
                     .map_err(|error| format!("component {name:?}: {error}"))?;
+                if let Some(error) = spec
+                    .types
+                    .iter()
+                    .find_map(|name| super::check_type(name).err())
+                {
+                    return Err(format!("component {name:?}: {error}"));
+                }
                 if spec.provider != PROVIDER {
                     return Err(format!(
                         "component {name:?} names unknown provider {:?}",
@@ -168,6 +183,7 @@ impl Provider<'_> {
                 format!("{}.{name}", self.scope),
                 description,
                 base,
+                spec.types.clone(),
                 spec.config.clone(),
             )
             .map_err(|error| format!("component {name:?}: {error}"))?,

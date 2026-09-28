@@ -1,7 +1,6 @@
 //! The manager's workflow language and its expansion into existing declarations.
 
 use super::{
-    NodeType,
     components::{Binding, Bindings},
     tasks::RetryPolicy,
 };
@@ -261,7 +260,7 @@ impl Typing {
     pub fn node_types(self, binding: &Binding) -> BTreeSet<String> {
         match self {
             Self::Shared => BTreeSet::from([SHARED_NODE_TYPE.to_owned()]),
-            Self::Component => BTreeSet::from([binding.node_type.as_str().to_owned()]),
+            Self::Component => binding.types.clone(),
         }
     }
 
@@ -310,10 +309,13 @@ pub(super) fn root(id: &str) -> RootDeclaration {
 }
 
 /// Expand a bound document into a new run's declaration. Each node has its
-/// component's types in core, and its binding is its execution binding.
+/// component's types in core, and its binding is its execution binding. The
+/// run declares `node_types` and every type its nodes have: edits can place
+/// nodes only of declared types.
 pub fn expand(
     document: &Document,
     bindings: &Bindings,
+    node_types: &BTreeSet<String>,
     definition_id: &str,
     identities: &IdentityMap,
 ) -> Result<GraphDeclaration> {
@@ -363,9 +365,12 @@ pub fn expand(
         version: DECLARATION_VERSION,
         id: definition_id.into(),
         schema: SchemaDeclaration {
-            node_types: NodeType::ALL
+            node_types: node_types
                 .iter()
-                .map(|node_type| node_type.as_str().into())
+                .chain(bindings.values().flat_map(|binding| &binding.types))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect(),
             object_types: vec![OBJECT_TYPE.into()],
             authority_tags: vec![AUTHORITY.into()],
@@ -394,8 +399,10 @@ pub(crate) fn expand_builtin(
     definition_id: &str,
     identities: &IdentityMap,
 ) -> Result<GraphDeclaration> {
-    let bindings = super::Catalog::builtin().bind(document)?;
-    expand(document, &bindings, definition_id, identities)
+    let catalog = super::Catalog::builtin();
+    let bindings = catalog.bind(document)?;
+    let node_types = catalog.node_types(document)?;
+    expand(document, &bindings, &node_types, definition_id, identities)
 }
 
 /// The workspace alternative preserves core's explicit package envelope unchanged.
@@ -435,7 +442,7 @@ pub fn validate_payload(bytes: &[u8]) -> std::result::Result<(), ContractViolati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::{Catalog, NodeType, components::definition_digest};
+    use crate::workflow::{Catalog, components::definition_digest};
 
     fn document() -> Document {
         Document::parse(r#"{"name":"example","entry":"write","nodes":[{"id":"write","component":"agent","config":{"prompt":"Write"}},{"id":"test","component":"command","config":{"argv":["true"]}}],"edges":[{"from":"write","to":"test"}]}"#).unwrap()
@@ -453,13 +460,12 @@ mod tests {
         second.nodes.reverse();
         second.edges.reverse();
         assert_eq!(first, second.canonicalized().unwrap());
-        let bindings = bind(&first).unwrap();
         assert_eq!(
-            expand(&first, &bindings, "example", &identities)
+            expand_builtin(&first, "example", &identities)
                 .unwrap()
                 .fingerprint()
                 .unwrap(),
-            expand(&second, &bindings, "example", &identities)
+            expand_builtin(&second, "example", &identities)
                 .unwrap()
                 .fingerprint()
                 .unwrap()
@@ -467,41 +473,20 @@ mod tests {
     }
 
     #[test]
-    fn each_node_role_is_its_core_node_type_and_its_binding_its_execution_binding() {
+    fn each_node_has_its_component_types_and_its_binding_as_execution_binding() {
         let mut document = document();
         let identities = IdentityMap::fresh(&document);
         let mut fingerprints = BTreeSet::new();
         for (component, config, node_type, implementation) in [
-            (
-                "agent",
-                json!({"prompt":"Different"}),
-                NodeType::Agent,
-                "codex",
-            ),
-            (
-                "claude",
-                json!({"prompt":"Different"}),
-                NodeType::Agent,
-                "claude",
-            ),
-            (
-                "command",
-                json!({"argv":["false"]}),
-                NodeType::Command,
-                "command",
-            ),
-            (
-                "human",
-                json!({"prompt":"Approve?"}),
-                NodeType::Human,
-                "human",
-            ),
-            ("inbox", json!({}), NodeType::Inbox, "inbox"),
+            ("agent", json!({"prompt":"Different"}), "Agent", "codex"),
+            ("claude", json!({"prompt":"Different"}), "Agent", "claude"),
+            ("command", json!({"argv":["false"]}), "Command", "command"),
+            ("human", json!({"prompt":"Approve?"}), "Human", "human"),
+            ("inbox", json!({}), "Inbox", "inbox"),
         ] {
             document.nodes[1].component = component.into();
             document.nodes[1].config = config;
-            let declaration =
-                expand(&document, &bind(&document).unwrap(), "example", &identities).unwrap();
+            let declaration = expand_builtin(&document, "example", &identities).unwrap();
             assert_eq!(
                 declaration.schema.node_types,
                 ["Agent", "Command", "Human", "Inbox"]
@@ -511,7 +496,7 @@ mod tests {
                 .iter()
                 .find(|node| node.id == identities.nodes["write"])
                 .unwrap();
-            assert_eq!(node.types, [node_type.as_str()]);
+            assert_eq!(node.types, [node_type]);
             let binding = declaration
                 .execution_bindings
                 .iter()
@@ -537,12 +522,12 @@ mod tests {
         bad = original.clone();
         bad.nodes[0].config["typo"] = json!(true);
         assert!(bind(&bad).is_err());
-        let bindings = bind(&original).unwrap();
-        assert!(expand(&original, &bindings, "example", &IdentityMap::default()).is_err());
+        assert!(expand_builtin(&original, "example", &IdentityMap::default()).is_err());
         assert!(
             expand(
                 &original,
                 &Bindings::new(),
+                &BTreeSet::new(),
                 "example",
                 &IdentityMap::fresh(&original)
             )
@@ -593,7 +578,7 @@ mod tests {
                 "{invalid} must be rejected"
             );
         }
-        // Whether a node takes tasks depends on its component's node type.
+        // Whether a node takes tasks depends on its implementation.
         for invalid in [
             r#"{"id":"write","component":"human","retry":{"max_attempts":2}}"#,
             r#"{"id":"write","component":"inbox","grants":["retire"]}"#,

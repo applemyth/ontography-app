@@ -5,7 +5,6 @@ pub mod components;
 pub mod document;
 pub mod edit;
 pub mod harness;
-mod node_type;
 mod output;
 pub mod runtime;
 pub mod tasks;
@@ -15,4 +14,3 @@ pub use components::{Binding, Bindings, BoundNode, Catalog, Implementation};
 pub use document::{
     Document, DocumentEdge, DocumentNode, Grant, IdentityMap, WorkflowPayload, edge_key, expand,
 };
-pub use node_type::NodeType;
