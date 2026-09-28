@@ -38,9 +38,10 @@ struct Client {
 
 impl Client {
     async fn new(server: &NodeMcp) -> Self {
-        let mut child = Command::new(crate::launcher::application_executable().unwrap())
-            .arg("node-mcp")
-            .envs(server.environment())
+        let stdio = server.server().unwrap();
+        let mut child = Command::new(&stdio.command)
+            .args(&stdio.args)
+            .envs(&stdio.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

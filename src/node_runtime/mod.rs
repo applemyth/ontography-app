@@ -1,6 +1,8 @@
 //! One continuing agent execution at a graph node. Terminals are views of this
 //! execution; its selected scoped tools are exposed through the node MCP adapter.
 
+#[allow(dead_code, reason = "NodeRuntime::run does not launch it yet")]
+pub(crate) mod claude;
 pub mod codex;
 mod process;
 mod rpc;

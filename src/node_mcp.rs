@@ -9,6 +9,7 @@ use crate::{
     AppError, Result,
     node_tool::{NodeToolContext, Reply},
     protocol,
+    workflow::components::McpServer,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -89,6 +90,20 @@ impl NodeMcp {
     pub async fn shutdown(&mut self) {
         self.stop.send_replace(true);
         let _ = (&mut self.task).await;
+    }
+
+    /// The node tools as a stdio MCP server, for agents that take a server
+    /// list: this application's `node-mcp` proxy, bound to this socket.
+    pub fn server(&self) -> Result<McpServer> {
+        let program = crate::launcher::application_executable()?;
+        let command = program
+            .to_str()
+            .ok_or_else(|| AppError::invalid("MCP executable path must be UTF-8"))?;
+        Ok(McpServer {
+            command: command.into(),
+            args: vec!["node-mcp".into()],
+            env: self.environment(),
+        })
     }
 
     pub fn environment(&self) -> BTreeMap<String, String> {

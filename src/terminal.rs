@@ -842,6 +842,12 @@ impl Terminal {
         }
     }
 
+    /// The visible screen as plain text, one line per row.
+    pub fn screen_text(&self) -> String {
+        let state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.parser.screen().contents()
+    }
+
     fn snapshot_ready(&self) -> bool {
         self.shared
             .state
