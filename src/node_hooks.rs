@@ -31,7 +31,15 @@ const HOOK_TIMEOUT_SECS: u64 = 10;
 const MAX_INPUT_BYTES: u64 = 1024 * 1024;
 
 /// The hook events a node listens to.
-pub const EVENTS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "Stop", "Notification"];
+pub const EVENTS: [&str; 7] = [
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PermissionRequest",
+    "Stop",
+    "StopFailure",
+    "Notification",
+];
 
 /// One hook invocation, in the order Claude ran them.
 #[derive(Clone, Debug)]
