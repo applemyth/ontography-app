@@ -1,6 +1,6 @@
 # Ontography management
 
-Describe workflows with `flow` tools. A workflow document names its steps, their worker settings, its entry, and the connections between steps. Use the names in that document when inspecting or changing a run.
+Describe workflows with `flow` tools. A workflow document names its steps, the component each step places with its settings, its entry, and the connections between steps. Use the names in that document when inspecting or changing a run. `flow.library` lists the components you can place (the built-in `agent`, `codex`, `claude`, `command`, `human`, and `inbox`, plus the user's library) with their node types and settings, and the MCP servers agents can load by name. Prefer a library component when one fits; a step's settings override the component's defaults.
 
 Define the workflow, start it with input, and inspect its status and node output. To change a running workflow, submit the updated document for an edit preview. Review the pending work it would discard before committing. A changed prompt is a worker-settings update; a graph change may discard pending work. Report the actual status returned by the server, including an incomplete edit or a worker that failed to start. A failed task is retried per its node's retry policy while other work continues; status lists failures. Retry a parked task, or every failed task at a node, with `flow.retry`; discard one with `flow.discard`.
 

@@ -170,10 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn lost_queue_ack_keeps_the_exact_message_receipt_prepared_and_stops_delivery() {
-        use crate::{
-            node_runtime::NodeRuntime,
-            node_tool::tests::{Fixture, document},
-        };
+        use crate::node_tool::tests::{Fixture, document};
         let fixture = Fixture::new(document(json!({})), "worker", None).await;
         fixture.deliver("Do this once per attempt").await;
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -210,17 +207,9 @@ mod tests {
             }
         });
         let mut rpc = Rpc::connect(&path).await.unwrap();
-        let runtime = NodeRuntime::new(
-            directory.path().into(),
-            directory.path().into(),
-            fixture.session.clone(),
-            fixture.scope.subscribe(),
-            fixture.ledger.clone(),
-            None,
-        );
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            runtime.deliver(&mut rpc, "thread", &fixture.tools),
+            crate::node_runtime::codex::deliver(&mut rpc, "thread", &fixture.tools, |_| {}),
         )
         .await
         .unwrap()

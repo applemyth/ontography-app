@@ -9,16 +9,38 @@ mod native_delivery;
 
 const THREAD: &str = "6b121953-b116-4a0f-b2dd-a63c293e2c85";
 
-fn node() -> DocumentNode {
-    serde_json::from_value(json!({"id":"writer","component":"agent","config":{"prompt":"Review changes","model":"test-model"}})).unwrap()
+/// A node as the Codex implementation receives it.
+struct Node {
+    id: String,
+    config: AgentConfig,
+}
+
+fn node() -> Node {
+    Node {
+        id: "writer".into(),
+        config: AgentConfig {
+            prompt: "Review changes".into(),
+            model: Some("test-model".into()),
+            pty: true,
+            mcp: BTreeMap::new(),
+            permission_mode: None,
+        },
+    }
 }
 
 #[tokio::test]
 async fn session_persists_exact_identity_and_removes_only_stale_graph_queue_entries() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let mut definition = node();
-    let plan =
-        Plan::with_home(&definition, dir.path(), dir.path(), dir.path(), dir.path()).unwrap();
+    let plan = Plan::with_home(
+        &definition.id,
+        &definition.config,
+        dir.path(),
+        dir.path(),
+        dir.path(),
+        dir.path(),
+    )
+    .unwrap();
     let listener = UnixListener::bind(&plan.socket).unwrap();
     let server = tokio::spawn(async move {
         let mut seen = Vec::new();
@@ -61,8 +83,15 @@ async fn session_persists_exact_identity_and_removes_only_stale_graph_queue_entr
     plan.attach(THREAD).unwrap();
     assert_eq!(std::fs::read_to_string(&plan.ready).unwrap().trim(), THREAD);
     drop(rpc);
-    let next =
-        Plan::with_home(&definition, dir.path(), dir.path(), dir.path(), dir.path()).unwrap();
+    let next = Plan::with_home(
+        &definition.id,
+        &definition.config,
+        dir.path(),
+        dir.path(),
+        dir.path(),
+        dir.path(),
+    )
+    .unwrap();
     let rpc = Rpc::connect(&plan.socket).await.unwrap();
     assert_eq!(next.open(&rpc).await.unwrap(), THREAD);
     drop(rpc);
@@ -93,10 +122,21 @@ async fn session_persists_exact_identity_and_removes_only_stale_graph_queue_entr
     assert_eq!(deleted, [json!("stale"), json!("stale")]);
     assert!(!seen.iter().any(|call| call["method"] == "turn/start"));
     definition.id = "another-node".into();
-    assert!(Plan::with_home(&definition, dir.path(), dir.path(), dir.path(), dir.path()).is_err());
     assert!(
         Plan::with_home(
-            &node(),
+            &definition.id,
+            &definition.config,
+            dir.path(),
+            dir.path(),
+            dir.path(),
+            dir.path()
+        )
+        .is_err()
+    );
+    assert!(
+        Plan::with_home(
+            "writer",
+            &node().config,
             dir.path(),
             dir.path(),
             dir.path(),
@@ -126,7 +166,15 @@ async fn native_codex_server_and_pane_share_a_thread() {
         ),
     )
     .unwrap();
-    let plan = Plan::with_home(&node(), dir.path(), &cwd, dir.path(), &home).unwrap();
+    let plan = Plan::with_home(
+        "writer",
+        &node().config,
+        dir.path(),
+        &cwd,
+        dir.path(),
+        &home,
+    )
+    .unwrap();
     let overrides = vec![
         "model_provider=\"fixture\"".into(),
         "model_providers.fixture={name=\"Fixture\",base_url=\"http://127.0.0.1:1/v1\",wire_api=\"responses\",requires_openai_auth=false,request_max_retries=0,stream_max_retries=0}".into(),
@@ -253,7 +301,15 @@ async fn native_codex_server_and_pane_share_a_thread() {
         )
     });
     crate::process::recover_process(dir.path()).await.unwrap();
-    let resumed = Plan::with_home(&node(), dir.path(), &cwd, dir.path(), &home).unwrap();
+    let resumed = Plan::with_home(
+        "writer",
+        &node().config,
+        dir.path(),
+        &cwd,
+        dir.path(),
+        &home,
+    )
+    .unwrap();
     let mut lifetime = Lifetime::new(dir.path()).unwrap();
     let terminal = Terminal::launch(
         lifetime.supervise(resumed.launch(Path::new("codex"), &overrides, env)),

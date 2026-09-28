@@ -44,7 +44,7 @@ core commits graph and package state; workflow runtime reconciles worker process
 | --- | --- | --- | --- |
 | Shell + UI | Where you sit. Attach, detach, look at the graph and the panes. | 8, 12 | Manager terminal, graph view, and selected agent terminal implemented. |
 | Manager | Creates documents, starts runs, reads status, and requests edits. | 8, 11 | Document tools and Pi allowlist implemented. |
-| Workflow document | Named nodes, kind/config, joins, directed edges, and entry. | 10 | Implemented. |
+| Workflow document | Named nodes placing components with settings, joins, directed edges, and entry. | 10 | Implemented. |
 | Compiler + library | Fixed vocabulary, declaration expansion, edit grammar, and diff. | 2–5, 9 | Implemented using existing core APIs. |
 | Core | Enforces graph and package/workflow semantics. | — | Existing dependency; no additions in scope. |
 | Nodes | Host continuing agents or execute tasks using scoped graph tools. | 1, 6, 7 | Persistent Codex server, attached PTY client, incoming conversation messages, task harness, selected tools, and MCP implemented. |
@@ -58,9 +58,9 @@ The manager writes it. The compiler checks it and returns errors in these terms.
   "name": "review-and-fix",
   "entry": "triage",
   "nodes": [
-    {"id": "triage", "kind": "agent", "config": {"prompt": "Review the input and describe the changes needed."}},
-    {"id": "fix", "kind": "agent", "config": {"prompt": "Apply the requested changes and report the result."}},
-    {"id": "result", "kind": "inbox"}
+    {"id": "triage", "component": "claude", "config": {"prompt": "Review the input and describe the changes needed."}},
+    {"id": "fix", "component": "codex", "config": {"prompt": "Apply the requested changes and report the result."}},
+    {"id": "result", "component": "inbox"}
   ],
   "edges": [
     {"from": "triage", "to": "fix"},
@@ -69,18 +69,23 @@ The manager writes it. The compiler checks it and returns errors in these terms.
 }
 ```
 
-Fields: `name`, `entry`, `nodes` (`id`, `kind`, `config`, `join`), and directed
-`edges` (`from`, `to`). Join belongs to the receiving node: `any` (the default)
-takes one available input; `all` waits for one from every incoming edge. There
-is one entry. Cycles and self loops are supported; duplicate connections are
-rejected. Kinds are `agent`, `command`, `human`, and `inbox`. See
-[WORKFLOWS.md](docs/WORKFLOWS.md) for configuration and a working example.
+Fields: `name`, `entry`, optional `components`, `nodes` (`id`, `component`,
+`config`, `join`), and directed `edges` (`from`, `to`). Join belongs to the
+receiving node: `any` (the default) takes one available input; `all` waits for
+one from every incoming edge. There is one entry. Cycles and self loops are
+supported; duplicate connections are rejected. See
+[WORKFLOWS.md](docs/WORKFLOWS.md) for components, the library, and a working
+example.
 
 ## Library
 
 The app supplies the initial vocabulary and defaults.
 
-- Worker kinds: `agent` (Codex), `command`, `human`, and `inbox`.
+- Components, following core's project model: `agent` (with `codex` and
+  `claude` presets, in a terminal or headless), `command`, `human`, and
+  `inbox`. The user's `library.json` and a document's own `components` add
+  components that extend these with defaults, and MCP servers by name.
+- Node types, one per role: `Agent`, `Command`, `Human`, and `Inbox`.
 - Package types: `workspace` (item 2), `message` (item 3), `union` (item 4).
 - One edge rule accepting `union` (item 5).
 - One implicit authority tag on every edge and root.
@@ -88,17 +93,19 @@ The app supplies the initial vocabulary and defaults.
   add/remove connections, including self loops. Replacement uses removal and
   addition (item 9).
 
-Every kind uses the same core node type, result contract, edge rule, and tag.
-Kind and worker config live only in app execution bindings. The four core
-variants come from join (`any`/`all`) and root status, not worker kind. The
-generated grammar has 40 productions: eight node rules, 24 connection rules,
-and eight self-loop rules.
+Each node's role is its core node type; every node shares the result contract,
+edge rule, and tag. A component binds a node to a trusted implementation and
+exact configuration, which become its execution binding. Core matches rewrite
+nodes exactly, so the core variants come from node type, join (`any`/`all`),
+and root status. The generated grammar has 448 productions: 32 node rules, 384
+connection rules, and 32 self-loop rules. Runs created before node types keep
+one shared type and their original 40 rules.
 
-Command config changes take effect on the next task. Agent config changes stop
-and replace the running session process, preserving its recorded conversation
-and working directory. Grants and topology refresh its tooling scope in place.
-Changing kind stops and waits for the old worker before launching its replacement.
-A prompt or kind change alone does not rewrite the core graph.
+Command config changes take effect on the next task. A change to an agent's
+binding stops and replaces the running session process, preserving its recorded
+conversation and working directory. Grants and topology refresh its tooling
+scope in place. A settings change alone does not rewrite the core graph;
+changing a node's type replaces its core node.
 
 ## Process
 
@@ -136,7 +143,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **5. Edge definitions**
 
-   One shared directed edge rule accepts the union contract with the fixed authority tag. A successful task broadcasts its result through every outgoing connection. Replies require a reverse connection. Worker kinds introduce no additional routing or authority rules.
+   One shared directed edge rule accepts the union contract with the fixed authority tag. A successful task broadcasts its result through every outgoing connection. Replies require a reverse connection. Node types introduce no additional routing or authority rules.
 
 - [x] **6. Node harness**
 
@@ -184,7 +191,7 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **10. Workflow document**
 
-   The schema in [Workflow document](#workflow-document) and its validation. Defines named nodes, worker kinds/settings, per-node joins, connections, and one entry.
+   The schema in [Workflow document](#workflow-document) and its validation. Defines named nodes placing components with settings, per-node joins, connections, and one entry.
 
 - [x] **11. Manager surface**
 
@@ -238,7 +245,7 @@ The command task harness makes explicit choices: broadcast each result to all su
 allow one workspace per task, retry a failed task with capped backoff and then
 park it for the manager, and apply new config at the next task boundary.
 Workspace workers currently need an outgoing edge; an inbox provides a terminal
-result holder. These are app policies, not restrictions imposed by worker kinds
+result holder. These are app policies, not restrictions imposed by node types
 or new core semantics.
 
 Remaining within the agreed scope: live-model project acceptance. Native Codex

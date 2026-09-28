@@ -20,10 +20,24 @@ A document expands into the existing `GraphDeclaration` and app-owned
 harness handles initial input and workspace preparation. The older native
 `ApplicationDeclaration` path remains a separate compatibility path.
 
-All worker kinds share one core node type, result contract, edge rule, and
-authority tag. Only ingress (`any`/`all`) and root status affect the graph
-variants. The fixed grammar contains 40 productions, including self loops.
-Kind and process settings belong to app execution bindings. Reusable documents live under
+Nodes place components, using core's project model (`ontography::project`).
+Built-in and library components implement `ProjectComponent`: each
+`ComponentDescription` gives the node's core node type, and `bind` turns the
+placement's settings into a `BoundComponent`, the trusted implementation kind
+and exact configuration. Library and document specifications load through a
+`ComponentProvider` named `ontography`. The bound kind and configuration
+become the node's execution binding. A run stores its bindings with its
+document, so a later library change reaches a node only through an edit.
+
+Each node's role is its core node type: `Agent`, `Command`, `Human`, or
+`Inbox`, all declared in the run's schema. Every node shares one result
+contract, edge rule, and authority tag, and connections require no endpoint
+type. Core matches a rewrite's nodes exactly, so the fixed grammar has one
+rule for each node type, ingress (`any`/`all`), and root variant: 448
+productions, including self loops. A node's type never changes; an edit to
+another type replaces the node. Runs created before node types keep one
+shared `WorkflowNode` type and their original 40 productions, which the app
+reads from the run's schema. Reusable documents live under
 `definitions/workflows/<revision>.json`, separately from legacy graph drafts.
 
 The app persists its document, identity map, and edit intentions alongside
@@ -34,13 +48,14 @@ stored core build and declaration/catalog identities.
 
 ## Workflow surface
 
-Pi exposes the following thirteen workflow tools. Bound requests default to the
+Pi exposes the following fourteen workflow tools. Bound requests default to the
 session's run and project; explicit targets must agree with that binding.
 Schemas are available through the session-scoped `system.hello` handshake.
 
 | Operation | Manager input and result | Existing capability used |
 | --- | --- | --- |
-| `flow.define` | Document → reusable revision | App validation and immutable document storage; declaration admission checks on start. |
+| `flow.library` | → components with node types and settings schemas; library MCP servers | Built-in `ProjectComponent`s and library specifications loaded through the `ontography` `ComponentProvider`. |
+| `flow.define` | Document → reusable revision | App validation, component binding, and immutable document storage; declaration admission checks on start. |
 | `flow.start` | Document or revision, message or workspace directory → run | `GraphDeclaration`, persistent runtime/session, reserved initialization, app worker bindings. |
 | `flow.status` | Run → document, named graph, pending edit, worker state, tasks, failures | Current kernel/frontier, app edit state, hosted execution status, per-node retry ledgers. |
 | `flow.output` | Node and optional task/work selection → ready input, last result, or inbox page | Accepted invocation/publication evidence, bounded pending queries, and content reads. |
@@ -153,13 +168,15 @@ run, invocation history, or live processes.
 ## Node runtimes and remaining limits
 
 Agent nodes use `NodeRuntime`: one core execution owns a persistent private
-working directory, managed PTY, continuing Codex session, and `NodeToolContext`.
-The runtime hosts a persistent Codex app-server on a private Unix socket and
-connects the native terminal UI to the same saved conversation with `--remote`.
-Restart reopens the same conversation rather than selecting a global
-latest conversation. A complete `argv` override bypasses native Codex setup and
-does not provide managed conversation recovery. Live process state is never
-recovered from conversation history.
+working directory, a supervised process in a managed PTY or headless on pipes,
+a continuing conversation, and `NodeToolContext`. For Codex the runtime hosts a
+persistent app-server on a private Unix socket and, with a terminal, connects
+the native terminal UI to the same saved conversation with `--remote`. For
+Claude it runs Claude Code in the terminal, reporting through hooks, or headless
+over stream JSON. Restart reopens the same conversation rather than selecting a
+global latest conversation. An `argv` program bypasses agent setup and does not
+provide managed conversation recovery. Live process state is never recovered
+from conversation history.
 
 The runtime begins attempts for runnable tasks and queues recorded conversation
 input through app-server. Packages remain pending until core accepts a result.

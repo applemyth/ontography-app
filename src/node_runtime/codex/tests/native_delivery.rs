@@ -3,7 +3,6 @@
 use super::*;
 use crate::{
     node_mcp::NodeMcp,
-    node_runtime::NodeRuntime,
     node_tool::tests::{Fixture, document},
 };
 use std::sync::Arc;
@@ -143,8 +142,12 @@ approval_mode = {approval:?}
         }
     });
     let mut mcp = NodeMcp::bind(dir.path(), fixture.tools.clone()).unwrap();
-    let definition = fixture.scope.borrow().node.clone();
-    let plan = Plan::with_home(&definition, dir.path(), &cwd, dir.path(), &home).unwrap();
+    let scope = fixture.scope.borrow().clone();
+    let crate::workflow::Implementation::Codex(config) = &scope.binding.implementation else {
+        panic!("the fixture's worker is a Codex agent");
+    };
+    let plan =
+        Plan::with_home(&scope.node.id, config, dir.path(), &cwd, dir.path(), &home).unwrap();
     let overrides = mcp.codex_overrides().unwrap();
     let mut env = mcp.environment();
     env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
@@ -225,18 +228,10 @@ approval_mode = {approval:?}
         .await
         .unwrap();
     fixture.deliver("first").await;
-    let runtime = NodeRuntime::new(
-        cwd.clone(),
-        dir.path().into(),
-        fixture.session.clone(),
-        fixture.scope.subscribe(),
-        fixture.ledger.clone(),
-        None,
-    );
     let delivery = tokio::spawn({
         let thread = thread.clone();
         let tools = fixture.tools.clone();
-        async move { runtime.deliver(&mut rpc, &thread, &tools).await }
+        async move { deliver(&mut rpc, &thread, &tools, |_| {}).await }
     });
     let result = tokio::time::timeout(Duration::from_secs(25), async {
         let first = observed.recv().await.unwrap();

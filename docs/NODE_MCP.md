@@ -24,7 +24,7 @@ Set `tools` on the node definition, alongside `config` and `grants`:
 ```json
 {
   "id": "observer",
-  "kind": "agent",
+  "component": "agent",
   "config": {"prompt": "Inspect the graph and report what is waiting."},
   "tools": ["inspect_node", "inspect_graph", "list_inputs"]
 }

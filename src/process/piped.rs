@@ -14,6 +14,7 @@ use nix::{
     unistd::Pid,
 };
 use std::{
+    collections::BTreeMap,
     fs::OpenOptions,
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
     path::{Path, PathBuf},
@@ -162,6 +163,15 @@ impl SupervisedProcess {
         result
     }
 
+    /// Whether the supervisor has exited, reaping it if so.
+    pub fn exited(&mut self) -> std::io::Result<bool> {
+        let exited = self.child().try_wait()?.is_some();
+        if exited {
+            self.group.disarm();
+        }
+        Ok(exited)
+    }
+
     /// Kills the whole group, unless the supervisor has already exited.
     pub fn terminate(&mut self) {
         if matches!(self.child().try_wait(), Ok(Some(_))) {
@@ -220,10 +230,23 @@ pub async fn spawn_supervised(
     directory: &Path,
     stdin: Stdin<'_>,
 ) -> Result<SupervisedProcess> {
+    spawn_supervised_with_env(argv, cwd, directory, &BTreeMap::new(), stdin).await
+}
+
+/// Like [`spawn_supervised`], with `env` added to the program's environment.
+/// Values stay out of the command line, where other users could read them.
+pub async fn spawn_supervised_with_env(
+    argv: &[String],
+    cwd: &Path,
+    directory: &Path,
+    env: &BTreeMap<String, String>,
+    stdin: Stdin<'_>,
+) -> Result<SupervisedProcess> {
     spawn_supervised_using(
         argv,
         cwd,
         directory,
+        env,
         stdin,
         |pid, token| async move { inspect_process_identity(pid, &token).await },
         Duration::from_secs(1),
@@ -235,6 +258,7 @@ async fn spawn_supervised_using<F, Fut>(
     argv: &[String],
     cwd: &Path,
     directory: &Path,
+    env: &BTreeMap<String, String>,
     stdin: Stdin<'_>,
     mut inspect: F,
     timeout: Duration,
@@ -270,6 +294,7 @@ where
         .arg(files.path("input"))
         .arg(files.path("status"))
         .args(argv)
+        .envs(env)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -350,6 +375,7 @@ mod tests {
                 &["/bin/sh".into(), "-c".into(), "touch ran".into()],
                 directory.path(),
                 directory.path(),
+                &BTreeMap::new(),
                 Stdin::Bytes(b"input"),
                 |observed, _| {
                     pid = observed;
@@ -375,6 +401,7 @@ mod tests {
                 &["/bin/sh".into(), "-c".into(), "touch ran".into()],
                 &path,
                 &path,
+                &BTreeMap::new(),
                 Stdin::Bytes(b"input"),
                 |pid, _| {
                     sender.take().unwrap().send(pid).unwrap();

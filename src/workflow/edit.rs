@@ -644,10 +644,34 @@ mod tests {
         SessionHandle,
         WorkflowState,
     ) {
+        fixture_typed(Typing::Roles)
+    }
+
+    /// A run created with `typing`. Runs created before node types have one
+    /// shared type and the original rules.
+    fn fixture_typed(
+        typing: Typing,
+    ) -> (
+        tempfile::TempDir,
+        ProposalRuntime,
+        SessionHandle,
+        WorkflowState,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let doc = document().canonicalized().unwrap();
         let ids = IdentityMap::fresh(&doc);
-        let declaration = expand(&doc, "edit-test", &ids).unwrap();
+        let mut declaration = expand(&doc, "edit-test", &ids).unwrap();
+        if typing == Typing::Shared {
+            declaration.schema.node_types = vec![SHARED_NODE_TYPE.into()];
+            for node in &mut declaration.nodes {
+                node.types = vec![SHARED_NODE_TYPE.into()];
+            }
+            for edge in &mut declaration.edges {
+                edge.source_requirements = vec![SHARED_NODE_TYPE.into()];
+                edge.target_requirements = vec![SHARED_NODE_TYPE.into()];
+            }
+            declaration.rewrites = grammar::productions(Typing::Shared);
+        }
         let compiled = declaration.compile().unwrap();
         let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
         let session = runtime
@@ -693,6 +717,78 @@ mod tests {
             .unwrap()
             .outputs()
             .next()
+    }
+
+    #[tokio::test]
+    async fn a_node_keeps_its_identity_within_its_node_type_and_is_replaced_across_types() {
+        let (_directory, _runtime, session, state) = fixture();
+        let original = state.identities.clone();
+        let mut next = state.current.clone();
+        for node in &mut next.nodes {
+            // Codex to Claude keeps the Agent type; inbox to human does not.
+            if node.id == "writer" {
+                node.component = "claude".into();
+            } else {
+                node.component = "human".into();
+            }
+        }
+        let plan = preview(&session, &state, next).await.unwrap();
+        assert_eq!(plan.identities.nodes["writer"], original.nodes["writer"]);
+        assert_ne!(plan.identities.nodes["review"], original.nodes["review"]);
+        assert_eq!(plan.bindings["writer"].implementation.kind(), "claude");
+        assert_eq!(plan.bindings["review"].node_type, NodeType::Human);
+        // Add the human, reconnect it, then remove the inbox and its edge.
+        assert_eq!(plan.steps, 4);
+    }
+
+    #[tokio::test]
+    async fn runs_created_before_node_types_keep_their_shared_rules() {
+        let (directory, _runtime, session, mut state) = fixture_typed(Typing::Shared);
+        let path = directory.path().join("workflow.json");
+        let original = state.identities.clone();
+        let mut next = state.current.clone();
+        // Core never recorded roles here, so a new role replaces nothing.
+        next.nodes
+            .iter_mut()
+            .find(|node| node.id == "review")
+            .unwrap()
+            .component = "human".into();
+        next.nodes
+            .push(serde_json::from_value(json!({"id":"archive","component":"inbox"})).unwrap());
+        next.edges
+            .push(serde_json::from_value(json!({"from":"review","to":"archive"})).unwrap());
+        let plan = preview(&session, &state, next).await.unwrap();
+        assert_eq!(plan.identities.nodes["review"], original.nodes["review"]);
+        assert_eq!(plan.steps, 2);
+        commit(&session, &mut state, &path, plan).await.unwrap();
+        let kernel = session.kernel().await.unwrap();
+        let archive = kernel
+            .node_definition(&state.identities.nodes["archive"])
+            .unwrap();
+        assert_eq!(
+            archive
+                .types()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            [SHARED_NODE_TYPE]
+        );
+    }
+
+    #[test]
+    fn state_saved_before_components_binds_its_built_in_kinds() {
+        let (_directory, _runtime, _session, state) = fixture();
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved.as_object_mut().unwrap().remove("bindings");
+        for node in saved["current"]["nodes"].as_array_mut().unwrap() {
+            let component = node.as_object_mut().unwrap().remove("component").unwrap();
+            node["kind"] = component;
+        }
+        let loaded: WorkflowState = serde_json::from_value(saved).unwrap();
+        assert!(loaded.bindings.is_empty());
+        let loaded = loaded.with_bindings().unwrap();
+        assert_eq!(loaded.bindings, state.bindings);
+        assert_eq!(loaded.current, state.current);
     }
 
     #[tokio::test]

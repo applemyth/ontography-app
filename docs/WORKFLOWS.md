@@ -14,9 +14,9 @@ Save this as `start.json`. It is the complete argument object for `flow.start`:
     "name": "review-a-draft",
     "entry": "draft",
     "nodes": [
-      {"id": "draft", "kind": "command", "config": {"argv": ["/bin/echo", "Draft ready"]}},
-      {"id": "review", "kind": "human", "config": {"prompt": "Check the draft"}},
-      {"id": "result", "kind": "inbox"}
+      {"id": "draft", "component": "command", "config": {"argv": ["/bin/echo", "Draft ready"]}},
+      {"id": "review", "component": "human", "config": {"prompt": "Check the draft"}},
+      {"id": "result", "component": "inbox"}
     ],
     "edges": [
       {"from": "draft", "to": "review"},
@@ -137,14 +137,15 @@ the agent; see [Session controls](SESSIONS.md#graph-display).
 4. Read status. Use `flow.resume` to recover an interrupted edit or restart
    stopped or failed workers.
 
-A command config change takes effect on the next task. An agent config change
-stops and replaces its process, retaining its node directory and recorded
-conversation. Tool selection, grants, retry policy, and changes elsewhere in the graph refresh
-the agent's scoped tooling without restarting its process. A kind change stops
-and waits for the old worker before launching the replacement. Changing joins or
-entry status can require replacing core identities and retiring pending work;
-the preview reports that work. The initial entry cannot be replaced before
-its initial task completes.
+A command config change takes effect on the next task. A change to what an
+agent node is bound to (its settings over its component's defaults) stops and
+replaces its process, retaining its node directory and recorded conversation.
+Tool selection, grants, retry policy, and changes elsewhere in the graph refresh
+the agent's scoped tooling without restarting its process. Changing a node's
+node type, join, or entry status replaces its core node, which retires its
+pending work; the preview reports that work, and the old worker stops before
+its replacement starts. The initial entry cannot be replaced before its
+initial task completes.
 
 Each graph transition is atomic. A multi-step edit is not: existing workers
 continue, and a failed edit may leave some graph changes committed. The app
@@ -232,7 +233,7 @@ failed join keeps its inputs together for its retries, and the node's other
 inputs form joins of their own. A node's `retry` sets the policy:
 
 ```json
-{"id":"draft","kind":"command","config":{"argv":["./draft.sh"]},
+{"id":"draft","component":"command","config":{"argv":["./draft.sh"]},
  "retry":{"max_attempts":3,"initial_delay_secs":5,"max_delay_secs":300}}
 ```
 
@@ -288,9 +289,9 @@ attempt.
   parks until the manager retries or discards it. An interrupted attempt is not
   counted. External command effects may repeat if a previous attempt ran but
   did not publish to core.
-- Command config updates do not interrupt a task already running. Agent config
-  updates restart its session process. Removing a node or changing its kind
-  stops its old worker during reconciliation.
+- Command config updates do not interrupt a task already running. A change to
+  an agent's binding restarts its session process. Removing a node or changing
+  its node type stops its old worker during reconciliation.
 - Command task timeout defaults to five minutes. Captured stdout/stderr are bounded
   to 1 MiB each; status/output previews truncate long text. Export retrieves
   the complete accepted message or workspace.

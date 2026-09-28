@@ -1,7 +1,9 @@
-//! One continuing agent execution at a graph node. Terminals are views of this
+//! One continuing session at a graph node: the implementation its binding
+//! names, hosted in a terminal or headless. Terminals are views of this
 //! execution; its selected scoped tools are exposed through the node MCP adapter.
 
 pub mod codex;
+mod host;
 mod process;
 mod rpc;
 
@@ -9,22 +11,33 @@ use crate::{
     AppError, Result,
     node_mcp::NodeMcp,
     node_tool::{NodeScope, NodeToolContext},
-    process::recover_process,
+    process::{Stdin, recover_process},
     terminal::{LaunchSpec, Terminal, TerminalStatus},
-    workflow::tasks::RetryLedger,
+    workflow::{
+        Implementation,
+        components::{AgentConfig, ProgramConfig},
+        tasks::RetryLedger,
+    },
 };
-use ontography::{ExecutionContext, ExecutionFailure, Payload, SessionHandle, SessionStatus};
+use host::Host;
+use ontography::{
+    ExecutionContext, ExecutionFailure, ExecutionStop, Payload, SessionHandle, SessionStatus,
+};
 use serde::Serialize;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
+    future::Future,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex, MutexGuard, Weak},
     time::Duration,
 };
 use tokio::sync::watch;
+
+/// How long a session's own server may take to accept its first request.
+const STARTUP: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct NodeStatus {
@@ -44,6 +57,9 @@ struct State {
     tools: Weak<NodeToolContext>,
     started: bool,
 }
+
+/// Delivers graph work to a started session until the session fails.
+type Driver<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 /// The workflow holds this handle; the execution future owns the live resources.
 /// Retaining a handle, a terminal view, or a tool context cannot keep a stopped
@@ -132,7 +148,7 @@ impl NodeRuntime {
             state.status.state = "failed";
             state.status.error = Some(error.clone());
         }
-        result.map_err(|error| ExecutionFailure::new(error.code, error.message))
+        result.map_err(ExecutionFailure::from)
     }
 
     async fn run_inner(
@@ -163,22 +179,15 @@ impl NodeRuntime {
             .await?,
         );
         lock(&self.state).tools = Arc::downgrade(&tools);
-        // Keep local sockets short enough for Unix sockaddr paths. Each MCP
-        // execution gets a fresh endpoint and capability, including on resume.
-        let identity = format!(
-            "{:x}",
-            Sha256::digest(self.directory.as_os_str().as_encoded_bytes())
-        );
-        let endpoint = PathBuf::from("/tmp").join(format!(
-            "ontography-node-{}-{}",
-            nix::unistd::geteuid(),
-            &identity[..20]
-        ));
-        private_directory(&endpoint)?;
-        resources.mcp = Some(NodeMcp::bind(&endpoint, tools.clone())?);
+        let endpoint = self.endpoint()?;
+        let mcp = resources
+            .mcp
+            .insert(NodeMcp::bind(&endpoint, tools.clone())?);
         resources.tools = Some(tools.clone());
-        let node = self.scope.borrow().node.clone();
-        let mcp = resources.mcp.as_ref().expect("bound node MCP");
+        let (node, binding) = {
+            let scope = self.scope.borrow();
+            (scope.node.clone(), scope.binding.clone())
+        };
         let mut env = mcp.environment();
         env.insert("ONTOGRAPHY_NODE_NAME".into(), node.id.clone());
         env.insert(
@@ -189,92 +198,61 @@ impl NodeRuntime {
             "ONTOGRAPHY_PROJECT".into(),
             self.project.to_string_lossy().into_owned(),
         );
-        let spec = if let Some(argv) = node.config.get("argv") {
-            let argv = argv
-                .as_array()
-                .ok_or_else(|| AppError::invalid("agent argv must be an array"))?;
-            let argv: Vec<_> = argv
-                .iter()
-                .map(|arg| {
-                    arg.as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| AppError::invalid("agent argv must contain strings"))
-                })
-                .collect::<Result<_>>()?;
-            let (program, args) = argv
-                .split_first()
-                .filter(|(program, _)| !program.trim().is_empty())
-                .ok_or_else(|| AppError::invalid("agent argv must name a program"))?;
-            LaunchSpec {
-                program: program.into(),
-                args: args.to_vec(),
-                env,
-                cwd,
-                rows: 24,
-                cols: 80,
-                server_id: uuid::Uuid::new_v4().to_string(),
-                session_id: node.id.clone(),
+        let terminal = endpoint.join("terminal.sock");
+        let driver: Driver<'_> = match binding.implementation {
+            Implementation::Program(program) => {
+                let spec = program_launch(&program, env, cwd, &node.id)?;
+                self.started(
+                    resources,
+                    Host::terminal(spec, &self.directory, terminal).await?,
+                );
+                // A program reaches the graph only through its node tools.
+                Box::pin(std::future::pending())
             }
-        } else {
-            let plan = codex::Plan::new(&node, &self.directory, &cwd, &endpoint)?;
-            let spec = plan.launch(Path::new("codex"), &mcp.codex_overrides()?, env);
-            resources.plan = Some(plan);
-            spec
-        };
-        let lifetime = process::Lifetime::new(&self.directory)?;
-        let spec = lifetime.supervise(spec);
-        resources.lifetime = Some(lifetime);
-        let terminal = Terminal::launch(spec, endpoint.join("terminal.sock")).await?;
-        {
-            let mut state = lock(&self.state);
-            state.terminal = Arc::downgrade(&terminal);
-            state.status.terminal = Some(terminal.status());
-        }
-        resources.terminal = Some(terminal.clone());
-        let lifetime = resources.lifetime.as_mut().expect("prepared lifetime");
-        lifetime.permit(&terminal).await?;
-        let conversation = if let Some(plan) = &resources.plan {
-            let ready = async {
-                let rpc = loop {
-                    if !terminal.status().running {
-                        return Err(AppError::new(
-                            "codex_startup",
-                            "Codex app-server exited; inspect codex-server.log",
-                        ));
-                    }
-                    if plan.socket.try_exists()? {
-                        break rpc::Rpc::connect(&plan.socket).await?;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+            Implementation::Codex(config) => {
+                let started = self
+                    .start_codex(&node.id, &config, &cwd, env, &mut stop, resources)
+                    .await?;
+                let Some((plan, mut rpc, thread)) = started else {
+                    lock(&self.state).status.state = "stopped";
+                    return Ok(());
                 };
-                let id = plan.open(&rpc).await?;
-                plan.attach(&id)?;
-                Ok::<_, AppError>((rpc, id))
-            };
-            let (rpc, id) = tokio::select! {
-                () = stop.requested() => { return Ok(()); }
-                result = tokio::time::timeout(Duration::from_secs(45), ready) => {
-                    result.map_err(|_| AppError::new("codex_startup", "Codex app-server initialization timed out; inspect codex-server.log"))??
-                }
-            };
-            lock(&self.state).status.conversation_id = Some(id.clone());
-            resources.rpc = Some(rpc);
-            Some(id)
-        } else {
-            None
+                let tools = tools.clone();
+                Box::pin(async move {
+                    // The plan owns the server's socket paths while it runs.
+                    let _plan = plan;
+                    codex::deliver(&mut rpc, &thread, &tools, |state| {
+                        lock(&self.state).status.agent_state = Some(state.into());
+                    })
+                    .await
+                })
+            }
+            implementation => {
+                return Err(AppError::new(
+                    "node_runtime",
+                    format!(
+                        "A {:?} node runs in the task harness, not a session",
+                        implementation.kind()
+                    ),
+                ));
+            }
         };
         lock(&self.state).status.state = "running";
-        let delivery = async {
-            match (&mut resources.rpc, conversation) {
-                (Some(rpc), Some(id)) => self.deliver(rpc, &id, &tools).await,
-                _ => std::future::pending::<Result<()>>().await,
-            }
-        };
-        tokio::pin!(delivery);
+        self.supervise(driver, &mut stop, resources).await
+    }
+
+    /// Runs `driver` while watching for a stop, the run closing, and the
+    /// session's process ending.
+    async fn supervise(
+        &self,
+        mut driver: Driver<'_>,
+        stop: &mut ExecutionStop,
+        resources: &mut Resources<'_>,
+    ) -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(25));
         loop {
             tokio::select! {
-                result = &mut delivery => { return result; }
+                result = &mut driver => { return result; }
                 () = stop.requested() => {
                     lock(&self.state).status.state = "stopped";
                     return Ok(());
@@ -284,14 +262,10 @@ impl NodeRuntime {
                         lock(&self.state).status.state = "stopped";
                         return Ok(());
                     }
-                    let status = terminal.status();
-                    if let Some(fault) = &status.fault {
-                        return Err(AppError::new("node_terminal", fault));
-                    }
-                    if !status.running {
-                        let code = lifetime.exit_code()?;
+                    let host = resources.host.as_mut().expect("started session host");
+                    if let Some(code) = host.ended().await? {
                         let mut state = lock(&self.state);
-                        state.status.terminal = Some(status);
+                        state.status.terminal = host.terminal_handle().map(|terminal| terminal.status());
                         state.status.exit_code = Some(code);
                         state.status.state = "exited";
                         return if code == 0 { Ok(()) } else {
@@ -303,147 +277,162 @@ impl NodeRuntime {
         }
     }
 
-    async fn deliver(
+    /// Starts the Codex server and opens its conversation. `None` means the
+    /// execution was asked to stop meanwhile.
+    async fn start_codex(
         &self,
-        rpc: &mut rpc::Rpc,
-        thread: &str,
-        tools: &NodeToolContext,
-    ) -> Result<()> {
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut messages = HashMap::<String, String>::new();
-        let mut turns = HashMap::<String, Vec<String>>::new();
-        loop {
-            tokio::select! {
-                _ = rpc.health.changed() => {
-                    return Err(rpc.health.borrow().clone().unwrap_or_else(|| AppError::new("codex_connection", "Codex controller stopped")));
+        node_id: &str,
+        config: &AgentConfig,
+        cwd: &Path,
+        env: BTreeMap<String, String>,
+        stop: &mut ExecutionStop,
+        resources: &mut Resources<'_>,
+    ) -> Result<Option<(codex::Plan, rpc::Rpc, String)>> {
+        let endpoint = self.endpoint()?;
+        let plan = codex::Plan::new(node_id, config, &self.directory, cwd, &endpoint)?;
+        let mut overrides = resources
+            .mcp
+            .as_ref()
+            .expect("bound node MCP")
+            .codex_overrides()?;
+        overrides.extend(codex::mcp_overrides(&config.mcp)?);
+        let program = Path::new("codex");
+        let host = if config.pty {
+            let spec = plan.launch(program, &overrides, env);
+            Host::terminal(spec, &self.directory, endpoint.join("terminal.sock")).await?
+        } else {
+            let (host, _) = Host::headless(
+                &plan.headless(program, &overrides),
+                plan.cwd(),
+                &self.directory,
+                &env,
+                Stdin::Bytes(&[]),
+                &self.directory.join("agent.log"),
+                false,
+            )
+            .await?;
+            host
+        };
+        self.started(resources, host);
+        let host = resources.host.as_mut().expect("started session host");
+        let ready = async {
+            let rpc = loop {
+                if host.ended().await?.is_some() {
+                    return Err(AppError::new(
+                        "codex_startup",
+                        "Codex app-server exited; inspect codex-server.log",
+                    ));
                 }
-                event = rpc.events.recv() => {
-                    let Some(event) = event else { return Err(AppError::new("codex_connection", "Codex event stream closed")); };
-                    if event["params"]["threadId"] != thread { continue; }
-                    if event["method"] == "item/started"
-                        && let Some(client) = event["params"]["item"]["clientId"].as_str()
-                        && let Some(attempt) = messages.remove(client)
-                        && let Some(turn) = event["params"]["turnId"].as_str() {
-                        turns.entry(turn.into()).or_default().push(attempt);
-                    }
-                    if event["method"] == "turn/completed"
-                        && let Some(turn) = event["params"]["turn"]["id"].as_str()
-                        && let Some(attempts) = turns.remove(turn)
-                        && event["params"]["turn"]["status"] != "completed" {
-                        for attempt in attempts {
-                            tools.message_failed(&attempt, &format!("Codex turn ended: {}",event["params"]["turn"]["status"])).await?;
-                        }
-                    }
+                if plan.socket.try_exists()? {
+                    break rpc::Rpc::connect(&plan.socket).await?;
                 }
-                _ = tick.tick() => {
-                    messages.retain(|_, attempt| tools.message_is_open(attempt));
-                    let state = rpc.call("thread/read", json!({"threadId":thread})).await?;
-                    let status = state["thread"]["status"]["type"].as_str().unwrap_or("unknown");
-                    lock(&self.state).status.agent_state = Some(status.into());
-                    if matches!(status, "notLoaded" | "systemError") {
-                        return Err(AppError::new("codex_session", format!("Codex conversation became {status}")));
-                    }
-                    if let Some(reply) = tools.next_message().await? {
-                        let value = reply.value()?;
-                        let attempt = value["attempt_id"].as_str().ok_or_else(|| AppError::new("codex_delivery", "Message has no attempt ID"))?;
-                        let client_id = format!("ontography:{attempt}");
-                        let text = std::str::from_utf8(reply.bytes()).map_err(|error| AppError::new("codex_delivery", error.to_string()))?;
-                        rpc.call("thread/queue/add", json!({"threadId":thread,
-                            "clientUserMessageId":client_id,
-                            "input":[{"type":"text","text":text}]})).await?;
-                        // Server acceptance, rather than socket write, is the
-                        // receipt boundary. The queue preserves input verbatim.
-                        reply.sent().await?;
-                        messages.insert(client_id, attempt.into());
-                    }
-                    if status == "idle" { start_queued(rpc, thread).await?; }
-                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            let id = plan.open(&rpc).await?;
+            if config.pty {
+                plan.attach(&id)?;
             }
+            Ok::<_, AppError>((rpc, id))
+        };
+        let (rpc, id) = tokio::select! {
+            () = stop.requested() => { return Ok(None); }
+            result = tokio::time::timeout(STARTUP, ready) => {
+                result.map_err(|_| AppError::new("codex_startup", "Codex app-server initialization timed out; inspect codex-server.log"))??
+            }
+        };
+        lock(&self.state).status.conversation_id = Some(id.clone());
+        Ok(Some((plan, rpc, id)))
+    }
+
+    /// Records a started session's host, and its terminal if it has one.
+    fn started(&self, resources: &mut Resources<'_>, host: Host) {
+        let mut state = lock(&self.state);
+        if let Some(terminal) = host.terminal_handle() {
+            state.terminal = Arc::downgrade(terminal);
+            state.status.terminal = Some(terminal.status());
         }
+        resources.host = Some(host);
+    }
+
+    /// A private directory for this node's sockets. Local socket paths must stay
+    /// short enough for Unix sockaddr; each execution gets fresh endpoints and
+    /// capabilities in it, including on resume.
+    fn endpoint(&self) -> Result<PathBuf> {
+        let identity = format!(
+            "{:x}",
+            Sha256::digest(self.directory.as_os_str().as_encoded_bytes())
+        );
+        let endpoint = PathBuf::from("/tmp").join(format!(
+            "ontography-node-{}-{}",
+            nix::unistd::geteuid(),
+            &identity[..20]
+        ));
+        private_directory(&endpoint)?;
+        Ok(endpoint)
     }
 }
 
-async fn start_queued(rpc: &rpc::Rpc, thread: &str) -> Result<()> {
-    let queue = rpc
-        .call("thread/queue/list", json!({"threadId":thread,"limit":1}))
-        .await?;
-    let Some(first) = queue["data"].as_array().and_then(|items| items.first()) else {
-        return Ok(());
-    };
-    match rpc
-        .call(
-            "thread/queue/start",
-            json!({"threadId":thread,"queuedSubmissionId":first["id"]}),
-        )
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(error) if error.code == "codex_rpc" => {
-            // The native TUI can start the same queued turn concurrently. Only
-            // forgive a refusal after observing that race; never replay input.
-            let state = rpc.call("thread/read", json!({"threadId":thread})).await?;
-            if state["thread"]["status"]["type"] == "active" {
-                return Ok(());
-            }
-            let queue = rpc
-                .call("thread/queue/list", json!({"threadId":thread,"limit":1}))
-                .await?;
-            if queue["data"][0]["id"] != first["id"] {
-                return Ok(());
-            }
-            Err(error)
-        }
-        Err(error) => Err(error),
-    }
+/// An interactive program in the node's terminal, in place of an agent.
+fn program_launch(
+    program: &ProgramConfig,
+    env: BTreeMap<String, String>,
+    cwd: PathBuf,
+    node_id: &str,
+) -> Result<LaunchSpec> {
+    let (executable, args) = program
+        .argv
+        .split_first()
+        .ok_or_else(|| AppError::invalid("argv must name a program"))?;
+    Ok(LaunchSpec {
+        program: executable.into(),
+        args: args.to_vec(),
+        env,
+        cwd,
+        rows: 24,
+        cols: 80,
+        server_id: uuid::Uuid::new_v4().to_string(),
+        session_id: node_id.into(),
+    })
 }
 
 /// This guard also runs when core forcibly aborts the execution future. It stops
 /// writers synchronously even if outside code retains terminal/tool handles.
 struct Resources<'a> {
     owner: &'a NodeRuntime,
-    terminal: Option<Arc<Terminal>>,
+    host: Option<Host>,
     tools: Option<Arc<NodeToolContext>>,
-    lifetime: Option<process::Lifetime>,
     mcp: Option<NodeMcp>,
-    rpc: Option<rpc::Rpc>,
-    plan: Option<codex::Plan>,
 }
 
 impl<'a> Resources<'a> {
     fn new(owner: &'a NodeRuntime) -> Self {
         Self {
             owner,
-            terminal: None,
+            host: None,
             tools: None,
-            lifetime: None,
             mcp: None,
-            rpc: None,
-            plan: None,
         }
     }
 
     async fn close(&mut self) -> Result<()> {
-        self.rpc.take();
         if let Some(mut mcp) = self.mcp.take() {
             mcp.shutdown().await;
         }
-        if let Some(lifetime) = &mut self.lifetime {
-            lifetime.disconnect();
-        }
-        let stopped = if let Some(terminal) = &self.terminal {
-            terminal.request_stop();
-            let result = terminal.shutdown().await;
-            lock(&self.owner.state).status.terminal = Some(terminal.status());
-            result
-        } else {
-            Ok(())
+        let stopped = match self.host.as_mut() {
+            Some(host) => {
+                let result = host.close().await;
+                if let Some(terminal) = host.terminal_handle() {
+                    lock(&self.owner.state).status.terminal = Some(terminal.status());
+                }
+                result
+            }
+            None => Ok(()),
         };
         if let Some(tools) = &self.tools {
             tools.close().await;
         }
         stopped?;
-        if self.lifetime.is_some() {
+        if self.host.is_some() {
             recover_process(&self.owner.directory).await?;
         }
         Ok(())
@@ -452,16 +441,12 @@ impl<'a> Resources<'a> {
 
 impl Drop for Resources<'_> {
     fn drop(&mut self) {
-        self.rpc.take();
         self.mcp.take();
-        if let Some(lifetime) = &mut self.lifetime {
-            lifetime.disconnect();
-        }
-        if let Some(terminal) = &self.terminal {
-            terminal.request_stop();
+        if let Some(host) = &mut self.host {
+            host.request_stop();
         }
         let mut state = lock(&self.owner.state);
-        if let Some(terminal) = &self.terminal {
+        if let Some(terminal) = self.host.as_ref().and_then(Host::terminal_handle) {
             state.status.terminal = Some(terminal.status());
         }
         if matches!(state.status.state, "starting" | "running") {

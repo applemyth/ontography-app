@@ -24,7 +24,7 @@ Rust server
     ├── Pi manager state: conversations, active selection, tool preferences
     ├── Server-owned shell and PTY → native Pi when launched
     └── Optional graph run and core runtime
-        └── Agent nodes → persistent Codex app-servers + attached terminal clients
+        └── Agent nodes → Codex or Claude sessions, in terminals or headless
 ```
 
 | Component | Responsibility |
@@ -54,6 +54,8 @@ CLI targets accept an exact session ID or a unique exact name. Ambiguous names r
 Scoped calls resolve the session's graph and reject conflicting targets. Unscoped calls remain the explicit administration interface. The handshake publishes operation schemas. [examples/flow.json](examples/flow.json) is a logical graph with a configured rewrite; logical nodes can exist before worker implementations are installed.
 
 Pi manages workflow documents, runs, edits, task decisions, and artifacts through the workflow tools. Shared node tooling supplies scoped graph and package operations for worker implementations. [The workflow guide](docs/WORKFLOWS.md) describes current behavior; [the binding inventory](docs/CORE_BINDINGS.md) maps it to core's public API.
+
+Each node places a component, following core's project model. The built-in components are `agent` (with `codex` and `claude` presets), `command`, `human`, and `inbox`; each gives its node a core node type (its role) and binds the node's settings to what runs there. Agents run in a terminal you can open from the graph, or headless with `"pty": false`. Put your own components and MCP servers in `~/.ontography/library.json`; `flow.library` lists everything a document can place. See [Components](docs/WORKFLOWS.md#components).
 
 ## Development and status
 
