@@ -232,7 +232,7 @@ Other existing limits remain:
 | Retirement previews, stale plans, partial edits, saved-target recovery | [editor tests](../src/workflow/edit.rs), [workflow recovery](../tests/workflow_recovery.rs) |
 | Command → human → inbox, config changes, added workers, repeated commits | [workflow flow](../tests/workflow_flow.rs) |
 | Repeated reviews, exact inbox selection, pagination, structured failure status | [workflow outputs](../tests/workflow_outputs.rs) |
-| Task execution, cancellation, failures, process supervision, workspace constraints | [harness tests](../src/workflow/harness.rs) |
+| Task execution, cancellation, failures, process supervision, workspace constraints | [harness tests](../src/workflow/harness.rs), [supervisor tests](../src/process/) |
 | Retry backoff, parking, join sets, manager retry/discard, definition changes, durability | [task tests](../src/workflow/tasks.rs), [workflow retry](../tests/workflow_retry.rs) |
 | Node tools: receipts equal sent bytes, metadata-only views, attempts, retries, grants, content and checkouts | [node tool tests](../src/node_tool/tests.rs), [content](../src/node_tool/outputs.rs), [workspaces](../src/node_tool/workspace.rs) |
 | Persistent agent startup, scope updates, config replacement, exit, suspension, and resume | [persistent node tests](../tests/persistent_nodes.rs), [node runtime](../src/node_runtime/mod.rs), [Codex launcher](../src/node_runtime/codex.rs) |

@@ -3,8 +3,8 @@
 
 use crate::{
     AppError, Result,
+    process::lease_process,
     terminal::{LaunchSpec, Terminal},
-    workflow::harness,
 };
 use std::{
     fs::{File, OpenOptions},
@@ -106,9 +106,7 @@ impl Lifetime {
             .status()
             .pid
             .ok_or_else(|| AppError::new("node_lifetime", "Terminal supervisor has no PID"))?;
-        harness::lease_process(&self.directory, pid, &self.token)
-            .await
-            .map_err(|error| AppError::new(error.class(), error.message()))?;
+        lease_process(&self.directory, pid, &self.token).await?;
         self.leased = true;
         writeln!(
             self.pipe.as_mut().expect("open lifetime pipe"),
@@ -150,6 +148,7 @@ impl Drop for Lifetime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::recover_process;
     use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
     use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
 
@@ -234,7 +233,7 @@ mod tests {
         wait_gone(job).await;
         wait_gone(Pid::from_raw(terminal.status().pid.unwrap() as i32)).await;
         assert!(!terminal.status().running);
-        harness::recover_process(directory.path()).await.unwrap();
+        recover_process(directory.path()).await.unwrap();
         assert!(!directory.path().join("worker-process.json").exists());
         assert!(!lifetime.path("input").exists());
         terminal.shutdown().await.unwrap();
@@ -254,7 +253,7 @@ mod tests {
         wait_gone(Pid::from_raw(terminal.status().pid.unwrap() as i32)).await;
         assert_eq!(lifetime.exit_code().unwrap(), 7);
         lifetime.disconnect();
-        harness::recover_process(directory.path()).await.unwrap();
+        recover_process(directory.path()).await.unwrap();
         assert!(!lifetime.path("status").exists());
         terminal.shutdown().await.unwrap();
     }
@@ -284,7 +283,7 @@ mod tests {
         assert_ne!(nix::unistd::getpgid(Some(job)).unwrap(), owner);
         // Recovery must let the still-live guardian clean other process groups;
         // killing only its owner group would leave this job behind.
-        harness::recover_process(directory.path()).await.unwrap();
+        recover_process(directory.path()).await.unwrap();
         wait_gone(job).await;
         wait_gone(owner).await;
         assert!(!directory.path().join("worker-process.json").exists());
@@ -341,7 +340,7 @@ mod tests {
             "ready"
         );
         lifetime.disconnect();
-        harness::recover_process(directory.path()).await.unwrap();
+        recover_process(directory.path()).await.unwrap();
         terminal.shutdown().await.unwrap();
     }
 
@@ -425,7 +424,7 @@ mod tests {
                 );
                 wait_gone(agent).await;
                 wait_gone(job.unwrap()).await;
-                harness::recover_process(directory.path()).await.unwrap();
+                recover_process(directory.path()).await.unwrap();
             } else {
                 assert!(!directory.path().join("agent.pid").exists());
             }
