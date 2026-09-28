@@ -255,20 +255,9 @@ async fn local_rewrites_report_route_holder_and_acceptance_retirements() {
     let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
     let mut definition = declaration();
     definition["nodes"][1]["ingress_mode"] = json!("all");
-    let fragment_nodes = definition["nodes"].clone();
-    let edge1 = definition["edges"][0].clone();
-    let mut edge2 = edge1.clone();
+    let mut edge2 = definition["edges"][0].clone();
     edge2["id"] = json!("A_to_B_2");
     definition["edges"].as_array_mut().unwrap().push(edge2);
-    let roots = definition["roots"].clone();
-    definition["rewrites"] = json!([
-        {"id":"drop_route","left":{"nodes":fragment_nodes,"edges":definition["edges"],"roots":roots},
-         "interface_nodes":["A","B"],"interface_edges":["A_to_B"],
-         "right":{"nodes":fragment_nodes,"edges":[edge1],"roots":roots}},
-        {"id":"drop_receiver","left":{"nodes":fragment_nodes,"edges":[edge1],"roots":roots},
-         "interface_nodes":["A"],"interface_edges":[],
-         "right":{"nodes":[definition["nodes"][0]],"roots":roots}}
-    ]);
     definition["nodes"]
         .as_array_mut()
         .unwrap()
@@ -285,8 +274,7 @@ async fn local_rewrites_report_route_holder_and_acceptance_retirements() {
     let plan = call(
         &service,
         "rewrite.prepare",
-        json!({"run_id":run_id,"request":{"production_id":"drop_route",
-        "nodes":{"A":"A","B":"B"},"edges":{"A_to_B":"A_to_B","A_to_B_2":"A_to_B_2"}}}),
+        json!({"run_id":run_id,"request":{"remove_edges":["A_to_B_2"]}}),
     )
     .await;
     assert_eq!(plan["retirements"].as_array().unwrap().len(), 1);
@@ -323,8 +311,7 @@ async fn local_rewrites_report_route_holder_and_acceptance_retirements() {
     let plan = call(
         &service,
         "rewrite.prepare",
-        json!({"run_id":run_id,"request":{"production_id":"drop_receiver",
-        "nodes":{"A":"A","B":"B"},"edges":{"A_to_B":"A_to_B"}}}),
+        json!({"run_id":run_id,"request":{"remove_nodes":["B"],"remove_edges":["A_to_B"]}}),
     )
     .await;
     assert_eq!(plan["retirements"].as_array().unwrap().len(), 2);

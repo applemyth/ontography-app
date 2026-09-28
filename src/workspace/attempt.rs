@@ -181,7 +181,8 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let content = runtime.open().unwrap().content_store().await.unwrap();
         let store = WorkspaceStore::new(content, directory.join("store"));
         let source = directory.join("source");

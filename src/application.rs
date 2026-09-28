@@ -1,9 +1,9 @@
 //! Pinned native/project declarations resolved only through trusted core registries.
 
-use crate::declarations::RewriteProductionDeclaration;
+use crate::declarations::{Edits, SavedProductions, edit_policy};
 use crate::registry::ImplementationRegistry;
 use crate::{AppError, Result};
-use ontography::{Application, Kernel, RewriteGrammar};
+use ontography::{Application, EditPolicy, Kernel};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,8 +22,12 @@ pub struct ApplicationDeclaration {
     pub version: u32,
     pub format: ApplicationFormat,
     pub document: String,
-    #[serde(default)]
-    pub rewrites: Vec<RewriteProductionDeclaration>,
+    /// Which graph edits the application's run accepts.
+    #[serde(default, skip_serializing_if = "Edits::is_fixed")]
+    pub edits: Edits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub rewrites: SavedProductions,
     pub definition_id: String,
     /// Exact registered adapter descriptors, including versions and configuration schemas.
     pub registry: Value,
@@ -34,25 +38,24 @@ pub struct ApplicationDeclaration {
 pub struct CompiledApplication {
     pub application: Application,
     pub kernel: Arc<Kernel>,
-    pub grammar: RewriteGrammar,
+    pub policy: Arc<dyn EditPolicy>,
 }
 
 impl ApplicationDeclaration {
     pub fn new(
         format: ApplicationFormat,
         document: String,
-        rewrites: Vec<RewriteProductionDeclaration>,
+        edits: Edits,
         registry: &ImplementationRegistry,
         project: &Path,
     ) -> Result<Self> {
         let (application, resolution_fingerprint) = resolve(format, &document, registry, project)?;
-        // Validate grammar before admitting a reusable declaration.
-        grammar(&application, &rewrites)?;
         Ok(Self {
             version: 1,
             format,
             document,
-            rewrites,
+            edits,
+            rewrites: None,
             definition_id: application.kernel().id().to_string(),
             registry: registry.catalog(),
             resolution_fingerprint,
@@ -83,7 +86,7 @@ impl ApplicationDeclaration {
                 "provider resolution changed: expanded configuration, component metadata, project identity, or kernel differs from the saved declaration",
             ));
         }
-        let grammar = grammar(&application, &self.rewrites)?;
+        let policy = edit_policy(self.edits, &self.rewrites);
         let initial = application.kernel();
         // Core exposes the admitted constituents, but does not expose its retained Arc.
         let kernel = Arc::new(
@@ -100,29 +103,11 @@ impl ApplicationDeclaration {
             .map_err(AppError::core)?,
         );
         Ok(CompiledApplication {
-            application: application.with_grammar(grammar.clone()),
+            application: application.with_policy(policy.clone()),
             kernel,
-            grammar,
+            policy,
         })
     }
-}
-
-fn grammar(
-    application: &Application,
-    declarations: &[RewriteProductionDeclaration],
-) -> Result<RewriteGrammar> {
-    let kernel = application.kernel();
-    RewriteGrammar::new(
-        declarations
-            .iter()
-            .map(|declaration| {
-                declaration
-                    .compile(kernel.id(), kernel.schema(), kernel.contracts())
-                    .map_err(AppError::core)
-            })
-            .collect::<Result<Vec<_>>>()?,
-    )
-    .map_err(AppError::core)
 }
 
 fn resolve(
@@ -206,7 +191,7 @@ mod tests {
         let declaration = ApplicationDeclaration::new(
             ApplicationFormat::Native,
             document,
-            vec![],
+            Edits::Fixed,
             &registry,
             directory.path(),
         )
@@ -288,7 +273,7 @@ mod tests {
         let declaration = ApplicationDeclaration::new(
             ApplicationFormat::Project,
             document,
-            vec![],
+            Edits::Fixed,
             &registry,
             directory.path(),
         )

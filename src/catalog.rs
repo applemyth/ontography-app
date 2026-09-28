@@ -54,7 +54,7 @@ pub fn manager_operations() -> Vec<Operation> {
 fn build_operations() -> Vec<Operation> {
     let text = json!({"type":"string"});
     let declaration = schema::<crate::declarations::GraphDeclaration>();
-    let rewrite = schema::<crate::declarations::RewriteRequestDeclaration>();
+    let rewrite = schema::<crate::declarations::GraphEditDeclaration>();
     let mut ops = vec![
         Operation::new(
             "system.hello",
@@ -163,7 +163,7 @@ fn build_operations() -> Vec<Operation> {
         ),
         Operation::new(
             "rewrite.prepare",
-            "Prepare a configured rewrite and report its exact graph and package retirements without changing the run.",
+            "Prepare an explicit graph edit and report its exact graph and package retirements without changing the run. The run's declared edits decide whether it may change.",
             json!({"run_id":text,"request":rewrite}),
             &["run_id", "request"],
             true,

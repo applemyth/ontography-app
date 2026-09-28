@@ -1,14 +1,18 @@
 use crate::catalog::Operation;
-use crate::declarations::{GraphDeclaration, RewriteRequestDeclaration};
+use crate::declarations::{GraphDeclaration, GraphEditDeclaration};
 use crate::persistence::{read_json, write_json};
 use crate::state::{ManagedRun, RewriteHandle, Service};
 use crate::{AppError, Result, views};
+use ontography::{Principal, RewriteRequest};
 use serde_json::{Value, json};
 
 pub mod content;
 pub mod execution;
 pub mod workflow;
 pub mod workspace;
+
+/// The principal that administration calls edit a run's graph as.
+const OPERATOR: &str = "operator";
 
 pub fn operations() -> Vec<Operation> {
     let mut operations = workflow::operations();
@@ -69,6 +73,9 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
                     .cloned()
                     .ok_or_else(|| AppError::invalid("declaration is required"))?,
             )?;
+            declaration
+                .check_new()
+                .map_err(|error| AppError::invalid(error.to_string()))?;
             let revision = declaration.fingerprint().map_err(AppError::core)?;
             if operation == "graph.validate" {
                 let compiled = declaration
@@ -136,17 +143,24 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             Ok(json!({"definitions":definitions,"next_after":next}))
         }
         "run.start" => {
-            let declaration = match (args.get("declaration"), args.get("revision")) {
-                (Some(d), None) => serde_json::from_value(d.clone())?,
-                (None, Some(Value::String(revision))) => {
-                    read_json(&service.paths.definition(revision)?)?
-                }
-                _ => {
-                    return Err(AppError::invalid(
-                        "supply exactly one of declaration or revision",
-                    ));
-                }
-            };
+            let declaration: GraphDeclaration =
+                match (args.get("declaration"), args.get("revision")) {
+                    (Some(d), None) => {
+                        let declaration: GraphDeclaration = serde_json::from_value(d.clone())?;
+                        declaration
+                            .check_new()
+                            .map_err(|error| AppError::invalid(error.to_string()))?;
+                        declaration
+                    }
+                    (None, Some(Value::String(revision))) => {
+                        read_json(&service.paths.definition(revision)?)?
+                    }
+                    _ => {
+                        return Err(AppError::invalid(
+                            "supply exactly one of declaration or revision",
+                        ));
+                    }
+                };
             let project = std::path::PathBuf::from(views::field(args, "project")?);
             if !project.is_absolute() {
                 return Err(AppError::invalid("project must be an absolute directory"));
@@ -200,16 +214,19 @@ async fn dispatch_run(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         }
         "rewrite.prepare" => {
             let run_id = run.manifest.run_id.clone();
-            let request: RewriteRequestDeclaration = serde_json::from_value(
+            let edit: GraphEditDeclaration = serde_json::from_value(
                 args.get("request")
                     .cloned()
                     .ok_or_else(|| AppError::invalid("request is required"))?,
             )?;
+            let edit = edit
+                .compile()
+                .map_err(|error| AppError::invalid(error.to_string()))?;
             let id = uuid::Uuid::new_v4().to_string();
             let live = run.live_mut()?;
             let plan = live
                 .session
-                .prepare_rewrite(&request.compile())
+                .prepare_rewrite(&RewriteRequest::new(Principal::new(OPERATOR), edit))
                 .await
                 .map_err(AppError::core)?
                 .map_err(rewrite_error)?;
@@ -270,6 +287,7 @@ fn rewrite_error(error: ontography::RewriteError) -> AppError {
     let code = match &error {
         E::Stale => "stale",
         E::StateMismatch => "foreign_session",
+        E::Denied(_) => "edit_denied",
         _ => "rejected",
     };
     AppError::new(code, error.to_string())

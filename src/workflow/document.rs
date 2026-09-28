@@ -1,17 +1,18 @@
 //! The manager's workflow language and its expansion into existing declarations.
 
 use super::{
-    components::Bindings,
-    grammar::{self, Typing},
+    NodeType,
+    components::{Binding, Bindings},
     tasks::RetryPolicy,
 };
 use crate::declarations::{
-    ContractDeclaration, DECLARATION_VERSION, GraphDeclaration, IngressDeclaration,
-    SchemaDeclaration, VALIDATOR_VERSION, ValidatorKind,
+    AuthorityMatchDeclaration, ContractDeclaration, DECLARATION_VERSION, EdgeDeclaration, Edits,
+    GraphDeclaration, IngressDeclaration, NodeDeclaration, RootDeclaration, SchemaDeclaration,
+    VALIDATOR_VERSION, ValidatorKind,
 };
 use crate::registry::ExecutionBinding;
 use crate::{AppError, Result};
-use ontography::{ContractViolation, PackageEnvelope, Payload, content::BlobFormat};
+use ontography::{ContractViolation, Kernel, PackageEnvelope, Payload, content::BlobFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -235,8 +236,81 @@ impl IdentityMap {
     }
 }
 
-/// Expand a bound document into a new run's declaration. Each node's role is
-/// its core node type, and its binding is its execution binding.
+/// How a run types its nodes in core.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Typing {
+    /// Runs created before node types: every node has one shared type.
+    Shared,
+    /// Each node has its component's types.
+    Component,
+}
+
+impl Typing {
+    /// Read from core: a run created before node types declares only the
+    /// shared type.
+    pub fn of(kernel: &Kernel) -> Self {
+        if kernel.schema().node_types().eq([SHARED_NODE_TYPE]) {
+            Self::Shared
+        } else {
+            Self::Component
+        }
+    }
+
+    /// The types core gives a node with this binding. A node keeps its types
+    /// for life: different types replace it.
+    pub fn node_types(self, binding: &Binding) -> BTreeSet<String> {
+        match self {
+            Self::Shared => BTreeSet::from([SHARED_NODE_TYPE.to_owned()]),
+            Self::Component => BTreeSet::from([binding.node_type.as_str().to_owned()]),
+        }
+    }
+
+    /// A node as core declares it.
+    pub(super) fn node(
+        self,
+        id: &str,
+        binding: &Binding,
+        join: IngressDeclaration,
+    ) -> NodeDeclaration {
+        NodeDeclaration {
+            id: id.into(),
+            types: self.node_types(binding).into_iter().collect(),
+            result_contract: CONTRACT.into(),
+            ingress_mode: join,
+        }
+    }
+
+    /// A connection as core declares it. Any nodes may connect; runs created
+    /// before node types require their one type at both ends.
+    pub(super) fn edge(self, id: &str, from: &str, to: &str) -> EdgeDeclaration {
+        let requirements = match self {
+            Self::Shared => vec![SHARED_NODE_TYPE.into()],
+            Self::Component => vec![],
+        };
+        EdgeDeclaration {
+            id: id.into(),
+            source: from.into(),
+            target: to.into(),
+            types: vec![EDGE_TYPE.into()],
+            source_requirements: requirements.clone(),
+            target_requirements: requirements,
+            package_contract: CONTRACT.into(),
+            authority_tags: vec![AUTHORITY.into()],
+            authority_match: AuthorityMatchDeclaration::AnyOf,
+        }
+    }
+}
+
+/// The entry node's root rule: new work there carries workflow authority.
+pub(super) fn root(id: &str) -> RootDeclaration {
+    RootDeclaration {
+        node_id: id.into(),
+        ceiling: vec![AUTHORITY.into()],
+    }
+}
+
+/// Expand a bound document into a new run's declaration. Each node has its
+/// component's types in core, and its binding is its execution binding.
 pub fn expand(
     document: &Document,
     bindings: &Bindings,
@@ -254,27 +328,20 @@ pub fn expand(
     {
         return Err(invalid("Every node needs exactly one component binding"));
     }
-    let typing = Typing::Roles;
+    let typing = Typing::Component;
     let nodes = document
         .nodes
         .iter()
-        .map(|node| {
-            grammar::node(
-                &identities.nodes[&node.id],
-                typing.core_type(bindings[&node.id].node_type),
-                node.join,
-            )
-        })
+        .map(|node| typing.node(&identities.nodes[&node.id], &bindings[&node.id], node.join))
         .collect();
     let edges = document
         .edges
         .iter()
         .map(|edge| {
-            grammar::edge(
+            typing.edge(
                 &identities.edges[&edge_key(&edge.from, &edge.to)],
                 &identities.nodes[&edge.from],
                 &identities.nodes[&edge.to],
-                typing,
             )
         })
         .collect();
@@ -296,7 +363,10 @@ pub fn expand(
         version: DECLARATION_VERSION,
         id: definition_id.into(),
         schema: SchemaDeclaration {
-            node_types: typing.node_types().into_iter().map(Into::into).collect(),
+            node_types: NodeType::ALL
+                .iter()
+                .map(|node_type| node_type.as_str().into())
+                .collect(),
             object_types: vec![OBJECT_TYPE.into()],
             authority_tags: vec![AUTHORITY.into()],
         },
@@ -308,9 +378,11 @@ pub fn expand(
         }],
         nodes,
         edges,
-        roots: vec![grammar::root(&identities.nodes[&document.entry])],
+        roots: vec![root(&identities.nodes[&document.entry])],
         authority_transitions: vec![],
-        rewrites: grammar::productions(typing),
+        // The workflow editor's policy governs edits (`edit::policy`).
+        edits: Edits::Fixed,
+        rewrites: None,
         execution_bindings,
     })
 }

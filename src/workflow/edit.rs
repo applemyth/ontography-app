@@ -1,23 +1,77 @@
-//! Durable intent over core's individually atomic rewrites.
+//! Edits to a running workflow, each one explicit core graph edit.
 //!
-//! The caller serializes topology edits for a run. Workers may keep submitting
-//! between steps: this is a recoverable live edit, not one atomic graph change.
-//! The graph itself records progress; a saved target fixes all fresh identities.
+//! The caller serializes edits for a run; workers keep submitting throughout.
+//! An accepted edit is saved with every fresh identity before core changes,
+//! and core's graph records whether it applied: recovery computes the edit
+//! again and finds either the whole edit or nothing left to do.
 
-use super::NodeType;
 use super::components::{Binding, Bindings, BoundNode, Catalog};
-use super::document::{Document, IdentityMap, SHARED_NODE_TYPE, edge_key};
-use super::grammar::{self, Typing, Variant};
-use crate::declarations::IngressDeclaration;
+use super::document::{
+    AUTHORITY, CONTRACT, Document, EDGE_TYPE, IdentityMap, Typing, edge_key, root,
+};
+use crate::declarations::GraphFragmentDeclaration;
 use crate::{AppError, Result, persistence};
 use ontography::{
-    IngressMode, Kernel, RetirementReason, RewriteError, RewriteGrammar, RewriteMatch,
-    RewriteRequest, SessionHandle,
+    AuthorityMatch, AuthorityTag, EdgeDefinition, EditContext, EditPolicy, GraphEdit, IngressMode,
+    Kernel, PolicyDenial, Principal, RetirementReason, RewriteError, RewriteRequest, RootRule,
+    SessionHandle,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 const MAX_STALE_RETRIES: usize = 8;
+
+/// The principal the workflow editor edits a run's graph as.
+const EDITOR: &str = "workflow";
+
+/// Which edits a workflow run accepts: only its editor's, and only ones that
+/// keep it a workflow, with workflow nodes and connections, one entry, and no
+/// authority changes.
+pub fn policy() -> Arc<dyn EditPolicy> {
+    Arc::new(workflow_edit)
+}
+
+fn workflow_edit(context: &EditContext<'_>) -> std::result::Result<(), PolicyDenial> {
+    let deny = |reason: &str| Err(PolicyDenial::new(reason));
+    if context.principal.name() != EDITOR {
+        return deny("change this run through its workflow document");
+    }
+    let add = context.edit.add();
+    if !add.authority_transitions().is_empty() {
+        return deny("workflow edits cannot change authority");
+    }
+    if add
+        .node_definitions()
+        .iter()
+        .any(|node| node.result_contract() != CONTRACT)
+    {
+        return deny("workflow nodes produce workflow payloads");
+    }
+    if !add.edge_definitions().iter().all(is_connection) {
+        return deny("workflow connections carry workflow payloads under workflow authority");
+    }
+    let workflow_authority =
+        |root: &RootRule| root.ceiling().tags().map(AuthorityTag::id).eq([AUTHORITY]);
+    if !add.roots().iter().all(workflow_authority) || context.after.roots().len() != 1 {
+        return deny("a workflow has exactly one entry, with workflow authority");
+    }
+    Ok(())
+}
+
+fn is_connection(edge: &EdgeDefinition) -> bool {
+    edge.types().iter().map(AsRef::as_ref).eq([EDGE_TYPE])
+        && edge.package_contract() == CONTRACT
+        && edge
+            .authority_tags()
+            .iter()
+            .map(AuthorityTag::id)
+            .eq([AUTHORITY])
+        && edge.authority_match() == AuthorityMatch::AnyOf
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,9 +140,9 @@ impl WorkflowState {
         })
     }
 
-    /// Workflow names of core nodes, by core identity. During an unfinished
-    /// edit, a replacement already in `kernel` takes its name and the node it
-    /// replaces is labeled "(previous)".
+    /// Workflow names of core nodes, by core identity. While an accepted edit
+    /// is pending, a replacement already in `kernel` takes its name and the
+    /// node it replaces is labeled "(previous)".
     pub fn node_names(&self, kernel: &Kernel) -> BTreeMap<String, String> {
         let mut names: BTreeMap<_, _> = self
             .identities
@@ -130,14 +184,18 @@ pub struct Plan {
     pub bindings: Bindings,
     pub identities: IdentityMap,
     pub retirements: BTreeMap<String, String>,
-    pub steps: usize,
+    /// Nodes and connections the edit adds to or removes from core's graph;
+    /// none when only settings change.
+    #[serde(alias = "steps")]
+    pub changes: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EditOutcome {
     pub version: u64,
     pub core_revision: u64,
-    pub steps_applied: usize,
+    /// Whether this call changed core's graph.
+    pub changed_graph: bool,
 }
 
 pub fn load(path: &Path) -> Result<WorkflowState> {
@@ -157,9 +215,9 @@ pub fn store(path: &Path, state: &WorkflowState) -> Result<()> {
     persistence::write_json(path, state)
 }
 
-/// Simulate the remaining changes using the same kernel rules and exact bytes.
-/// A stopped edit can be re-previewed only with its original target, IDs, and
-/// bindings.
+/// Prepare the edit to `next` against the current graph and report the work
+/// it would retire, without changing anything. A stopped edit can be
+/// re-previewed only with its original target, identities, and bindings.
 pub async fn preview(
     session: &SessionHandle,
     state: &WorkflowState,
@@ -167,79 +225,55 @@ pub async fn preview(
     bindings: Bindings,
 ) -> Result<Plan> {
     let document = next.canonicalized()?;
-    let snapshot = session.try_snapshot().await.map_err(AppError::core)?;
-    let mut kernel = snapshot.kernel().clone();
-    let mut facts = snapshot.state().clone();
-    let typing = Typing::of(&kernel);
+    let kernel = session.kernel().await.map_err(AppError::core)?;
     let (bindings, identities) = if let Some(pending) = &state.pending {
         if pending.document != document {
             return Err(pending_edit());
         }
         (pending.bindings.clone(), pending.identities.clone())
     } else {
-        let identities = target_identities(state, &document, &bindings, typing);
+        if graph_edit(&kernel, &state.current, &state.bindings, &state.identities)?.is_some() {
+            return Err(AppError::new(
+                "workflow_drift",
+                "Core's graph differs from the saved workflow",
+            ));
+        }
+        let identities = target_identities(state, &document, &bindings, Typing::of(&kernel));
         (bindings, identities)
     };
-    if state.pending.is_none()
-        && next_step(&kernel, &state.current, &state.bindings, &state.identities)?.is_some()
-    {
-        return Err(AppError::new(
-            "workflow_drift",
-            "Core's graph differs from the saved workflow",
-        ));
-    }
-    let contracts = kernel.contracts().to_vec();
-    let grammar = RewriteGrammar::new(
-        grammar::productions(typing)
-            .iter()
-            .map(|rule| rule.compile(kernel.id(), kernel.schema(), &contracts))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(AppError::core)?,
-    )
-    .map_err(AppError::core)?;
-    let mut evidence = BTreeMap::new();
-    let mut retirements = BTreeMap::new();
-    let mut steps = 0;
-    while let Some(request) = next_step(&kernel, &document, &bindings, &identities)? {
-        let prepared = loop {
-            match kernel.prepare_rewrite(&facts, &grammar, &request, &evidence) {
-                Ok(prepared) => break prepared,
-                Err(RewriteError::MissingEvidence(package)) => {
-                    let digest = facts.packages()[&package].content_digest();
-                    let bytes = session
-                        .content(digest)
-                        .await
-                        .map_err(AppError::core)?
-                        .ok_or_else(|| {
-                            AppError::new(
-                                "missing_content",
-                                format!("Missing bytes for pending package {package}"),
-                            )
-                        })?;
-                    evidence.insert(digest, bytes);
-                }
-                Err(error) => return Err(AppError::core(error)),
+    let (base_core_revision, retirements, changes) =
+        match graph_edit(&kernel, &document, &bindings, &identities)? {
+            None => (session.frontier().revision(), BTreeMap::new(), 0),
+            Some(edit) => {
+                let changes = edit.remove_nodes().len()
+                    + edit.remove_edges().len()
+                    + edit.add().nodes().len()
+                    + edit.add().edges().len();
+                let prepared = session
+                    .prepare_rewrite(&request(edit))
+                    .await
+                    .map_err(AppError::core)?
+                    .map_err(AppError::core)?;
+                (
+                    prepared.revision(),
+                    retirement_report(prepared.retirements()),
+                    changes,
+                )
             }
         };
-        retirements.extend(retirement_report(&prepared.retirements()));
-        kernel = kernel
-            .commit_rewrite(&mut facts, prepared)
-            .map_err(AppError::core)?;
-        steps += 1;
-    }
     Ok(Plan {
         id: uuid::Uuid::new_v4().to_string(),
         base_version: state.version,
-        base_core_revision: snapshot.revision(),
+        base_core_revision,
         document,
         bindings,
         identities,
         retirements,
-        steps,
+        changes,
     })
 }
 
-/// Accept a server-owned preview, durably save intent, and begin reconciling.
+/// Accept a server-owned preview, durably save intent, and apply it.
 pub async fn commit(
     session: &SessionHandle,
     state: &mut WorkflowState,
@@ -259,7 +293,7 @@ pub async fn commit(
         .is_some_and(|pending| pending.id == plan.id)
     {
         // Retrying an accepted plan resumes its saved intention. Its original
-        // revision is necessarily stale once any of its steps have committed.
+        // revision is necessarily stale once its edit has committed.
         return recover(session, state, path).await;
     }
     if state.pending.is_none()
@@ -273,18 +307,19 @@ pub async fn commit(
         return recover(session, state, path).await;
     }
     let revision = session.frontier().revision();
-    if state.version != plan.base_version || (plan.steps > 0 && revision != plan.base_core_revision)
+    if state.version != plan.base_version
+        || (plan.changes > 0 && revision != plan.base_core_revision)
     {
         return Err(AppError::new(
             "stale_preview",
             "The workflow changed after this preview; preview it again",
         ));
     }
-    if plan.steps == 0 {
+    if plan.changes == 0 {
         // Worker progress cannot stale a settings edit. Its graph must still
         // match, so skipping the work revision never authorizes graph repair.
         let kernel = session.kernel().await.map_err(AppError::core)?;
-        if next_step(&kernel, &plan.document, &plan.bindings, &plan.identities)?.is_some() {
+        if graph_edit(&kernel, &plan.document, &plan.bindings, &plan.identities)?.is_some() {
             return Err(AppError::new(
                 "workflow_drift",
                 "Core's graph changed after this settings preview",
@@ -300,7 +335,7 @@ pub async fn commit(
     recover(session, state, path).await
 }
 
-/// Continue a saved intention; never infer success from an app progress counter.
+/// Finish a saved intention; never infer success from an app progress record.
 /// New retirements leave the intention saved for another preview of this target.
 pub async fn recover(
     session: &SessionHandle,
@@ -311,14 +346,14 @@ pub async fn recover(
         return Ok(EditOutcome {
             version: state.version,
             core_revision: session.frontier().revision(),
-            steps_applied: 0,
+            changed_graph: false,
         });
     };
-    let mut steps_applied = 0;
+    let mut changed_graph = false;
     let mut stale_retries = 0;
     loop {
         let kernel = session.kernel().await.map_err(AppError::core)?;
-        let Some(request) = next_step(&kernel, &plan.document, &plan.bindings, &plan.identities)?
+        let Some(edit) = graph_edit(&kernel, &plan.document, &plan.bindings, &plan.identities)?
         else {
             let completed = completed_state(state)?;
             store(path, &completed)?;
@@ -326,38 +361,34 @@ pub async fn recover(
             return Ok(EditOutcome {
                 version: state.version,
                 core_revision: session.frontier().revision(),
-                steps_applied,
+                changed_graph,
             });
         };
-        if plan.steps == 0 {
+        if plan.changes == 0 || changed_graph {
             return Err(AppError::new(
                 "workflow_drift",
-                "A settings edit cannot repair an unexpected graph change",
+                "Core's graph changed in a way this edit cannot repair",
             ));
         }
         let prepared = session
-            .prepare_rewrite(&request)
+            .prepare_rewrite(&request(edit))
             .await
             .map_err(AppError::core)?
             .map_err(AppError::core)?;
-        let retirements = retirement_report(prepared.retirements());
-        let additional: BTreeMap<_, _> = retirements
+        let additional: BTreeMap<_, _> = retirement_report(prepared.retirements())
             .into_iter()
             .filter(|(id, reason)| plan.retirements.get(id) != Some(reason))
             .collect();
         if !additional.is_empty() {
             return Err(AppError::new("retirement_preview_required", "Completing the pending edit would discard additional work; preview this target again")
-                .details(serde_json::json!({"additional_retirements":additional,"steps_applied":steps_applied,"pending_edit":plan.id})));
+                .details(serde_json::json!({"additional_retirements":additional,"pending_edit":plan.id})));
         }
         match session
             .commit_rewrite(prepared)
             .await
             .map_err(AppError::core)?
         {
-            Ok(_) => {
-                steps_applied += 1;
-                stale_retries = 0;
-            }
+            Ok(_) => changed_graph = true,
             Err(RewriteError::Stale) => {
                 stale_retries += 1;
                 if stale_retries == MAX_STALE_RETRIES {
@@ -414,17 +445,16 @@ fn retirement_report(
 }
 
 /// Keep a node's core identity unless core must replace it: its join, entry
-/// status, or core node type changed.
+/// status, or core node types changed. A connection keeps its identity while
+/// both of its nodes keep theirs.
 fn target_identities(
     state: &WorkflowState,
     document: &Document,
     bindings: &Bindings,
     typing: Typing,
 ) -> IdentityMap {
-    let role = |bindings: &Bindings, name: &str| {
-        bindings
-            .get(name)
-            .map(|binding| typing.role(binding.node_type))
+    let node_types = |bindings: &Bindings, name: &str| {
+        bindings.get(name).map(|binding| typing.node_types(binding))
     };
     let mut identities = IdentityMap::fresh(document);
     for node in &document.nodes {
@@ -432,7 +462,7 @@ fn target_identities(
             old.id == node.id
                 && old.join == node.join
                 && (old.id == state.current.entry) == (node.id == document.entry)
-                && role(&state.bindings, &old.id) == role(bindings, &node.id)
+                && node_types(&state.bindings, &old.id) == node_types(bindings, &node.id)
         }) && let Some(id) = state.identities.nodes.get(&node.id)
         {
             identities.nodes.insert(node.id.clone(), id.clone());
@@ -450,44 +480,18 @@ fn target_identities(
     identities
 }
 
-/// A node's variant as core records it, including its core node type.
-fn variant(kernel: &Kernel, node_id: &str) -> Result<Variant> {
-    let drift = |message: String| AppError::new("workflow_drift", message);
-    let node = kernel
-        .node_definition(node_id)
-        .ok_or_else(|| drift(format!("Missing node {node_id}")))?;
-    let role = match node
-        .types()
-        .iter()
-        .map(AsRef::as_ref)
-        .collect::<Vec<&str>>()[..]
-    {
-        [SHARED_NODE_TYPE] => None,
-        [name] => Some(
-            NodeType::from_core(name)
-                .ok_or_else(|| drift(format!("Node {node_id} has unknown type {name:?}")))?,
-        ),
-        _ => return Err(drift(format!("Node {node_id} must have exactly one type"))),
-    };
-    Ok(Variant {
-        role,
-        join: match node.ingress_mode() {
-            IngressMode::Any => IngressDeclaration::Any,
-            IngressMode::All => IngressDeclaration::All,
-        },
-        root: kernel.root_ceiling(node_id).is_some(),
-    })
-}
-
-/// Monotone reconciliation: add target nodes/routes before deleting old ones.
-/// Replacements use new IDs, so their old and new incarnations can coexist.
-fn next_step(
+/// The one core edit that makes `kernel`'s graph the target's: it adds the
+/// target's nodes and connections that core lacks and removes those the target
+/// lacks. `None` when the graph already matches.
+fn graph_edit(
     kernel: &Kernel,
     document: &Document,
     bindings: &Bindings,
     ids: &IdentityMap,
-) -> Result<Option<RewriteRequest>> {
+) -> Result<Option<GraphEdit>> {
+    let drift = |message: &str| AppError::new("workflow_drift", message);
     let typing = Typing::of(kernel);
+    let mut add = GraphFragmentDeclaration::default();
     for node in &document.nodes {
         let id = ids
             .nodes
@@ -496,27 +500,37 @@ fn next_step(
         let binding = bindings
             .get(&node.id)
             .ok_or_else(|| AppError::invalid("Incomplete workflow node bindings"))?;
-        let wanted = Variant {
-            role: typing.role(binding.node_type),
-            join: node.join,
-            root: node.id == document.entry,
+        let wanted = typing.node(id, binding, node.join);
+        let entry = node.id == document.entry;
+        let Some(actual) = kernel.node_definition(id) else {
+            if let Some(unknown) = wanted
+                .types
+                .iter()
+                .find(|name| !kernel.schema().node_types().any(|known| known == *name))
+            {
+                return Err(AppError::new(
+                    "unknown_node_type",
+                    format!(
+                        "Node {:?} has type {unknown:?}, which this run does not declare; start a new run to use it",
+                        node.id
+                    ),
+                ));
+            }
+            add.nodes.push(wanted);
+            if entry {
+                add.roots.push(root(id));
+            }
+            continue;
         };
-        if kernel.graph().node(id).is_none() {
-            return Ok(Some(RewriteRequest::new(
-                grammar::node_rule(true, wanted),
-                RewriteMatch::new(
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    symbols(&[("n", id)]),
-                    BTreeMap::new(),
-                ),
-            )));
-        }
-        if variant(kernel, id)? != wanted {
-            return Err(AppError::new(
-                "workflow_drift",
-                "A retained node has different core properties",
-            ));
+        if !actual
+            .types()
+            .iter()
+            .map(AsRef::as_ref)
+            .eq(wanted.types.iter().map(String::as_str))
+            || actual.ingress_mode() != IngressMode::from(wanted.ingress_mode)
+            || kernel.root_ceiling(id).is_some() != entry
+        {
+            return Err(drift("A retained node has different core properties"));
         }
     }
     for edge in &document.edges {
@@ -526,91 +540,55 @@ fn next_step(
             .ok_or_else(|| AppError::invalid("Incomplete workflow edge identities"))?;
         let source = &ids.nodes[&edge.from];
         let target = &ids.nodes[&edge.to];
-        if let Some(actual) = kernel.graph().edge(id) {
-            if actual.source() != source || actual.target() != target {
-                return Err(AppError::new(
-                    "workflow_drift",
-                    "A retained connection has different endpoints",
-                ));
+        match kernel.graph().edge(id) {
+            None => add.edges.push(typing.edge(id, source, target)),
+            Some(actual) if actual.source() != source || actual.target() != target => {
+                return Err(drift("A retained connection has different endpoints"));
             }
-        } else {
-            return Ok(Some(edge_request(kernel, true, id, source, target)?));
+            Some(_) => {}
         }
     }
-    for edge in kernel.graph().edges() {
-        if !ids.edges.values().any(|id| id == edge.id()) {
-            return Ok(Some(edge_request(
-                kernel,
-                false,
-                edge.id(),
-                edge.source(),
-                edge.target(),
-            )?));
-        }
-    }
-    for node in kernel.graph().nodes() {
-        if !ids.nodes.values().any(|id| id == node.id()) {
-            return Ok(Some(RewriteRequest::new(
-                grammar::node_rule(false, variant(kernel, node.id())?),
-                RewriteMatch::new(
-                    symbols(&[("n", node.id())]),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                ),
-            )));
-        }
-    }
-    Ok(None)
-}
-
-fn edge_request(
-    kernel: &Kernel,
-    add: bool,
-    id: &str,
-    source: &str,
-    target: &str,
-) -> Result<RewriteRequest> {
-    let is_loop = source == target;
-    Ok(RewriteRequest::new(
-        grammar::edge_rule(
-            add,
-            variant(kernel, source)?,
-            variant(kernel, target)?,
-            is_loop,
-        ),
-        RewriteMatch::new(
-            if is_loop {
-                symbols(&[("n", source)])
-            } else {
-                symbols(&[("a", source), ("b", target)])
-            },
-            if add {
-                BTreeMap::new()
-            } else {
-                symbols(&[("e", id)])
-            },
-            BTreeMap::new(),
-            if add {
-                symbols(&[("e", id)])
-            } else {
-                BTreeMap::new()
-            },
-        ),
-    ))
-}
-
-fn symbols(entries: &[(&str, &str)]) -> BTreeMap<Arc<str>, Arc<str>> {
-    entries
+    let kept =
+        |ids: &BTreeMap<String, String>| -> BTreeSet<String> { ids.values().cloned().collect() };
+    let (kept_nodes, kept_edges) = (kept(&ids.nodes), kept(&ids.edges));
+    let remove_nodes: BTreeSet<Arc<str>> = kernel
+        .graph()
+        .nodes()
         .iter()
-        .map(|(key, value)| (Arc::from(*key), Arc::from(*value)))
-        .collect()
+        .filter(|node| !kept_nodes.contains(node.id()))
+        .map(|node| Arc::from(node.id()))
+        .collect();
+    let remove_edges: BTreeSet<Arc<str>> = kernel
+        .graph()
+        .edges()
+        .iter()
+        .filter(|edge| !kept_edges.contains(edge.id()))
+        .map(|edge| Arc::from(edge.id()))
+        .collect();
+    if remove_nodes.is_empty()
+        && remove_edges.is_empty()
+        && add.nodes.is_empty()
+        && add.edges.is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some(GraphEdit::new(
+        remove_nodes,
+        remove_edges,
+        add.compile().map_err(AppError::core)?,
+    )))
+}
+
+fn request(edit: GraphEdit) -> RewriteRequest {
+    RewriteRequest::new(Principal::new(EDITOR), edit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::document::expand_builtin as expand;
+    use crate::declarations::{GraphEditDeclaration, IngressDeclaration};
+    use crate::workflow::NodeType;
+    use crate::workflow::document::{SHARED_NODE_TYPE, expand_builtin as expand};
     use ontography::{
         ActivationProposal, Emission, OutputAuthority, ProposalDecision, ProposalRuntime,
     };
@@ -638,17 +616,33 @@ mod tests {
         super::preview(session, state, next, bindings).await
     }
 
+    /// Apply the edit to `document` directly, as a writer bypassing the
+    /// saved workflow would.
+    async fn apply(session: &SessionHandle, document: &Document, ids: &IdentityMap) {
+        let bindings = Catalog::builtin().bind(document).unwrap();
+        let kernel = session.kernel().await.unwrap();
+        let edit = graph_edit(&kernel, document, &bindings, ids)
+            .unwrap()
+            .unwrap();
+        let prepared = session
+            .prepare_rewrite(&request(edit))
+            .await
+            .unwrap()
+            .unwrap();
+        session.commit_rewrite(prepared).await.unwrap().unwrap();
+    }
+
     fn fixture() -> (
         tempfile::TempDir,
         ProposalRuntime,
         SessionHandle,
         WorkflowState,
     ) {
-        fixture_typed(Typing::Roles)
+        fixture_typed(Typing::Component)
     }
 
     /// A run created with `typing`. Runs created before node types have one
-    /// shared type and the original rules.
+    /// shared type.
     fn fixture_typed(
         typing: Typing,
     ) -> (
@@ -670,10 +664,9 @@ mod tests {
                 edge.source_requirements = vec![SHARED_NODE_TYPE.into()];
                 edge.target_requirements = vec![SHARED_NODE_TYPE.into()];
             }
-            declaration.rewrites = grammar::productions(Typing::Shared);
         }
         let compiled = declaration.compile().unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime = ProposalRuntime::with_policy(compiled.kernel, policy());
         let session = runtime
             .create_persistent(directory.path().join("core"))
             .unwrap();
@@ -737,12 +730,13 @@ mod tests {
         assert_ne!(plan.identities.nodes["review"], original.nodes["review"]);
         assert_eq!(plan.bindings["writer"].implementation.kind(), "claude");
         assert_eq!(plan.bindings["review"].node_type, NodeType::Human);
-        // Add the human, reconnect it, then remove the inbox and its edge.
-        assert_eq!(plan.steps, 4);
+        // One edit adds the human and its connection and removes the inbox
+        // and its connection.
+        assert_eq!(plan.changes, 4);
     }
 
     #[tokio::test]
-    async fn runs_created_before_node_types_keep_their_shared_rules() {
+    async fn runs_created_before_node_types_keep_one_shared_type() {
         let (directory, _runtime, session, mut state) = fixture_typed(Typing::Shared);
         let path = directory.path().join("workflow.json");
         let original = state.identities.clone();
@@ -759,7 +753,7 @@ mod tests {
             .push(serde_json::from_value(json!({"from":"review","to":"archive"})).unwrap());
         let plan = preview(&session, &state, next).await.unwrap();
         assert_eq!(plan.identities.nodes["review"], original.nodes["review"]);
-        assert_eq!(plan.steps, 2);
+        assert_eq!(plan.changes, 2);
         commit(&session, &mut state, &path, plan).await.unwrap();
         let kernel = session.kernel().await.unwrap();
         let archive = kernel
@@ -773,6 +767,46 @@ mod tests {
                 .collect::<Vec<&str>>(),
             [SHARED_NODE_TYPE]
         );
+    }
+
+    #[tokio::test]
+    async fn only_the_editor_may_edit_and_only_into_a_workflow() {
+        let (_directory, _runtime, session, state) = fixture();
+        let writer = &state.identities.nodes["writer"];
+        let review = &state.identities.nodes["review"];
+        let connection = &state.identities.edges[&edge_key("writer", "review")];
+        let denied = |principal: &str, edit: serde_json::Value| {
+            let edit = serde_json::from_value::<GraphEditDeclaration>(edit)
+                .unwrap()
+                .compile()
+                .unwrap();
+            RewriteRequest::new(Principal::new(principal), edit)
+        };
+        let remove_review = json!({"remove_nodes":[review],"remove_edges":[connection]});
+        let foreign_connection = json!({"add":{"edges":[{
+            "id":"other","source":writer,"target":review,"types":["Other"],
+            "package_contract":CONTRACT,"authority_tags":[AUTHORITY]}]}});
+        let no_entry = json!({"remove_nodes":[writer],"remove_edges":[connection]});
+        for (principal, edit, reason) in [
+            ("operator", remove_review.clone(), "workflow document"),
+            (EDITOR, foreign_connection, "connections"),
+            (EDITOR, no_entry, "one entry"),
+        ] {
+            let error = session
+                .prepare_rewrite(&denied(principal, edit))
+                .await
+                .unwrap()
+                .unwrap_err();
+            let RewriteError::Denied(message) = error else {
+                panic!("{error}");
+            };
+            assert!(message.contains(reason), "{message}");
+        }
+        session
+            .prepare_rewrite(&denied(EDITOR, remove_review))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -792,6 +826,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plans_saved_with_steps_still_load() {
+        let (directory, _runtime, session, mut state) = fixture();
+        let mut next = state.current.clone();
+        next.edges.clear();
+        state.pending = Some(preview(&session, &state, next).await.unwrap());
+        let mut saved = serde_json::to_value(&state).unwrap();
+        let pending = saved["pending"].as_object_mut().unwrap();
+        let changes = pending.remove("changes").unwrap();
+        pending.insert("steps".into(), changes);
+        let path = directory.path().join("workflow.json");
+        persistence::write_json(&path, &saved).unwrap();
+        assert_eq!(load(&path).unwrap().pending.unwrap().changes, 1);
+    }
+
+    #[tokio::test]
     async fn prompt_only_edit_preserves_core_revision_and_incarnations() {
         let (directory, _runtime, session, mut state) = fixture();
         let original_ids = state.identities.clone();
@@ -802,7 +851,7 @@ mod tests {
             .unwrap()
             .config = json!({"prompt":"after"});
         let plan = preview(&session, &state, next.clone()).await.unwrap();
-        assert_eq!(plan.steps, 0);
+        assert_eq!(plan.changes, 0);
         let result = commit(
             &session,
             &mut state,
@@ -813,6 +862,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.core_revision, 0);
         assert_eq!(result.version, 2);
+        assert!(!result.changed_graph);
         assert_eq!(state.identities, original_ids);
         assert_eq!(
             load(&directory.path().join("workflow.json"))
@@ -833,7 +883,7 @@ mod tests {
             .unwrap()
             .config = json!({"prompt":"after"});
         let plan = preview(&session, &state, next.clone()).await.unwrap();
-        assert_eq!(plan.steps, 0);
+        assert_eq!(plan.changes, 0);
         let package = produce(&session, &state, true).await.unwrap();
         let revision = session.frontier().revision();
         assert!(revision > plan.base_core_revision);
@@ -847,7 +897,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.version, 2);
         assert_eq!(result.core_revision, revision);
-        assert_eq!(result.steps_applied, 0);
+        assert!(!result.changed_graph);
         assert_eq!(state.current, next);
         assert_eq!(state.identities, original_ids);
         assert!(session.try_snapshot().await.unwrap().state().packages()[&package].is_live());
@@ -934,11 +984,7 @@ mod tests {
             let bindings = Catalog::builtin().bind(&changed).unwrap();
             let kernel = session.kernel().await.unwrap();
             let ids = target_identities(&state, &changed, &bindings, Typing::of(&kernel));
-            let request = next_step(&kernel, &changed, &bindings, &ids)
-                .unwrap()
-                .unwrap();
-            let prepared = session.prepare_rewrite(&request).await.unwrap().unwrap();
-            session.commit_rewrite(prepared).await.unwrap().unwrap();
+            apply(&session, &changed, &ids).await;
             let revision = session.frontier().revision();
             let error = commit(&session, &mut state, &path, plan).await.unwrap_err();
             assert_eq!(error.code, "workflow_drift");
@@ -1015,7 +1061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_adds_new_route_before_removing_old_and_preserves_output() {
+    async fn a_replaced_connection_keeps_output_routable() {
         let (directory, _runtime, session, mut state) = fixture();
         let old_node = state.identities.nodes["review"].clone();
         let old_edge = state.identities.edges[&edge_key("writer", "review")].clone();
@@ -1050,9 +1096,9 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recovers_after_core_commit_before_any_app_progress_write() {
-        // Cover both a partially applied edit and a fully applied graph whose
-        // final document publication was interrupted.
-        for committed_steps in 1..=2 {
+        // Cover an accepted edit that core never applied and one whose final
+        // document publication was interrupted after core applied it.
+        for applied in [false, true] {
             let (directory, runtime, session, mut state) = fixture();
             let path = directory.path().join("workflow.json");
             let declaration = expand(&state.current, "edit-test", &state.identities).unwrap();
@@ -1062,22 +1108,17 @@ mod tests {
             next.edges
                 .push(serde_json::from_value(json!({"from":"review","to":"archive"})).unwrap());
             let plan = preview(&session, &state, next).await.unwrap();
-            assert_eq!(plan.steps, 2);
+            assert_eq!(plan.changes, 2);
             let target_ids = plan.identities.clone();
             state.pending = Some(plan.clone());
             store(&path, &state).unwrap();
-            for _ in 0..committed_steps {
-                let kernel = session.kernel().await.unwrap();
-                let request = next_step(&kernel, &plan.document, &plan.bindings, &plan.identities)
-                    .unwrap()
-                    .unwrap();
-                let prepared = session.prepare_rewrite(&request).await.unwrap().unwrap();
-                session.commit_rewrite(prepared).await.unwrap().unwrap();
+            if applied {
+                apply(&session, &plan.document, &plan.identities).await;
             }
             drop(session);
             drop(runtime);
             let compiled = declaration.compile().unwrap();
-            let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+            let runtime = ProposalRuntime::with_policy(compiled.kernel, policy());
             let session = runtime
                 .open_persistent(directory.path().join("core"))
                 .unwrap();
@@ -1085,14 +1126,14 @@ mod tests {
             let result = commit(&session, &mut state, &path, plan.clone())
                 .await
                 .unwrap();
-            assert_eq!(result.steps_applied, 2 - committed_steps);
+            assert_eq!(result.changed_graph, !applied);
             assert_eq!(state.identities, target_ids);
             assert!(state.pending.is_none());
             assert_eq!(state.current, plan.document);
             assert_eq!(session.kernel().await.unwrap().graph().nodes().len(), 3);
             let repeated = commit(&session, &mut state, &path, plan).await.unwrap();
             assert_eq!(repeated.version, result.version);
-            assert_eq!(repeated.steps_applied, 0);
+            assert!(!repeated.changed_graph);
         }
     }
 }

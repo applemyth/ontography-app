@@ -335,7 +335,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             }
             persistence::write_json(&plan_path(&run, &plan.id)?, &plan)?;
             Ok(
-                json!({"plan_id":plan.id,"version":plan.base_version,"document":plan.document,"changes":plan.steps,
+                json!({"plan_id":plan.id,"version":plan.base_version,"document":plan.document,"changes":plan.changes,
                 "retirements":retirements(&run,&state,&plan).await?}),
             )
         }

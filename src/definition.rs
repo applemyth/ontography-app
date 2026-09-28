@@ -2,7 +2,7 @@
 use crate::{
     AppError, Result,
     application::ApplicationDeclaration,
-    declarations::{CompiledGraph, GraphDeclaration, RewriteProductionDeclaration},
+    declarations::{CompiledGraph, GraphDeclaration},
     registry::{ExecutionBinding, ImplementationRegistry},
 };
 use serde::{Deserialize, Serialize};
@@ -39,15 +39,9 @@ impl RunDefinition {
                 let compiled = d.compile(registry, project)?;
                 Ok(CompiledGraph {
                     kernel: compiled.kernel,
-                    grammar: compiled.grammar,
+                    policy: compiled.policy,
                 })
             }
-        }
-    }
-    pub fn rewrites(&self) -> &[RewriteProductionDeclaration] {
-        match self {
-            Self::Logical(d) => &d.rewrites,
-            Self::Application(d) => &d.rewrites,
         }
     }
     pub fn execution_bindings(&self) -> &[ExecutionBinding] {

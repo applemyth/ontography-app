@@ -601,7 +601,13 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
         before["frontier"]["received"][0]["producer"],
         accepted["activation_id"]
     );
-    let plan = client.call("rewrite.prepare", json!({"run_id":run_id,"request":{"production_id":"remove_receiver","nodes":{"A":"A","B":"B"},"edges":{"A_to_B":"A_to_B"}}})).await.unwrap();
+    let plan = client
+        .call(
+            "rewrite.prepare",
+            json!({"run_id":run_id,"request":{"remove_nodes":["B"],"remove_edges":["A_to_B"]}}),
+        )
+        .await
+        .unwrap();
     assert_eq!(plan["revision"], before["revision"]);
 
     // The PID comes from this test's unique data directory and validated

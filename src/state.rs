@@ -1,5 +1,5 @@
 //! Server ownership of core objects. Connections never own graph resources.
-use crate::declarations::GraphDeclaration;
+use crate::declarations::{CompiledGraph, GraphDeclaration};
 use crate::definition::RunDefinition;
 use crate::persistence::{Paths, read_json, write_json};
 use crate::workspace::{Checkout, WorkspaceStore};
@@ -313,7 +313,7 @@ impl ManagedRun {
                 &compiled.kernel,
             )?;
         }
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime = runtime(compiled, self.is_workflow());
         let session = runtime
             .open_persistent(self.core_path()?)
             .map_err(AppError::core)?;
@@ -424,6 +424,17 @@ pub struct Service {
     pub registry: Arc<crate::registry::ImplementationRegistry>,
     pub recovery_errors: BTreeMap<String, AppError>,
     pub sessions: crate::sessions::Sessions,
+}
+
+/// The runtime for a compiled run. Workflow runs accept only their editor's
+/// edits, whatever their saved declaration says.
+fn runtime(compiled: CompiledGraph, workflow: bool) -> ProposalRuntime {
+    let policy = if workflow {
+        crate::workflow::edit::policy()
+    } else {
+        compiled.policy
+    };
+    ProposalRuntime::with_policy(compiled.kernel, policy)
 }
 
 /// A crash may leave only the reserved directory. Nonempty unknown stores are never overwritten.
@@ -568,7 +579,7 @@ impl Service {
                 && !run.directory.join("core").exists()
                 && run.manifest.status == "creating"
             {
-                let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+                let runtime = runtime(compiled, workflow.is_some());
                 let session = runtime
                     .create_persistent(run.directory.join("core"))
                     .map_err(AppError::core)?;
@@ -615,7 +626,7 @@ impl Service {
         }));
         self.runs.lock().await.insert(id.into(), run.clone());
         let mut run = run.lock().await;
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime = runtime(compiled, run.is_workflow());
         let session = runtime
             .create_persistent(run.directory.join("core"))
             .map_err(|e| {

@@ -29,8 +29,7 @@ fn root(run_id: &str, payload: Value) -> Value {
 }
 
 fn rewrite_request(run_id: &str) -> Value {
-    json!({"run_id":run_id,"request":{"production_id":"remove_receiver",
-        "nodes":{"A":"A","B":"B"},"edges":{"A_to_B":"A_to_B"}}})
+    json!({"run_id":run_id,"request":{"remove_nodes":["B"],"remove_edges":["A_to_B"]}})
 }
 
 #[tokio::test]

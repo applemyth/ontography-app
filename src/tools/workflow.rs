@@ -699,7 +699,7 @@ pub(crate) mod tests {
         let declaration =
             GraphDeclaration::parse(include_str!("../../examples/flow.json")).unwrap();
         let compiled = declaration.compile().unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime = ProposalRuntime::with_policy(compiled.kernel, compiled.policy);
         let session = runtime.create_persistent(directory.join("core")).unwrap();
         ManagedRun {
             manifest: RunManifest {

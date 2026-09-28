@@ -4,7 +4,6 @@ pub mod artifacts;
 pub mod components;
 pub mod document;
 pub mod edit;
-pub mod grammar;
 pub mod harness;
 mod node_type;
 mod output;

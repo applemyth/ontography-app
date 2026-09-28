@@ -637,7 +637,8 @@ mod tests {
         .unwrap();
         let ids = IdentityMap::fresh(&document);
         let compiled = expand(&document, "sink", &ids).unwrap().compile().unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let temporary = tempfile::tempdir().unwrap();
@@ -684,7 +685,8 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let temporary = tempfile::tempdir().unwrap();
@@ -852,7 +854,8 @@ mod tests {
                 .unwrap()
                 .compile()
                 .unwrap();
-            let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+            let runtime =
+                ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
             let session = runtime.open().unwrap();
             let host = ExecutionHost::new(session.clone());
             let temporary = tempfile::tempdir().unwrap();
@@ -1068,7 +1071,8 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let temporary = tempfile::tempdir().unwrap();
@@ -1193,7 +1197,8 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let temporary = tempfile::tempdir().unwrap();
@@ -1257,7 +1262,8 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let temporary = tempfile::tempdir().unwrap();
@@ -1320,7 +1326,8 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let temporary = tempfile::tempdir().unwrap();
@@ -1367,7 +1374,8 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let temporary = tempfile::tempdir().unwrap();
@@ -1421,7 +1429,8 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+        let runtime =
+            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let temporary = tempfile::tempdir().unwrap();
@@ -1579,7 +1588,8 @@ mod tests {
             .unwrap();
             let ids = IdentityMap::fresh(&document);
             let compiled = expand(&document, "join", &ids).unwrap().compile().unwrap();
-            let runtime = ProposalRuntime::with_grammar(compiled.kernel, compiled.grammar);
+            let runtime =
+                ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
             let session = runtime.open().unwrap();
             let host = ExecutionHost::new(session.clone());
             let temporary = tempfile::tempdir().unwrap();
