@@ -85,5 +85,5 @@ in their Codex settings. Tool selection and graph grants remain separate checks.
 
 The native verification uses a localhost Responses fixture to run real Codex
 turns, queue a second message during an active turn, and publish both replies
-through MCP. No external model is used. Node pane selection in the graph UI and
-a full project acceptance run with live models remain separate work.
+through MCP. No external model is used. Node terminals can be entered from the
+graph UI; a full project acceptance run with live models remains separate work.

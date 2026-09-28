@@ -38,6 +38,13 @@ pub fn operations() -> Vec<Operation> {
             false,
         ),
         Operation::new(
+            "terminal.node",
+            "Resolve the existing terminal for an agent node in this session's workflow. Does not start or resume workers.",
+            json!({"session_id":session,"node":{"type":"string"},"rows":{"type":"integer","minimum":2,"maximum":200},"cols":{"type":"integer","minimum":10,"maximum":500}}),
+            &["session_id", "node"],
+            false,
+        ),
+        Operation::new(
             "terminal.graph",
             "Show the owning session's graph in its controlling terminal client.",
             json!({"session_id":session}),
@@ -81,6 +88,10 @@ impl Managers {
             return tools::dispatch_scoped(service, scope, operation, args).await;
         }
         match operation {
+            "terminal.node" => {
+                let id = session_id(scope, args)?;
+                node_terminal(service, id, args).await
+            }
             "terminal.ensure" => {
                 let id = session_id(scope, args)?;
                 let mut managers = self.live.lock().await;
@@ -191,4 +202,53 @@ impl Managers {
         }
         first.map_or(Ok(()), Err)
     }
+}
+
+async fn node_terminal(service: &Service, session: &str, args: &Value) -> Result<Value> {
+    use crate::{
+        sessions::SessionStatus,
+        workflow::{NodeKind, runtime},
+    };
+    let handle = service.sessions.get(session).await?;
+    let record = handle.lock().await;
+    if record.status != SessionStatus::Active {
+        return Err(AppError::new(
+            "session_inactive",
+            "Resume this session before entering a node",
+        ));
+    }
+    let run_id = record
+        .run_id
+        .as_ref()
+        .ok_or_else(|| AppError::new("graph_uninitialized", "This session has no graph yet"))?;
+    let handle = service.run(run_id).await?;
+    let run = handle.lock().await;
+    let state = runtime::load(&run)?;
+    let name = crate::views::field(args, "node")?;
+    let node = state
+        .current
+        .nodes
+        .iter()
+        .find(|node| node.id == name)
+        .ok_or_else(|| {
+            AppError::new(
+                "node_not_found",
+                format!("Node {name:?} is no longer in this workflow"),
+            )
+        })?;
+    if node.kind != NodeKind::Agent {
+        return Err(AppError::new(
+            "node_no_terminal",
+            format!("Node {name:?} has no interactive terminal; only agent nodes do"),
+        ));
+    }
+    let terminal = run.live.as_ref()
+        .and_then(|live| live.workers.get(&state.identities.nodes[name]))
+        .and_then(|worker| worker.node.as_ref())
+        .and_then(|runtime| runtime.terminal())
+        .ok_or_else(|| AppError::new("node_not_running", format!("Node {name:?} has no running terminal; inspect its status or resume it through the manager")))?;
+    Ok(serde_json::to_value(terminal.attachment(
+        args["rows"].as_u64().unwrap_or(24) as u16,
+        args["cols"].as_u64().unwrap_or(80) as u16,
+    )?)?)
 }

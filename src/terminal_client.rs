@@ -81,6 +81,13 @@ enum Notice {
     Error(AppError),
 }
 
+struct ReaderTask(tokio::task::JoinHandle<()>);
+impl Drop for ReaderTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Default)]
 struct InputState {
     prefix: bool,
@@ -179,7 +186,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    run_inner(socket, request, initial_graph, None, graph).await
+    run_inner(socket, request, initial_graph, None, false, graph).await
+}
+
+/// A worker pane returns to its caller on either detach or the graph shortcut.
+/// It never opens another graph view or starts a replacement worker.
+pub async fn run_node(socket: &Path, request: AttachRequest) -> Result<()> {
+    run_inner(socket, request, false, None, true, || async { Ok(()) }).await
 }
 
 /// Display native Pi at full size, and the persistent shell beside live session
@@ -200,7 +213,7 @@ where
         request.session_id.clone(),
         request.terminal_id.clone(),
     );
-    run_inner(socket, request, initial_graph, Some(monitor), graph).await
+    run_inner(socket, request, initial_graph, Some(monitor), false, graph).await
 }
 
 async fn run_inner<F, Fut>(
@@ -208,6 +221,7 @@ async fn run_inner<F, Fut>(
     request: AttachRequest,
     initial_graph: bool,
     mut monitor: Option<panel::Monitor>,
+    return_to_graph: bool,
     mut graph: F,
 ) -> Result<()>
 where
@@ -255,7 +269,7 @@ where
             .expect("new notice queue has capacity");
     }
     let expected = request.terminal_id.clone();
-    let reader_task = tokio::spawn(async move {
+    let _reader_task = ReaderTask(tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let prefix = std::io::Cursor::new(buffered);
         let mut frames = BufReader::new(prefix.chain(&mut read));
@@ -314,8 +328,8 @@ where
                 }
             }
         }
-    });
-    let result = async {
+    }));
+    async {
         let mut guard = TerminalGuard::enter()?;
         let mut events = Some(EventStream::new());
         let mut input = InputState::default();
@@ -349,6 +363,7 @@ where
                 },
                 notice = notice_rx.recv() => match notice {
                     Some(Notice::Graph) => {
+                        if return_to_graph { break; }
                         if input.history {
                             protocol::write_frame(&mut write, &ClientFrame::History { terminal_id: request.terminal_id.clone(), action: HistoryAction::Exit }).await?;
                         }
@@ -421,9 +436,7 @@ where
         }
         let _ = protocol::write_frame(&mut write, &ClientFrame::Detach { terminal_id: request.terminal_id }).await;
         Ok(())
-    }.await;
-    reader_task.abort();
-    result
+    }.await
 }
 
 async fn panel_changed(monitor: &mut Option<panel::Monitor>) -> bool {

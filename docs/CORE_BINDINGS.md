@@ -4,7 +4,7 @@ The workflow layer uses the existing public core API. It adds an app document,
 fixed vocabulary, edit recovery, a task harness, and persistent node sessions;
 it does not change core.
 [WORKFLOWS.md](WORKFLOWS.md) is the usage guide. [ARCHITECTURE.md](../ARCHITECTURE.md)
-retains the agreed scope and unfinished interactive worker work.
+retains the agreed scope and outstanding live-model project acceptance work.
 
 ## Ownership
 
@@ -201,8 +201,10 @@ calls, and marks replies sent only after its stdio proxy flushes them to Codex.
 Worker and manager PTYs use the same terminal backend. Agent lifecycle includes
 cooperative stop, forced cancellation, exit reporting, and explicit resume.
 Automatic incoming conversation delivery and MCP package handoffs are available.
-Graph UI node pane selection and a full interactive project acceptance run with
-live models remain outstanding.
+The graph UI resolves the selected agent through `terminal.node` and attaches
+using its exact terminal identity. Detaching returns to the graph; no process
+or graph mutation is part of opening a view. A full interactive project
+acceptance run with live models remains outstanding.
 
 Other existing limits remain:
 

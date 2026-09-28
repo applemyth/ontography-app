@@ -51,6 +51,12 @@ pub struct AttachRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Attachment {
+    pub socket: PathBuf,
+    pub request: AttachRequest,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TerminalStatus {
     pub terminal_id: String,
     pub socket: PathBuf,
@@ -773,6 +779,28 @@ impl Terminal {
             sequence: state.sequence,
             fault: state.fault.clone(),
         }
+    }
+
+    /// Resolve this exact execution's attachment without starting a process.
+    pub fn attachment(&self, rows: u16, cols: u16) -> Result<Attachment> {
+        validate_size(rows, cols)?;
+        if !self.status().running {
+            return Err(AppError::new(
+                "terminal_exited",
+                "This terminal process has exited",
+            ));
+        }
+        Ok(Attachment {
+            socket: self.socket.path.clone(),
+            request: AttachRequest {
+                version: VERSION,
+                server_id: self.server_id.clone(),
+                session_id: self.session_id.clone(),
+                terminal_id: self.id.clone(),
+                rows,
+                cols,
+            },
+        })
     }
 
     pub fn snapshot(&self) -> Snapshot {

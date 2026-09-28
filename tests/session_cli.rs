@@ -13,6 +13,9 @@ use std::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_ontography");
 
+#[path = "session_cli/node_panes.rs"]
+mod node_panes;
+
 struct Fixture {
     directory: tempfile::TempDir,
     paths: Paths,
@@ -254,6 +257,7 @@ struct TerminalClient {
     _master: Box<dyn MasterPty + Send>,
     input: Box<dyn Write + Send>,
     output: Arc<Mutex<Vec<u8>>>,
+    screen: Arc<Mutex<vt100::Parser>>,
 }
 
 impl TerminalClient {
@@ -279,12 +283,15 @@ impl TerminalClient {
         let mut reader = pair.master.try_clone_reader().unwrap();
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
         let captured = output.clone();
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 100, 0)));
+        let rendered = screen.clone();
         std::thread::spawn(move || {
             let mut buffer = [0; 8192];
             while let Ok(count) = reader.read(&mut buffer) {
                 if count == 0 {
                     break;
                 }
+                rendered.lock().unwrap().process(&buffer[..count]);
                 let mut output = captured.lock().unwrap();
                 output.extend_from_slice(&buffer[..count]);
                 let excess = output.len().saturating_sub(65536);
@@ -297,6 +304,7 @@ impl TerminalClient {
             _master: pair.master,
             input,
             output,
+            screen,
         }
     }
 

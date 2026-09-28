@@ -1,5 +1,26 @@
 # Verification
 
+## Entering worker terminals from the graph — 2026-09-27
+
+Passed: **244 app Rust tests**, including the real CLI/PTY checks in
+[`node_panes.rs`](../tests/session_cli/node_panes.rs). All-target Clippy with
+warnings denied, formatting, and `git diff --check` also pass.
+
+- Enter in the graph resolves the selected agent in the owning session and
+  attaches to its existing terminal. Typing and resize reach that worker.
+  Ctrl-B D and Ctrl-B G return to the graph; repeated entry retains the same
+  process and terminal identity.
+- Detaching the parent session while inside a worker cancels the nested view
+  and releases both controlling sockets. Manager and worker continue running;
+  reattachment displays the same worker. Input bytes reach the worker exactly
+  once and graph navigation is not forwarded to it.
+- Non-agent and stopped nodes show an error without starting a process.
+  Worker exit returns to the graph, and returning to Pi restores its input.
+  Cross-session lookup and stale attachment identities are rejected.
+- A migration-lock test failed in the first concurrent full run, then passed
+  independently and in the full rerun. Pane tests use local shell fixtures;
+  native Codex conversation/MCP checks are recorded separately below.
+
 ## Rebuild recovery and explicit server shutdown — 2026-09-27
 
 Passed: **242 app Rust tests** (`cargo test --locked --quiet`), all-target

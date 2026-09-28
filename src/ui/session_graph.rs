@@ -3,7 +3,7 @@ use super::{
     TerminalGuard,
     graph::{GraphCanvas, GraphView},
 };
-use crate::{AppError, Result, client::Client};
+use crate::{AppError, Result, client::Client, terminal::Attachment, terminal_client};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures_util::StreamExt;
 use ratatui::{
@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use serde_json::{Value, json};
-use std::{io, time::Duration};
+use std::{collections::BTreeMap, io, time::Duration};
 use tokio::sync::watch;
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -25,15 +25,17 @@ impl Drop for AbortOnDrop {
 }
 
 pub async fn run(client: Client, session_id: String) -> Result<()> {
-    let _guard = TerminalGuard::enter()?;
+    let mut guard = Some(TerminalGuard::enter()?);
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut events = EventStream::new();
+    let mut events = Some(EventStream::new());
     let (updates, mut latest) = watch::channel(None::<std::result::Result<Value, String>>);
+    let poll_client = client.clone();
+    let poll_session = session_id.clone();
     let _poller = AbortOnDrop(tokio::spawn(async move {
         loop {
             let result = match tokio::time::timeout(
                 Duration::from_secs(5),
-                client.call("session.context", json!({"session_id":session_id})),
+                poll_client.call("session.context", json!({"session_id":poll_session})),
             )
             .await
             {
@@ -51,6 +53,8 @@ pub async fn run(client: Client, session_id: String) -> Result<()> {
     let mut message = String::from("Loading session graph…");
     let mut selected = None;
     let mut pan_x = 0;
+    let mut node_states = BTreeMap::<String, Value>::new();
+    let mut notice = None::<String>;
     async {
         loop {
             terminal.draw(|frame| {
@@ -62,10 +66,13 @@ pub async fn run(client: Client, session_id: String) -> Result<()> {
                 let pan_y = selected.as_deref().map(|id| (graph.node_y(id) - i32::from(canvas.height) / 2).max(0)).unwrap_or(0);
                 frame.render_widget(GraphCanvas { graph: &graph, selected: selected.as_deref(), pan_x, pan_y }, canvas);
                 let detail = if let Some(node) = graph.nodes.iter().find(|node| Some(node.id.as_str()) == selected.as_deref()) {
-                    format!("Node {} · received {} · outbound {}\n{}", node.id, node.received, node.outbound, graph.incident_edges(&node.id).join("\n"))
+                    let state = node_states.get(&node.id);
+                    let status = state.and_then(|state| state["session"]["state"].as_str().or(state["kind"].as_str())).unwrap_or("unknown");
+                    format!("Node {} · {} · received {} · outbound {}\n{}\n{}", node.id, status, node.received, node.outbound,
+                        notice.as_deref().unwrap_or("Enter opens an agent terminal · Ctrl-B D/G returns here"), graph.incident_edges(&node.id).join("\n"))
                 } else { "Pi remains running. Create and start the graph through its management tools.".into() };
                 frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), areas[2]);
-                frame.render_widget(Paragraph::new("↑/↓ select · ←/→ pan · q/Esc return to terminal"), areas[3]);
+                frame.render_widget(Paragraph::new("↑/↓ select · Enter node · ←/→ pan · q/Esc manager"), areas[3]);
             })?;
             tokio::select! {
                 changed = latest.changed() => {
@@ -75,6 +82,9 @@ pub async fn run(client: Client, session_id: String) -> Result<()> {
                         Some(Ok(context)) => {
                             name = context["session"]["name"].as_str().unwrap_or("Ontography").into();
                             let snapshot = &context["graph"];
+                            node_states = snapshot["nodes"].as_array().into_iter().flatten()
+                                .filter_map(|node| Some((node["id"].as_str()?.to_owned(), node.clone())))
+                                .collect();
                             if snapshot.is_null() {
                                 graph = GraphView::default(); selected = None;
                                 message = "Awaiting graph initialization".into();
@@ -91,11 +101,35 @@ pub async fn run(client: Client, session_id: String) -> Result<()> {
                         None => {},
                     }
                 }
-                event = events.next() => match event {
+                event = events.as_mut().expect("graph owns input outside a node pane").next() => match event {
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => break,
-                        KeyCode::Up => selected = graph.navigate(selected.as_deref(), -1),
-                        KeyCode::Down | KeyCode::Tab => selected = graph.navigate(selected.as_deref(), 1),
+                        KeyCode::Up => { selected = graph.navigate(selected.as_deref(), -1); notice = None; },
+                        KeyCode::Down | KeyCode::Tab => { selected = graph.navigate(selected.as_deref(), 1); notice = None; },
+                        KeyCode::Enter => {
+                            if let Some(node) = selected.as_deref() {
+                                let (cols, rows) = crossterm::terminal::size()?;
+                                match resolve_node(&client, &session_id, node, rows, cols).await {
+                                    Ok(attachment) => {
+                                        // Only one EventStream and terminal-mode owner may read
+                                        // physical input. Drop them before entering the worker.
+                                        events.take();
+                                        guard.take();
+                                        let result = terminal_client::run_node(&attachment.socket, attachment.request).await;
+                                        guard = Some(TerminalGuard::enter()?);
+                                        events = Some(EventStream::new());
+                                        // Fullscreen resize resets Ratatui's diff buffers
+                                        // without querying stdin for the cursor position.
+                                        terminal.resize(terminal.size()?.into())?;
+                                        notice = Some(match result {
+                                            Ok(()) => format!("Returned from {node}"),
+                                            Err(error) => error.message,
+                                        });
+                                    }
+                                    Err(error) => notice = Some(error.message),
+                                }
+                            }
+                        },
                         KeyCode::Left => pan_x = (pan_x - 8).max(0),
                         KeyCode::Right => pan_x += 8,
                         _ => {},
@@ -108,4 +142,30 @@ pub async fn run(client: Client, session_id: String) -> Result<()> {
         }
         Ok(())
     }.await
+}
+
+async fn resolve_node(
+    client: &Client,
+    session: &str,
+    node: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<Attachment> {
+    let value = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call(
+            "terminal.node",
+            json!({
+                "session_id":session,"node":node,"rows":rows.clamp(2,200),"cols":cols.clamp(10,500),
+            }),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        AppError::new(
+            "terminal_timeout",
+            "Node terminal lookup timed out; try again",
+        )
+    })??;
+    Ok(serde_json::from_value(value)?)
 }

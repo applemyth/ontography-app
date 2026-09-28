@@ -124,7 +124,9 @@ A lost acknowledgement stops the execution without replaying the request.
 On explicit resume, pending graph tasks receive fresh attempts; old graph queue
 entries are withdrawn because their attempt handles expired. History remains,
 so a task may be presented again after restart. This is not an exactly-once
-model execution guarantee. Node pane selection in the graph UI remains future work.
+model execution guarantee. In the graph UI, select an agent and press Enter to
+use its existing terminal. Ctrl-B D or G returns to the graph without stopping
+the agent; see [Session controls](SESSIONS.md#graph-display).
 
 ## Edit and recover
 
@@ -217,8 +219,8 @@ Agent nodes also report `session`: its lifecycle state, terminal status,
 persistent directory and working directory, native conversation ID when managed
 by Codex, its observed `agent_state` (`idle`, `active`, etc.), and any startup or process error. A failed or exited agent session
 stays stopped until `flow.resume` or a change to that node's definition; its
-process is not restarted by the task retry policy. Status is available even
-though the graph UI does not yet expose node terminal panes.
+process is not restarted by the task retry policy. Opening a node terminal in
+the graph does not start or resume its process.
 
 ## Failed tasks
 

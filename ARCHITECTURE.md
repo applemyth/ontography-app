@@ -23,8 +23,8 @@ The document/compiler, edit recovery, task harness, and persistent Codex node
 runtime are implemented. Agent nodes own persistent Codex app-servers with native
 terminal clients in managed PTYs; command nodes run individual tasks, human nodes wait for decisions, and
 inboxes hold results. Node-scoped MCP exposes selected graph tools to Codex;
-incoming work enters the same conversation as queued user messages. Node pane
-selection remains unfinished. An agent with no work stays idle. Pi remains the management harness. Core is
+incoming work enters the same conversation as queued user messages. Enter in the
+graph opens an agent's terminal. An agent with no work stays idle. Pi remains the management harness. Core is
 unchanged by this work.
 
 ## The picture
@@ -42,7 +42,7 @@ core commits graph and package state; workflow runtime reconciles worker process
 
 | Piece | Job | Items | Status |
 | --- | --- | --- | --- |
-| Shell + UI | Where you sit. Attach, detach, look at the graph and the panes. | 8, 12 | Manager terminal and graph view exist. Node panes missing. |
+| Shell + UI | Where you sit. Attach, detach, look at the graph and the panes. | 8, 12 | Manager terminal, graph view, and selected agent terminal implemented. |
 | Manager | Creates documents, starts runs, reads status, and requests edits. | 8, 11 | Document tools and Pi allowlist implemented. |
 | Workflow document | Named nodes, kind/config, joins, directed edges, and entry. | 10 | Implemented. |
 | Compiler + library | Fixed vocabulary, declaration expansion, edit grammar, and diff. | 2–5, 9 | Implemented using existing core APIs. |
@@ -109,8 +109,8 @@ Define, compile, run, inspect, edit.
 3. **Run.** Start with an input. Command tasks run when inputs arrive; agent
    sessions start with the graph and remain running. Agents receive work as queued conversation messages
    and process it through MCP tools.
-4. **Watch.** Read graph status, pending tasks, and committed outputs. Node
-   terminal panes remain future work.
+4. **Watch.** Read graph status, pending tasks, and committed outputs. Select an
+   agent in the graph and press Enter to use its terminal.
 5. **Edit.** Change the document, inspect the edit steps and retirement preview,
    and commit. Reconcile node processes with the committed graph.
 
@@ -192,14 +192,13 @@ Checkboxes indicate implementation, not completion of final release gates.
 
    Unused raw package, invocation, context, project, network, and fact tool wrappers are deleted, along with content mutation/export tools and unused rewrite/workspace operations. Remaining declaration, lifecycle, inspection, execution, and workspace adapters serve existing infrastructure and tests. Raw mutations reject document-owned runs, including through unscoped calls. The manager uses document names, task IDs, and workspace handles rather than core incarnations or content roots. Core package/context APIs and the app's workspace store still provide necessary internal plumbing; deletion of their tool wrappers does not mean deletion of those capabilities. No total code-size reduction is claimed here.
 
-- [ ] **12. Node panes**
+- [x] **12. Node panes**
 
-   Attach a client to a node's terminal the way the manager terminal works today. Opening or closing a pane has no graph effect.
+   Enter in the graph resolves the selected agent's current terminal through a session-scoped lookup and attaches the existing client. Ctrl-B D or G returns to the graph. Input, resize, history, single-controller ownership, and stale-identity checks use the shared terminal backend. Parent detach cancels the nested view and releases its socket. Opening or closing a pane has no graph effect and does not start or stop an execution.
 
 **Build status.** The document, fixed vocabulary, translator/editor, task
 harness, persistent Codex runtime (1), and Pi surface are implemented. Remaining
-execution/UI work includes a live-model project acceptance run and node pane
-selection (12).
+execution/UI work includes a live-model project acceptance run.
 Core remains an existing dependency; no composite-production API was added.
 
 ## Session foundation
@@ -216,7 +215,7 @@ A new session can start Pi before the graph exists. The first scoped start opera
 
 Bare `ontography` always creates an independent app session. `attach NAME_OR_ID` (or `--session NAME_OR_ID`) explicitly attaches; persisted selection is metadata and never an implicit launch target. Pi `/new`, `/resume`, `/fork`, `/clone`, and `/tree` preserve its graph. One controlling client owns the manager terminal's input/dimensions. Ctrl-B, then D detaches while manager and graph continue. Pi `/quit` returns to the managed shell and session panel. Shell `pi` resolves the latest saved active conversation and launches it with the same graph binding. Shell `exit` suspends the session and graph even while detached. Explicit suspension also stops the terminal; closure is terminal. Server restart loads records; attachment explicitly resumes the named session's graph and native history.
 
-`portable-pty` hosts manager and worker processes; `vt100` maintains terminal state; the Rust client renders native Pi, shell + session status, or the bound graph. Worker execution reconciliation provisions persistent Codex terminals and scoped MCP. Worker terminal views remain subsequent work.
+`portable-pty` hosts manager and worker processes; `vt100` maintains terminal state; the Rust client renders native Pi, shell + session status, the bound graph, or the selected worker terminal. Worker execution reconciliation provisions persistent Codex terminals and scoped MCP. Enter opens an agent terminal; Ctrl-B D/G returns to the graph while the worker continues.
 
 The [session guide](docs/SESSIONS.md) documents commands and storage. [SESSION_DESIGN.md](docs/SESSION_DESIGN.md) records ownership and recovery details. [CORE_BINDINGS.md](docs/CORE_BINDINGS.md) maps the existing core API. [PLAN.md](PLAN.md) is the original item-8 implementation plan.
 
@@ -242,8 +241,8 @@ Workspace workers currently need an outgoing edge; an inbox provides a terminal
 result holder. These are app policies, not restrictions imposed by worker kinds
 or new core semantics.
 
-Remaining within the agreed scope: live-model project acceptance and node pane
-selection. Native Codex message delivery is verified against a local model fixture.
+Remaining within the agreed scope: live-model project acceptance. Native Codex
+message delivery is verified against a local model fixture.
 [WORKFLOWS.md](docs/WORKFLOWS.md) describes current behavior and recovery limits.
 
 ## Tentative ideas

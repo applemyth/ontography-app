@@ -20,7 +20,7 @@ Rust server for one canonical data directory
 
 Clients attach to running terminals; detachment preserves server resources. A new session can host Pi before its graph exists. The graph view always resolves the owning session's run.
 
-Concrete worker nodes and their terminal views are subsequent work. Their intended model remains **graph node → agent execution → PTY → client view**. Each node has an execution within the graph's collective runtime; another process does not imply another graph runtime.
+Agent nodes own persistent worker terminals. Their model is **graph node → agent execution → PTY → client view**. Each node has an execution within the graph's collective runtime; another process does not imply another graph runtime.
 
 ## Commands
 
@@ -87,9 +87,23 @@ or process loss starts Pi using the session's saved active conversation.
 
 ### Graph display
 
-Enter `/graph` in Pi, or press Ctrl-B then G from the terminal. The Rust client displays its graph, or an initialization-pending view. Arrow keys select nodes/pan; `q` or Escape returns to the terminal. `ontography attach NAME_OR_ID --ui` opens this view first for an existing session; bare `ontography --ui` creates a new session with its pending graph view.
+Enter `/graph` in Pi, or press Ctrl-B then G from the terminal. The Rust client displays its graph, or an initialization-pending view. Up/Down or Tab selects a node; Left/Right pans. **Enter attaches to the selected agent's existing terminal.** `q` or Escape in the graph returns to the manager. `ontography attach NAME_OR_ID --ui` opens this view first for an existing session; bare `ontography --ui` creates a new session with its pending graph view.
 
 Pi keeps running while hidden; the server keeps reading its output. Returning displays its current screen. Graph display does not launch another Pi instance.
+
+Inside a node terminal, type directly into its running Codex session, including
+answers to approval prompts. **Ctrl-B, then D or G returns to the graph**, keeping
+the worker running. Scrollback uses the same Ctrl-B `[` controls as the manager.
+Selecting another node and pressing Enter switches to that node's terminal.
+Command, human, and inbox nodes have no interactive terminal. A stopped node
+shows an error; opening its pane does not restart it. For native Codex, `/exit`
+closes its interface while its app-server keeps running; Enter reconnects it.
+
+Only one controller can attach to a worker terminal at a time. Session detach
+from another terminal closes any nested node view too; manager and worker
+processes remain alive. Suspension, node replacement, or process exit releases
+the attachment. Lookup is session-scoped and uses the current worker identity,
+so an old attachment cannot enter a replacement execution.
 
 ### Terminal scrollback
 

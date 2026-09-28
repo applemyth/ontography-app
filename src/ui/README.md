@@ -6,6 +6,13 @@ Native Pi runs in the session's server-owned shell PTY. Pi is full screen; after
 
 The graph view reuses the Ratatui renderer described below. See [the session guide](../../docs/SESSIONS.md) for ownership, controls, and lifecycle, and [VERIFICATION.md](../../docs/VERIFICATION.md) for current acceptance evidence.
 
+Enter resolves the selected agent through the session-scoped `terminal.node`
+operation and attaches to its existing terminal. Ctrl-B D or G returns to the
+graph. Input and terminal modes have one owner at a time; the graph releases
+them before attachment and redraws on return. Parent detach cancels the nested
+view and drops its socket reader without stopping the worker. Non-agent and
+stopped nodes report an error in the graph instead of launching a process.
+
 ## Historical combined RPC interface
 
 The following describes the initial implementation retained in source and tests. It is no longer the CLI's `--ui` path.
@@ -89,4 +96,5 @@ Verified with the installed Pi 0.85.1 in an actual PTY on 2026-09-24:
   test cleanup stopped the server, preserving its runs.
 
 These checks exercise logical graphs and the real management agent. Production
-Codex worker definitions and their node terminals remain a separate implementation.
+Codex worker definitions and their node terminals are covered separately in
+[current verification](../../docs/VERIFICATION.md).

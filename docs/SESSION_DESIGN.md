@@ -1,6 +1,6 @@
 # Session design and implementation
 
-**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions, the fixed editing grammar, persistent Codex worker sessions, and node-scoped MCP are implemented. Incoming work is delivered through persistent Codex app-servers; node pane selection remains unfinished. [VERIFICATION.md](VERIFICATION.md) records release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
+**Status:** the persistent manager-session foundation is implemented and verified, including the local user-home migration. Workflow definitions, the fixed editing grammar, persistent Codex worker sessions, and node-scoped MCP are implemented. Incoming work is delivered through persistent Codex app-servers; Enter in the graph opens the selected agent's terminal. [VERIFICATION.md](VERIFICATION.md) records release evidence; [SESSIONS.md](SESSIONS.md) gives commands and usage.
 
 ## Ownership invariant
 
@@ -24,7 +24,7 @@ A process ID, connection, or terminal-instance ID is not a durable session ident
 | Manager execution | Run native Pi before and after graph initialization; resume the latest active conversation on shell reentry. | Managed launcher inside a persistent Bash PTY. |
 | Node execution | Run a concrete agent associated with a durable graph-node ID. | Persistent Codex app-server owns the native conversation; the node runtime binds execution, working directory, attached native TUI, queued input, and scoped tools. |
 | PTY and terminal state | Host terminal bytes/dimensions; continuously read output and retain a current screen. | `portable-pty` and `vt100` shared by manager and worker sessions. |
-| Pane/view | Display existing execution and route controlling-client input. | Full Pi, shell + session panel, and graph view; worker panes deferred. |
+| Pane/view | Display existing execution and route controlling-client input. | Full Pi, shell + session panel, graph view, and selected worker terminal. |
 
 The worker relationship is node → execution → PTY → client view. Each node has an execution inside one collective graph runtime. Node identity persists across process restart and view closure; worker client views are still pending.
 
@@ -41,7 +41,7 @@ The worker relationship is node → execution → PTY → client view. Each node
 
 `session new --no-attach` creates records without starting Pi. Existing runs require explicit adoption into an uninitialized session with the same project; no old Pi ownership is inferred.
 
-Node creation commits through core's configured grammar, then reconciles agent execution. Initial graphs provision their agent sessions on startup. A startup failure preserves committed graph state and remains visible for recovery with `flow.resume`. Agent config changes restart its process; graph grants and scope update in place. Opening a future worker view must not create a node, edge, or package delivery. See [WORKFLOWS.md](WORKFLOWS.md) for session configuration and delivery limits.
+Node creation commits through core's configured grammar, then reconciles agent execution. Initial graphs provision their agent sessions on startup. A startup failure preserves committed graph state and remains visible for recovery with `flow.resume`. Agent config changes restart its process; graph grants and scope update in place. Opening a worker view does not create a node, edge, or package delivery. See [WORKFLOWS.md](WORKFLOWS.md) for session configuration and delivery limits.
 
 ## Pi integration
 
@@ -96,7 +96,7 @@ The same backend hosts management and worker terminals. Worker view integration 
 ## Remaining work
 
 1. Wake continuing agent sessions when graph work arrives; tools already support discovering and processing it.
-2. Complete worker terminal views and verify a full interactive multi-agent project flow.
+2. Verify a full interactive multi-agent project flow against live models.
 3. Specify explicit app-session fork/archive/delete, complete artifact-backed export, and optional viewer/takeover behavior.
 4. Runs need the desired grammar at creation. Live grammar replacement remains unavailable; `run.extend` only adds vocabulary and trusted contracts. This WIP uses fresh runs instead of migrating empty-grammar runs.
 
