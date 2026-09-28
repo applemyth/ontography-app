@@ -67,6 +67,10 @@ pub(super) struct Timing {
     pub quiet: Duration,
     /// Claude must report a delivered prompt within this time.
     pub accept: Duration,
+    /// After input Claude never took, its state is unknown. Without any hook
+    /// event for this long, it is taken to be idle again: the idle
+    /// notification may have come before the delivery, and comes only once.
+    pub settle: Duration,
     /// Lets Claude act on the stash key before more input arrives.
     pub keystroke: Duration,
     /// Lets Claude take in the paste before Enter submits it.
@@ -81,6 +85,7 @@ impl Default for Timing {
             trust: Duration::from_secs(10),
             quiet: Duration::from_secs(10),
             accept: Duration::from_secs(20),
+            settle: Duration::from_secs(60),
             keystroke: Duration::from_millis(100),
             paste: Duration::from_millis(150),
             poll: Duration::from_millis(250),
@@ -123,6 +128,7 @@ pub(super) async fn run(
         typed: 0,
         restored: false,
         stashed: false,
+        unsettled: None,
     };
     let mut poll = tokio::time::interval(timing.poll);
     poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -182,10 +188,13 @@ struct Delivery<'a, C> {
     restored: bool,
     /// Whether delivery stashed a draft since the last submitted prompt.
     stashed: bool,
+    /// When Claude last failed to take delivered input, until it reports again.
+    unsettled: Option<Instant>,
 }
 
 impl<C: Console> Delivery<'_, C> {
     async fn observe(&mut self, event: HookEvent) -> Result<()> {
+        self.unsettled = None;
         match event.name.as_str() {
             // Compaction starts a session too, even in the middle of a turn.
             "SessionStart" if event.input["source"] != "compact" => {
@@ -214,8 +223,16 @@ impl<C: Console> Delivery<'_, C> {
                 self.idle();
             }
             // Claude notifies a minute after it goes idle. After an interrupt,
-            // which Stop does not report, this is the only sign.
-            "Notification" if event.input["notification_type"] == "idle_prompt" => self.idle(),
+            // which Stop does not report, this is the only sign, and the
+            // interrupted turn's attempts fail as they would in Codex.
+            "Notification" if event.input["notification_type"] == "idle_prompt" => {
+                for attempt in std::mem::take(&mut self.turn) {
+                    self.tools
+                        .message_failed(&attempt, "Claude's turn was interrupted")
+                        .await?;
+                }
+                self.idle();
+            }
             _ => {}
         }
         Ok(())
@@ -263,8 +280,17 @@ impl<C: Console> Delivery<'_, C> {
             // wait until Claude reports idle, then stash whatever is there.
             self.phase = Phase::Working;
             self.restored = true;
+            self.unsettled = Some(Instant::now());
             self.fail(pending, "Claude did not accept the delivered input")
                 .await?;
+        }
+        if self.phase == Phase::Working
+            && self
+                .unsettled
+                .is_some_and(|since| since.elapsed() >= self.timing.settle)
+        {
+            self.unsettled = None;
+            self.phase = Phase::Idle;
         }
         let typing = self.console.typing();
         let stash = typing.count != self.typed || self.restored;

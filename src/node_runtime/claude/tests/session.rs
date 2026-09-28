@@ -14,6 +14,7 @@ const TIMING: Timing = Timing {
     trust: Duration::from_millis(300),
     quiet: Duration::from_millis(400),
     accept: Duration::from_millis(500),
+    settle: Duration::from_millis(1500),
     keystroke: Duration::from_millis(1),
     paste: Duration::from_millis(1),
     poll: Duration::from_millis(10),
@@ -294,6 +295,62 @@ async fn unaccepted_input_fails_its_attempt_and_waits_for_claude_to_go_idle() {
     let retried = envelope(&sent[3]);
     assert_eq!(retried["inputs"][0]["message"], "first");
     assert_ne!(retried["attempt_id"], first.as_str());
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn without_any_hook_claude_is_taken_to_be_idle_again_after_unaccepted_input() {
+    let mut harness = Harness::new().await;
+    harness
+        .hook("SessionStart", json!({"source": "startup"}))
+        .await;
+    harness.fixture.deliver("first").await;
+    let sent = harness.sent(2).await;
+    let first = attempt(&sent[0]);
+    harness.status(Status::Working).await;
+    // Claude went idle before the delivery, so no idle notification follows.
+    let sent = harness.sent(5).await;
+    assert_eq!(sent[2], STASH);
+    let retried = envelope(&sent[3]);
+    assert_eq!(retried["inputs"][0]["message"], "first");
+    assert_ne!(retried["attempt_id"], first.as_str());
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_interrupted_turn_fails_its_attempts_when_claude_goes_idle() {
+    let mut harness = Harness::new().await;
+    harness
+        .hook("SessionStart", json!({"source": "startup"}))
+        .await;
+    harness.fixture.deliver("first").await;
+    let sent = harness.sent(2).await;
+    let first = attempt(&sent[0]);
+    harness.submit(&sent[0]).await;
+    harness.status(Status::Working).await;
+    // Esc ends the turn without Stop; only the idle notification follows.
+    harness
+        .hook("Notification", json!({"notification_type": "idle_prompt"}))
+        .await;
+    let sent = harness.sent(4).await;
+    assert_eq!(
+        harness.fixture.invocation_status(&first).await,
+        InvocationStatus::Failed
+    );
+    let retried = envelope(&sent[2]);
+    assert_eq!(retried["inputs"][0]["message"], "first");
+    // A turn that ended with Stop keeps its attempts open, as in Codex.
+    let second = attempt(&sent[2]);
+    harness.submit(&sent[2]).await;
+    harness.hook("Stop", json!({})).await;
+    harness
+        .hook("Notification", json!({"notification_type": "idle_prompt"}))
+        .await;
+    harness.quiet().await;
+    assert_eq!(
+        harness.fixture.invocation_status(&second).await,
+        InvocationStatus::Open
+    );
     harness.stop().await;
 }
 

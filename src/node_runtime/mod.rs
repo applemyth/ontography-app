@@ -2,7 +2,6 @@
 //! names, hosted in a terminal or headless. Terminals are views of this
 //! execution; its selected scoped tools are exposed through the node MCP adapter.
 
-#[allow(dead_code, reason = "NodeRuntime::run does not launch it yet")]
 pub(crate) mod claude;
 pub mod codex;
 mod host;
@@ -11,6 +10,7 @@ mod rpc;
 
 use crate::{
     AppError, Result,
+    node_hooks::NodeHooks,
     node_mcp::NodeMcp,
     node_tool::{NodeScope, NodeToolContext},
     process::{Stdin, recover_process},
@@ -229,6 +229,10 @@ impl NodeRuntime {
                     .await
                 })
             }
+            Implementation::Claude(config) => {
+                self.start_claude(&node.id, &config, &cwd, env, &tools, resources)
+                    .await?
+            }
             implementation => {
                 return Err(AppError::new(
                     "node_runtime",
@@ -346,6 +350,64 @@ impl NodeRuntime {
         Ok(Some((plan, rpc, id)))
     }
 
+    /// Starts Claude on its saved conversation and returns the driver that
+    /// delivers graph work to it: typed into its terminal, as its hooks
+    /// report it ready, or written to its stream-json input when headless.
+    async fn start_claude(
+        &self,
+        node_id: &str,
+        config: &AgentConfig,
+        cwd: &Path,
+        env: BTreeMap<String, String>,
+        tools: &Arc<NodeToolContext>,
+        resources: &mut Resources<'_>,
+    ) -> Result<Driver<'_>> {
+        let plan = claude::Plan::new(node_id, config, &self.directory, cwd, tools.checkouts_dir())?;
+        lock(&self.state).status.conversation_id = Some(plan.session_id().into());
+        let node_tools = resources.mcp.as_ref().expect("bound node MCP").server()?;
+        let program = Path::new("claude");
+        let started = plan.started();
+        let tools = tools.clone();
+        let report = move |status: claude::Status| {
+            lock(&self.state).status.agent_state = Some(status.to_string());
+        };
+        if config.pty {
+            let endpoint = self.endpoint()?;
+            let (hooks, events) = NodeHooks::bind(&endpoint)?;
+            let spec = plan.session(program, node_tools, &hooks, env)?;
+            let host =
+                Host::terminal(spec, &self.directory, endpoint.join("terminal.sock")).await?;
+            let terminal = host.terminal_handle().expect("terminal host").clone();
+            self.started(resources, host);
+            // Claude's hook commands report to this listener while it runs.
+            resources.hooks = Some(hooks);
+            return Ok(Box::pin(async move {
+                claude::session::deliver(&*terminal, events, &tools, started, report).await
+            }));
+        }
+        let (host, pipes) = Host::headless(
+            &plan.headless(program, node_tools),
+            cwd,
+            &self.directory,
+            &env,
+            Stdin::Stream,
+            &self.directory.join("agent.log"),
+            true,
+        )
+        .await?;
+        self.started(resources, host);
+        let (Some(input), Some(output)) = (pipes.input, pipes.output) else {
+            return Err(AppError::new(
+                "claude_session",
+                "Headless Claude has no input or output stream",
+            ));
+        };
+        Ok(Box::pin(async move {
+            let output = tokio::io::BufReader::new(output);
+            claude::stream::deliver(input, output, &tools, started, report).await
+        }))
+    }
+
     /// Records a started session's host, and its terminal if it has one.
     fn started(&self, resources: &mut Resources<'_>, host: Host) {
         let mut state = lock(&self.state);
@@ -404,6 +466,7 @@ struct Resources<'a> {
     host: Option<Host>,
     tools: Option<Arc<NodeToolContext>>,
     mcp: Option<NodeMcp>,
+    hooks: Option<NodeHooks>,
 }
 
 impl<'a> Resources<'a> {
@@ -413,6 +476,7 @@ impl<'a> Resources<'a> {
             host: None,
             tools: None,
             mcp: None,
+            hooks: None,
         }
     }
 
@@ -430,6 +494,8 @@ impl<'a> Resources<'a> {
             }
             None => Ok(()),
         };
+        // Hooks keep reporting until their program has stopped.
+        self.hooks.take();
         if let Some(tools) = &self.tools {
             tools.close().await;
         }
@@ -447,6 +513,7 @@ impl Drop for Resources<'_> {
         if let Some(host) = &mut self.host {
             host.request_stop();
         }
+        self.hooks.take();
         let mut state = lock(&self.owner.state);
         if let Some(terminal) = self.host.as_ref().and_then(Host::terminal_handle) {
             state.status.terminal = Some(terminal.status());

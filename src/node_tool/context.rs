@@ -18,7 +18,7 @@ use ontography::{
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicUsize, Ordering},
@@ -299,6 +299,12 @@ impl NodeToolContext {
 
     pub fn scope(&self) -> NodeScope {
         self.scope.borrow().clone()
+    }
+
+    /// Where `open_workspace` checks out an attempt's directories. An agent
+    /// that confines file access to its folders needs this one, too.
+    pub fn checkouts_dir(&self) -> &Path {
+        self.workspaces.checkouts_dir()
     }
 
     pub(crate) fn scope_changes(&self) -> watch::Receiver<NodeScope> {
