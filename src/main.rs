@@ -199,15 +199,24 @@ async fn run(cli: Cli) -> Result<()> {
             result
         }
         Some(Action::Server { action }) => {
-            if matches!(action, ServerAction::Stop) {
-                return print(Client::stop_server(&paths.socket).await?);
-            }
-            let client = if matches!(action, ServerAction::Start) {
-                launcher::ensure_server(&paths).await?
-            } else {
-                Client::connect(&paths.socket).await?
+            // An idle server exits on its own, so none running is ordinary.
+            let not_running = |error: &AppError| error.code == "io_error";
+            let client = match action {
+                ServerAction::Stop => {
+                    return match Client::stop_server(&paths.socket).await {
+                        Err(error) if not_running(&error) => print(json!({"running":false})),
+                        stopped => print(stopped?),
+                    };
+                }
+                ServerAction::Start => launcher::ensure_server(&paths).await?,
+                _ => match Client::connect(&paths.socket).await {
+                    Err(error) if not_running(&error) => return print(json!({"running":false})),
+                    client => client?,
+                },
             };
-            print(client.call("system.status", json!({})).await?)
+            let mut status = client.call("system.status", json!({})).await?;
+            status["running"] = json!(true);
+            print(status)
         }
         Some(Action::Call {
             operation,

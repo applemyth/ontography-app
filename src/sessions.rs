@@ -1139,7 +1139,12 @@ fn conversation(service: &Service, record: &mut SessionRecord, args: &Value) -> 
                 "recorded conversation history is missing; it cannot become a new empty conversation",
             ));
         }
-        if path.is_some() && existing.path.is_some() && path != existing.path {
+        // Pi writes a history only once something is said, and names a new
+        // file each time it starts a conversation it has not saved. An unwritten
+        // path only reserved a name, so the conversation may move.
+        let written =
+            existing.materialized || existing.path.as_ref().is_some_and(|path| path.is_file());
+        if written && path.is_some() && path != existing.path {
             return Err(AppError::new(
                 "conversation_not_owned",
                 "conversation is already registered at another path",

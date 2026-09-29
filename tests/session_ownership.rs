@@ -229,6 +229,49 @@ async fn adoption_is_explicit_exclusive_and_preserves_existing_run_identity() {
 }
 
 #[tokio::test]
+async fn an_unsaved_conversation_may_move_until_its_history_is_written() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
+    let id = create(&service, directory.path()).await;
+    let conversation = uuid::Uuid::new_v4().to_string();
+    let path = |name: &str| {
+        service
+            .sessions
+            .conversations_dir(&id)
+            .unwrap()
+            .join(format!("{name}.jsonl"))
+    };
+    let activate =
+        |name: &str| json!({"action":"activate","conversation_id":conversation,"path":path(name)});
+    // Pi started, nothing was said, and it named a new file when resumed.
+    for name in ["first", "second"] {
+        scoped(&service, &id, "session.conversation", activate(name))
+            .await
+            .unwrap();
+    }
+    std::fs::write(
+        path("second"),
+        format!(
+            "{}\n",
+            json!({"type":"session","id":conversation,"version":3})
+        ),
+    )
+    .unwrap();
+    // Once written, the history keeps its path.
+    assert_eq!(
+        scoped(&service, &id, "session.conversation", activate("third"))
+            .await
+            .unwrap_err()
+            .code,
+        "conversation_not_owned"
+    );
+    scoped(&service, &id, "session.conversation", activate("second"))
+        .await
+        .unwrap();
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn native_conversation_changes_preserve_graph_and_missing_history_stays_missing() {
     let directory = tempfile::tempdir().unwrap();
     let paths = Paths::initialize(directory.path().join("data")).unwrap();

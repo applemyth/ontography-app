@@ -406,6 +406,9 @@ async fn reading_sessions_never_starts_a_server() {
     let listed = fixture.output(&["ls"]).await;
     assert!(listed.status.success());
     assert!(String::from_utf8_lossy(&listed.stdout).contains("No sessions"));
+    for command in [["server", "status"], ["server", "stop"]] {
+        assert_eq!(fixture.cli(&command).await, json!({"running":false}));
+    }
     assert!(
         !fixture.paths.socket.exists(),
         "listing must not start a server"
