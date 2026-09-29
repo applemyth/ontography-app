@@ -153,10 +153,12 @@ Implementation: [document](../src/workflow/document.rs),
 - Requests carry the expected server instance. A replacement server rejects
   stale requests before dispatch. Session-bound requests also carry
   `app_session_id`; the server fills omitted targets and rejects conflicts.
-- Command-line requests also carry the client's environment. The server keeps
-  it, in memory only, for the session a request targets when that session has
-  none yet. `system.hello` reports whether the server is `idle`, so a client of
-  another build can replace an idle server.
+- Resuming and attaching requests, and `call`, also carry the client's
+  environment. The server gives it, in memory only, to a session they activate,
+  or to an active session without one that they change; a change to work no
+  session owns gives it to that work. `system.hello` reports whether the server
+  is `idle`, with nothing running and no other connection, so a client of
+  another build can replace it.
 - Accepted mutations retain `(client_id, request_id)` outcomes in a bounded
   server table. Identical retries return the original outcome; conflicting
   arguments reject. `operation.get` reports the receipt. Restart loses this

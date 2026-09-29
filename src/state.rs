@@ -40,6 +40,18 @@ pub struct RunManifest {
     pub workflow: Option<crate::workflow::runtime::InitialWorkflow>,
 }
 
+impl RunManifest {
+    /// The status of this run while it is not open. A run a stopped server
+    /// left active or suspending can be recovered.
+    pub fn resting_status(&self) -> &str {
+        if matches!(self.status.as_str(), "active" | "suspending") {
+            "recoverable"
+        } else {
+            &self.status
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub base: ContentId,
@@ -139,7 +151,7 @@ pub struct ManagedRun {
     /// Preserve user checkouts while a faulted core owner is reopened.
     pub recovery_checkouts: BTreeMap<String, WorkspaceHandle>,
     /// What its programs start with: its session's environment, or the
-    /// server's for a run no session owns. Kept in memory only.
+    /// unowned one for a run no session owns. Kept in memory only.
     pub environment: Environment,
 }
 
@@ -208,7 +220,7 @@ impl ManagedRun {
     pub fn summary(&self) -> Value {
         json!({"run_id":self.manifest.run_id,"definition_id":self.manifest.declaration.id(),
             "definition_revision":self.manifest.declaration_revision,"project":self.manifest.project,
-            "status":if self.live.as_ref().is_some_and(|l|l.session.status()==SessionStatus::Closed){"closed"}else if self.live.as_ref().is_some_and(|l|l.suspension_error.is_some()){"suspension_failed"}else if self.live.is_some(){"active"}else if self.manifest.status=="active" || self.manifest.status=="suspending"{"recoverable"}else{&self.manifest.status},
+            "status":if self.live.as_ref().is_some_and(|l|l.session.status()==SessionStatus::Closed){"closed"}else if self.live.as_ref().is_some_and(|l|l.suspension_error.is_some()){"suspension_failed"}else if self.live.is_some(){"active"}else{self.manifest.resting_status()},
             "admission":self.live.as_ref().map(|l|views::status(l.session.status())),
             "created_at":self.manifest.created_at.to_string(),"checkpoints":self.manifest.checkpoints})
     }
@@ -428,8 +440,15 @@ pub struct Service {
     pub registry: Arc<crate::registry::ImplementationRegistry>,
     pub recovery_errors: BTreeMap<String, AppError>,
     pub sessions: crate::sessions::Sessions,
-    /// The server's own environment, for work no session owns.
-    pub environment: Environment,
+    /// What work no session owns starts with: the environment of the latest
+    /// command that changed such work, or the server's own before any.
+    unowned: std::sync::Mutex<Environment>,
+}
+
+/// `environment` as the programs of this server's store start with it: they
+/// reach the same store with the `ontography` command.
+fn programs(paths: &Paths, environment: Environment) -> Environment {
+    environment.with("ONTOGRAPHY_DATA_DIR", paths.root.to_string_lossy())
 }
 
 /// The runtime for a compiled run. Workflow runs accept only their editor's
@@ -470,7 +489,7 @@ impl Service {
         paths: Paths,
         registry: Arc<crate::registry::ImplementationRegistry>,
     ) -> Result<Self> {
-        let environment = Environment::current();
+        let environment = programs(&paths, Environment::current());
         let mut runs = BTreeMap::new();
         let mut recovery_errors = BTreeMap::new();
         for entry in std::fs::read_dir(paths.root.join("runs"))? {
@@ -516,8 +535,42 @@ impl Service {
             registry,
             recovery_errors,
             sessions,
-            environment,
+            unowned: std::sync::Mutex::new(environment),
         })
+    }
+
+    /// The environment work no session owns starts with.
+    pub fn environment(&self) -> Environment {
+        self.unowned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A command that changes work no session owns gives it its environment.
+    pub fn set_environment(&self, environment: Environment) {
+        *self
+            .unowned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            programs(&self.paths, environment);
+    }
+
+    /// Give a session `environment` for its programs; see
+    /// [`Sessions::offer_environment`](crate::sessions::Sessions::offer_environment).
+    pub async fn offer_environment(&self, id: &str, environment: Environment, activating: bool) {
+        self.sessions
+            .offer_environment(id, programs(&self.paths, environment), activating)
+            .await;
+    }
+
+    /// What a run's programs start with: its session's environment, or the
+    /// unowned one.
+    pub async fn run_environment(&self, run_id: &str) -> Environment {
+        match self.sessions.owner(run_id).await {
+            Some(session) => self.session_environment(&session).await,
+            None => self.environment(),
+        }
     }
 
     /// Whether any run is open. Never waits: a run busy with an operation
@@ -529,13 +582,13 @@ impl Service {
         })
     }
 
-    /// The environment a session's programs start with: its client's, or the
-    /// server's if no client has given it one.
+    /// The environment a session's programs start with: the one a command
+    /// gave it, or the unowned one if none has.
     pub async fn session_environment(&self, id: &str) -> Environment {
         self.sessions
             .environment(id)
             .await
-            .unwrap_or_else(|| self.environment.clone())
+            .unwrap_or_else(|| self.environment())
     }
 
     pub async fn run(&self, id: &str) -> Result<Arc<Mutex<ManagedRun>>> {
@@ -552,7 +605,7 @@ impl Service {
             &uuid::Uuid::new_v4().to_string(),
             declaration,
             project,
-            self.environment.clone(),
+            self.environment(),
         )
         .await
     }
@@ -697,7 +750,7 @@ impl Service {
             declaration,
             project,
             input,
-            self.environment.clone(),
+            self.environment(),
         )
         .await
     }

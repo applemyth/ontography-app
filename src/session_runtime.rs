@@ -1,6 +1,7 @@
 //! Live manager ownership, separate from durable session records and core runs.
 use crate::{
-    AppError, Result, catalog::Operation, managed_shell::ManagedShell, state::Service, tools,
+    AppError, Result, catalog::Operation, environment::Environment, managed_shell::ManagedShell,
+    state::Service, tools,
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -74,17 +75,26 @@ fn session_id<'a>(scope: Option<&'a str>, args: &'a Value) -> Result<&'a str> {
 }
 
 impl Managers {
+    /// `environment` is the command line client's. Activating a session, or
+    /// changing an active one that has none, gives it to the session; a change
+    /// to work no session owns gives it to that work.
     pub async fn dispatch(
         &self,
         service: &Arc<Service>,
         scope: Option<&str>,
         operation: &str,
         args: &Value,
+        environment: Option<Environment>,
     ) -> Result<Value> {
         if operation == "session.resume" {
             let id = session_id(scope, args)?;
             let mut managers = self.live.lock().await;
+            // A shell that exited is suspended first, forgetting its session's
+            // environment, so this resume brings its own.
             Self::reconcile_one(&mut managers, service, id).await?;
+            if let Some(environment) = environment {
+                service.offer_environment(id, environment, true).await;
+            }
             return tools::dispatch_scoped(service, scope, operation, args).await;
         }
         match operation {
@@ -94,15 +104,29 @@ impl Managers {
             }
             "terminal.ensure" => {
                 let id = session_id(scope, args)?;
+                let pi = PathBuf::from(args.get("pi").and_then(Value::as_str).unwrap_or("pi"));
+                let running = self
+                    .live
+                    .lock()
+                    .await
+                    .get(id)
+                    .is_some_and(|shell| shell.terminal.status().running);
+                if !running {
+                    // Checking Pi can take a while: not under the lock that
+                    // every session's manager operations share.
+                    ManagedShell::check_pi(service, id, &pi).await?;
+                }
                 let mut managers = self.live.lock().await;
                 Self::reconcile_one(&mut managers, service, id).await?;
+                if let Some(environment) = environment {
+                    service.offer_environment(id, environment, true).await;
+                }
                 if let Some(terminal) = managers.get(id) {
                     // It may exit immediately after reconciliation, just as an
                     // attached terminal may exit at any moment. Retain ownership
                     // so the watcher settles that generation before replacement.
                     return terminal.status();
                 }
-                let pi = PathBuf::from(args.get("pi").and_then(Value::as_str).unwrap_or("pi"));
                 let terminal = ManagedShell::launch(
                     service.clone(),
                     id,
@@ -147,7 +171,18 @@ impl Managers {
                 managers.remove(id);
                 tools::dispatch_scoped(service, scope, operation, args).await
             }
-            _ => tools::dispatch_scoped(service, scope, operation, args).await,
+            _ => {
+                let mutating = crate::catalog::operations()
+                    .iter()
+                    .any(|entry| entry.name == operation && entry.mutating);
+                if let Some(environment) = environment.filter(|_| mutating) {
+                    match session_id(scope, args) {
+                        Ok(id) => service.offer_environment(id, environment, false).await,
+                        Err(_) => service.set_environment(environment),
+                    }
+                }
+                tools::dispatch_scoped(service, scope, operation, args).await
+            }
         }
     }
 

@@ -23,10 +23,10 @@ async fn connect(paths: &Paths) -> Client {
 async fn an_idle_server_exits_while_an_open_run_keeps_it() {
     let directory = tempfile::tempdir().unwrap();
     let paths = Paths::initialize(directory.path().join("store")).unwrap();
-    let serving = tokio::spawn(server::serve_until_idle(
+    let serving = tokio::spawn(server::serve_with_registry(
         paths.clone(),
         Arc::new(ImplementationRegistry::default()),
-        Duration::from_millis(300),
+        Some(Duration::from_millis(300)),
     ));
     let client = connect(&paths).await;
     assert_eq!(
@@ -62,4 +62,28 @@ async fn an_idle_server_exits_while_an_open_run_keeps_it() {
         .unwrap()
         .unwrap();
     assert!(!paths.socket.exists());
+}
+
+#[tokio::test]
+async fn commands_arriving_between_idle_checks_keep_the_server() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths::initialize(directory.path().join("store")).unwrap();
+    let serving = tokio::spawn(server::serve_with_registry(
+        paths.clone(),
+        Arc::new(ImplementationRegistry::default()),
+        Some(Duration::from_millis(600)),
+    ));
+    let client = connect(&paths).await;
+    // Each command's connection lasts milliseconds, far shorter than the
+    // interval between idle checks; the limit counts from the latest one.
+    for _ in 0..12 {
+        client.call("system.status", json!({})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(!serving.is_finished(), "a server in use must not exit");
+    tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .expect("once commands stop, the server exits")
+        .unwrap()
+        .unwrap();
 }

@@ -297,29 +297,21 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             };
             drop(run);
             service
-                .start_workflow_reserved(
-                    &id,
-                    declaration,
-                    project,
-                    initial,
-                    service.environment.clone(),
-                )
+                .start_workflow_reserved(&id, declaration, project, initial, service.environment())
                 .await?;
         } else {
             service
-                .start_workflow_reserved(
-                    &id,
-                    declaration,
-                    project,
-                    initial,
-                    service.environment.clone(),
-                )
+                .start_workflow_reserved(&id, declaration, project, initial, service.environment())
                 .await?;
         }
         return status(&*service.run(&id).await?.lock().await).await;
     }
-    let handle = service.run(views::field(args, "run_id")?).await?;
+    let id = views::field(args, "run_id")?;
+    let handle = service.run(id).await?;
     let mut run = handle.lock().await;
+    // Whatever this operation starts, it starts with the run's current
+    // environment.
+    run.environment = service.run_environment(id).await;
     let state = runtime::load(&run)?;
     match operation {
         "flow.status" => status(&run).await,

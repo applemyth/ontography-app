@@ -163,7 +163,7 @@ async fn graph_initialization_recovers_reserved_identity_before_and_after_run_cr
                     &reserved,
                     serde_json::from_value(declaration()).unwrap(),
                     directory.path().into(),
-                    service.environment.clone(),
+                    service.environment(),
                 )
                 .await
                 .unwrap();

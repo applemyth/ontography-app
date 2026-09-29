@@ -232,46 +232,63 @@ impl Sessions {
         })
     }
 
-    /// Record the environment a session's programs start with, unless it has
-    /// one already: attaching again never changes a running session.
-    pub async fn offer_environment(&self, id: &str, environment: Environment) {
-        self.environments
-            .lock()
-            .await
-            .entry(id.to_owned())
-            .or_insert(environment);
+    /// Give a session `environment` for its programs, unless it has one. A
+    /// command that activates the session gives it; so does one that changes
+    /// an active session that has none, such as a scripted start. Reading a
+    /// session never does. Checked under the session's record lock, which
+    /// suspend and close hold while they forget it.
+    pub async fn offer_environment(&self, id: &str, environment: Environment, activating: bool) {
+        let Ok(handle) = self.get(id).await else {
+            return;
+        };
+        let record = handle.lock().await;
+        let open = match record.status {
+            SessionStatus::Active => true,
+            SessionStatus::Suspending | SessionStatus::Suspended => activating,
+            SessionStatus::Closing | SessionStatus::Closed => false,
+        };
+        if open {
+            self.environments
+                .lock()
+                .await
+                .entry(id.to_owned())
+                .or_insert(environment);
+        }
     }
 
-    /// The environment a client gave this session when it activated it.
+    /// The environment a command gave this session.
     pub async fn environment(&self, id: &str) -> Option<Environment> {
         self.environments.lock().await.get(id).cloned()
     }
 
-    /// A stopped session forgets its environment; the client that activates
+    /// A stopped session forgets its environment; the command that activates
     /// it next brings its own.
     async fn forget_environment(&self, id: &str) {
         self.environments.lock().await.remove(id);
     }
 
+    /// The session that owns a run, if one does.
+    pub async fn owner(&self, run_id: &str) -> Option<String> {
+        self.claims.lock().await.get(run_id).cloned()
+    }
+
     /// Every saved session, as `session.list` reports them, read while no
-    /// server runs. Nothing runs without a server, so a session left active
-    /// is reported suspended.
+    /// server runs.
     pub async fn saved(paths: &Paths) -> Result<Value> {
         let sessions = Self::open(paths)?;
-        let mut records = sessions.list().await;
-        for record in &mut records {
-            if matches!(
-                record.status,
-                SessionStatus::Active | SessionStatus::Suspending
-            ) {
-                record.status = SessionStatus::Suspended;
-            }
-        }
         Ok(json!({
-            "sessions": records,
+            "sessions": sessions.list().await,
             "selected_session_id": sessions.selected().await,
             "recovery_errors": sessions.recovery_errors,
         }))
+    }
+
+    /// A saved session as `session.inspect` shows it, read while no server
+    /// runs.
+    pub async fn inspect_saved(paths: &Paths, id: &str) -> Result<Value> {
+        let sessions = Self::open(paths)?;
+        let record = sessions.get(id).await?.lock().await.clone();
+        view(&record)
     }
 
     pub fn directory(&self, id: &str) -> Result<PathBuf> {
@@ -698,7 +715,15 @@ async fn context(service: &Service, record: &mut SessionRecord) -> Result<Value>
         }
         None => Value::Null,
     };
-    let mut session = serde_json::to_value(&*record)?;
+    Ok(
+        json!({"session":view(record)?,"conversations_dir":service.sessions.conversations_dir(&record.session_id)?,"graph":graph}),
+    )
+}
+
+/// A session as `session.inspect` shows it: its record, with a workflow's
+/// initialization summarized.
+fn view(record: &SessionRecord) -> Result<Value> {
+    let mut session = serde_json::to_value(record)?;
     if record
         .graph_initialization
         .as_ref()
@@ -706,9 +731,7 @@ async fn context(service: &Service, record: &mut SessionRecord) -> Result<Value>
     {
         session["graph_initialization"] = json!({"run_id":record.run_id,"operation":"flow.start"});
     }
-    Ok(
-        json!({"session":session,"conversations_dir":service.sessions.conversations_dir(&record.session_id)?,"graph":graph}),
-    )
+    Ok(session)
 }
 
 async fn dispatch_record(

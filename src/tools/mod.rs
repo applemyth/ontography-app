@@ -193,8 +193,12 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             )
         }
         _ => {
-            let run = service.run(views::field(args, "run_id")?).await?;
+            let id = views::field(args, "run_id")?;
+            let run = service.run(id).await?;
             let mut run = run.lock().await;
+            // Whatever this operation starts, it starts with the run's
+            // current environment.
+            run.environment = service.run_environment(id).await;
             dispatch_run(&mut run, operation, args).await
         }
     }

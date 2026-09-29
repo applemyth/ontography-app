@@ -47,6 +47,30 @@ impl Client {
         client.call("server.stop", serde_json::json!({})).await
     }
 
+    /// Stop a server of another build if its own handshake says it is idle.
+    /// Returns false if it is not. A server already stopping or gone counts
+    /// as stopped.
+    pub async fn stop_idle_server(socket: impl AsRef<Path>) -> Result<bool> {
+        let gone = |error: &AppError| {
+            matches!(
+                error.code.as_str(),
+                "io_error" | "server_stopping" | "unknown_outcome"
+            )
+        };
+        let (client, hello) = match Self::handshake(socket).await {
+            Ok(handshake) => handshake,
+            Err(error) if gone(&error) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if hello["idle"] != true {
+            return Ok(false);
+        }
+        match client.call("server.stop", serde_json::json!({})).await {
+            Err(error) if !gone(&error) => Err(error),
+            _ => Ok(true),
+        }
+    }
+
     async fn handshake(socket: impl AsRef<Path>) -> Result<(Self, Value)> {
         let mut client = Self {
             socket: socket.as_ref().into(),

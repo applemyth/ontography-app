@@ -230,7 +230,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let paths = Paths::initialize(directory.path().join("data")).unwrap();
         let socket = paths.socket.clone();
-        let server = tokio::spawn(crate::server::serve_with_registry(paths, ticker_registry()));
+        let server = tokio::spawn(crate::server::serve_with_registry(
+            paths,
+            ticker_registry(),
+            None,
+        ));
         let client = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match Client::connect(&socket).await {

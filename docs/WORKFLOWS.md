@@ -174,11 +174,11 @@ conversation. `timeout_secs` belongs to command tasks and is rejected for
 agents.
 
 Agents and command tasks start with their session's environment: that of the
-terminal whose command first reached the session, such as `attach` or a
-scripted `call flow.start`, less the variables that describe that terminal or
-an enclosing agent session. So `PATH`, API keys, `CODEX_HOME`, and
-`CLAUDE_CONFIG_DIR` come from that terminal. A run no session owns uses the
-server's own environment. See [Environment](SESSIONS.md#environment).
+terminal that activated the session, such as with `attach` or a scripted `call
+flow.start`, less the variables that describe that terminal or an enclosing
+agent session. So `PATH`, API keys, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR` come
+from that terminal. A run no session owns starts with the environment of the
+latest command that changed such a run. See [Environment](SESSIONS.md#environment).
 
 Initial and incoming graph work is delivered automatically as user messages in
 that conversation. The host begins an attempt using the existing join and retry

@@ -21,7 +21,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -55,6 +55,8 @@ pub struct Server {
     stopping: AtomicBool,
     manager_monitor_started: AtomicBool,
     stopped: Notify,
+    /// Client connections now open.
+    connections: AtomicUsize,
 }
 
 impl Server {
@@ -77,6 +79,7 @@ impl Server {
             stopping: AtomicBool::new(false),
             manager_monitor_started: AtomicBool::new(false),
             stopped: Notify::new(),
+            connections: AtomicUsize::new(0),
         }))
     }
 
@@ -131,14 +134,6 @@ impl Server {
             }
             return self.stop().await;
         }
-        if let (Some(id), Some(environment)) = (target_session(&request), &request.environment)
-            && self.service.sessions.get(id).await.is_ok()
-        {
-            self.service
-                .sessions
-                .offer_environment(id, Environment::from_vars(environment.clone()))
-                .await;
-        }
         let operation = catalog::operations()
             .iter()
             .find(|o| o.name == request.operation)
@@ -157,6 +152,7 @@ impl Server {
                 request.app_session_id.as_deref(),
                 &request.operation,
                 &request.args,
+                request.environment.clone().map(Environment::from_vars),
             ))
             .catch_unwind()
             .await
@@ -170,8 +166,10 @@ impl Server {
             if request.operation == "system.hello"
                 && let Ok(hello) = &mut result
             {
-                // A client of another build may replace an idle server.
-                hello["idle"] = json!(!self.busy().await);
+                // A client of another build may replace an idle server: one
+                // with nothing running and no connection but this one.
+                hello["idle"] =
+                    json!(!self.busy() && self.connections.load(Ordering::Acquire) <= 1);
             }
             return result;
         }
@@ -236,6 +234,7 @@ impl Server {
                             request.app_session_id.as_deref(),
                             &request.operation,
                             &request.args,
+                            request.environment.clone().map(Environment::from_vars),
                         )
                         .await
                 })
@@ -265,7 +264,7 @@ impl Server {
     /// Whether anything runs: a session's shell, an open run, or an accepted
     /// operation still in progress. Never waits on work in progress, which
     /// counts as running.
-    async fn busy(&self) -> bool {
+    fn busy(&self) -> bool {
         self.managers.any()
             || self.service.has_live_runs()
             || self.requests.try_lock().map_or(true, |requests| {
@@ -327,18 +326,6 @@ impl Server {
         }
         self.stopped.notify_one();
         Ok(json!({"stopped":true,"runs_preserved":true}))
-    }
-}
-
-/// The session a request targets. A client's environment reaches a session
-/// through any request that targets it, such as resuming it or starting its
-/// workflow from a script.
-fn target_session(request: &Request) -> Option<&str> {
-    let target = request.args.get("session_id").and_then(Value::as_str);
-    match (request.app_session_id.as_deref(), target) {
-        (Some(scope), Some(target)) if scope != target => None,
-        (Some(scope), _) => Some(scope),
-        (None, target) => target,
     }
 }
 
@@ -494,6 +481,15 @@ fn validate_arguments(schema: &Value, value: &Value, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Counts a connection as open while it lives.
+struct Open<'a>(&'a AtomicUsize);
+
+impl Drop for Open<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct Ownership {
     _lock: File,
     socket: PathBuf,
@@ -504,10 +500,14 @@ impl Drop for Ownership {
     }
 }
 
-pub async fn serve(paths: Paths) -> Result<()> {
+/// Serve until stopped. With an `idle_limit`, as for a background server,
+/// also stop once nothing has run and no client has connected for that long.
+/// A server under an external supervisor runs without one.
+pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
     serve_with_registry(
         paths,
         Arc::new(crate::registry::ImplementationRegistry::default()),
+        idle_limit,
     )
     .await
 }
@@ -515,16 +515,7 @@ pub async fn serve(paths: Paths) -> Result<()> {
 pub async fn serve_with_registry(
     paths: Paths,
     registry: Arc<crate::registry::ImplementationRegistry>,
-) -> Result<()> {
-    serve_until_idle(paths, registry, IDLE_LIMIT).await
-}
-
-/// Serve until stopped, or until nothing has run and no client has been
-/// connected for `idle_limit`.
-pub async fn serve_until_idle(
-    paths: Paths,
-    registry: Arc<crate::registry::ImplementationRegistry>,
-    idle_limit: Duration,
+    idle_limit: Option<Duration>,
 ) -> Result<()> {
     let lock = OpenOptions::new()
         .create(true)
@@ -534,14 +525,19 @@ pub async fn serve_until_idle(
         .mode(0o600)
         .open(paths.root.join("server.lock"))?;
     let handover = Instant::now() + HANDOVER;
-    while let Err(error) = lock.try_lock() {
-        if Instant::now() >= handover {
-            return Err(AppError::new(
-                "server_owned",
-                format!("another server owns this data directory: {error}"),
-            ));
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < handover => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(AppError::new(
+                    "server_owned",
+                    format!("another server owns this data directory: {error}"),
+                ));
+            }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     crate::migration::check_root_available(&paths.root)?;
     if paths.socket.exists() {
@@ -557,12 +553,18 @@ pub async fn serve_until_idle(
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut clients = JoinSet::new();
-    let mut idle_check = tokio::time::interval(Duration::from_secs(1).min(idle_limit));
+    let mut idle_check =
+        tokio::time::interval(idle_limit.map_or(Duration::from_secs(1), |limit| {
+            limit.min(Duration::from_secs(1))
+        }));
     let mut idle_since: Option<Instant> = None;
     loop {
         tokio::select! {
             accepted = listener.accept(), if clients.len() < 256 => {
                 let (socket,_) = accepted?;
+                // A command's connections come and go between idle checks;
+                // any of them means the server is in use.
+                idle_since = None;
                 let server = server.clone();
                 clients.spawn(async move { let _ = connection(server,socket).await; });
             }
@@ -570,10 +572,10 @@ pub async fn serve_until_idle(
             _ = terminate.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
             _ = interrupt.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
             _ = clients.join_next(), if !clients.is_empty() => {},
-            _ = idle_check.tick() => {
-                if !clients.is_empty() || server.busy().await {
+            _ = idle_check.tick(), if idle_limit.is_some() => {
+                if !clients.is_empty() || server.busy() {
                     idle_since = None;
-                } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= idle_limit {
+                } else if idle_limit.is_some_and(|limit| idle_since.get_or_insert_with(Instant::now).elapsed() >= limit) {
                     match server.stop().await {
                         Ok(_) => break,
                         Err(error) => {
@@ -595,6 +597,8 @@ pub async fn serve_until_idle(
 }
 
 async fn connection(server: Arc<Server>, socket: UnixStream) -> Result<()> {
+    server.connections.fetch_add(1, Ordering::AcqRel);
+    let _open = Open(&server.connections);
     let (reader, writer) = socket.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let mut reader = BufReader::new(reader);

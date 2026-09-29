@@ -413,8 +413,8 @@ async fn reading_sessions_never_starts_a_server() {
         !fixture.paths.socket.exists(),
         "listing must not start a server"
     );
-    // A session left active when its server stopped reads as not running.
-    fixture.cli(&["new", "kept", "--no-attach"]).await;
+    // Without a server, sessions read as they were saved, with nothing running.
+    let created = fixture.cli(&["new", "kept", "--no-attach"]).await;
     fixture.cli(&["server", "stop"]).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while fixture.paths.socket.exists() {
@@ -423,11 +423,11 @@ async fn reading_sessions_never_starts_a_server() {
     })
     .await
     .expect("the stopped server must remove its socket");
-    assert_eq!(fixture.cli(&["show", "kept"]).await["status"], "suspended");
+    assert_eq!(fixture.cli(&["show", "kept"]).await, created);
     let listed = fixture.output(&["ls"]).await;
     let table = String::from_utf8(listed.stdout).unwrap();
     assert!(
-        table.contains("kept") && table.contains("inactive") && table.contains("stopped"),
+        table.contains("kept") && table.contains("active") && table.contains("stopped"),
         "{table}"
     );
     assert!(

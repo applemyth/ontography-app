@@ -125,8 +125,6 @@ impl ManagedShell {
         }
         // The shell, and Pi within it, start with the session's environment.
         let environment = service.session_environment(session_id).await;
-        // Check the configured executable before leaving a durable shell running.
-        launcher::pi_command(&service.paths, &record.project, &pi, &environment, false).await?;
         let generation = uuid::Uuid::new_v4().to_string();
         let socket = lease_socket(&service.paths, &generation)?;
         let listener = UnixListener::bind(&socket)?;
@@ -166,11 +164,6 @@ impl ManagedShell {
                 .into_iter()
                 .chain([
                     ("BASH_SILENCE_DEPRECATION_WARNING".into(), "1".into()),
-                    // Commands typed in the shell reach this server's store.
-                    (
-                        "ONTOGRAPHY_DATA_DIR".into(),
-                        service.paths.root.to_string_lossy().into_owned(),
-                    ),
                     ("ONTOGRAPHY_SESSION_ID".into(), session_id.into()),
                     (
                         "ONTOGRAPHY_SOCKET".into(),
@@ -227,6 +220,23 @@ impl ManagedShell {
             }
         });
         Ok(shell)
+    }
+
+    /// Check the configured Pi before a shell is left running for it. The
+    /// check can take several seconds, so callers make it without holding
+    /// locks other sessions need.
+    pub async fn check_pi(service: &Service, session_id: &str, pi: &std::path::Path) -> Result<()> {
+        let project = service
+            .sessions
+            .get(session_id)
+            .await?
+            .lock()
+            .await
+            .project
+            .clone();
+        let environment = service.session_environment(session_id).await;
+        launcher::pi_command(&service.paths, &project, pi, &environment, false).await?;
+        Ok(())
     }
 
     pub fn status(&self) -> Result<Value> {

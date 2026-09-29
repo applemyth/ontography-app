@@ -44,7 +44,7 @@ Commands accept an exact session ID or a unique exact name. IDs take precedence 
 
 The existing `ontography session …` forms remain supported. `session list` continues returning raw session records and selection as JSON. API calls themselves use durable IDs; name resolution belongs to the CLI.
 
-`ls`, `show`, and `session list` never start the server. With none running, they read saved sessions from disk and show that nothing runs: a session left active reads as `inactive` (`suspended` in JSON), its terminal and program as `stopped`, and an active graph as `suspended`. Other session commands and `call` start the server when none is running.
+`ls`, `show`, and `session list` never start the server. With none running, they read saved sessions from disk, as they were saved, and show that nothing runs: terminals and programs as `stopped`, and a graph left open as `recoverable`. Other session commands and `call` start the server when none is running.
 
 `--project` chooses the project only during session creation. Existing attachments use the saved project. `--data-dir` selects the server/store. `--pi` selects the executable when creating a session terminal; a live terminal retains that choice for Pi reentry. Interactive creation requires a terminal before creating any session record; scripts use `new --no-attach`.
 
@@ -194,18 +194,18 @@ App-session fork/clone, archive/delete, complete portable backups, and multiple-
 
 ## Environment
 
-The background server outlives the terminal that started it, so it keeps only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `TMPDIR`, `LANG`, and `LC_*` for itself. Each session brings its own environment instead. Session commands and `call` send their terminal's environment; the first to reach a session, such as `attach` or a scripted `--session NAME call flow.start`, gives the session its environment, and its shell, Pi, agents, and command tasks start with it. Later commands do not change it. Suspending or closing the session forgets it; the next command brings its own.
+The background server outlives the terminal that started it, so it keeps only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `TMPDIR`, `LANG`, and `LC_*` for itself. Each session brings its own environment instead. Resuming or attaching a session gives it the environment of the terminal that did so, and its shell, Pi, agents, and command tasks start with it. So does a command that changes an active session without one, such as a scripted `--session NAME call flow.start` after `new --no-attach`. Commands that only read a session never give it one, and neither does changing a suspended session. Later commands do not change it. Suspending or closing the session forgets it; the next activation brings its own.
 
 One rule drops the variables that describe the terminal or agent session a command was typed in:
 
 - terminal variables: `TERM`, `TERM_*`, `COLORTERM`, `TMUX*`, `ITERM_*`, `KITTY_*`, `VSCODE_*`, and those of other terminal programs. Each terminal the server creates sets its own `TERM`.
 - shell state: `PWD`, `OLDPWD`, `SHLVL`, and `_`.
-- variables Claude Code and Codex set for their own children, such as `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, and `CODEX_SANDBOX`.
-- every `ONTOGRAPHY_*` variable; the server sets its own. It gives the session's shell `ONTOGRAPHY_DATA_DIR`, so commands typed there reach the same store.
+- variables Claude Code and Codex set for their own children, such as `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, and `CODEX_SANDBOX`. From a command typed inside Claude Code, the settings it gives its tools, such as `GIT_EDITOR=true`, are dropped too.
+- every `ONTOGRAPHY_*` variable; the server sets its own.
 
 Configuration such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, API keys, and `SSH_AUTH_SOCK` is kept.
 
-Environments are kept in memory only, never saved. Runs no session owns, started with an unscoped `call`, start with the server's own environment.
+Environments are kept in memory only, never saved. Runs no session owns, started with an unscoped `call`, start with the environment of the latest command that changed such a run; before any, with the server's own. Every program also gets `ONTOGRAPHY_DATA_DIR`, so `ontography` commands it runs reach the same store.
 
 ## Storage
 

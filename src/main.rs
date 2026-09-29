@@ -8,6 +8,7 @@ use ontography_app::{
     persistence::{self, Paths},
     server,
     sessions::Sessions,
+    state::RunManifest,
     terminal, terminal_client, ui,
 };
 use serde_json::{Value, json};
@@ -192,7 +193,9 @@ async fn run(cli: Cli) -> Result<()> {
                 nix::unistd::setsid().map_err(|e| AppError::new("detach_failed", e.to_string()))?;
             }
             let root = paths.root.clone();
-            let result = server::serve(paths).await;
+            // A background server exits when idle; one run in the foreground,
+            // such as under a supervisor, keeps running.
+            let result = server::serve(paths, detach.then_some(server::IDLE_LIMIT)).await;
             if let Err(error) = &result {
                 ontography_app::logging::record(&root, &error.to_string());
             }
@@ -247,15 +250,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let id = resolve(&client, target).await?;
                 attach(&client, &id, &options.pi, options.ui).await
             } else {
-                change_session(
-                    &client,
-                    &options,
-                    SessionAction::New {
-                        name: None,
-                        no_attach: false,
-                    },
-                )
-                .await
+                new_session(&client, &options, None, false).await
             }
         }
         Some(Action::Migrate { .. }) => {
@@ -274,7 +269,7 @@ async fn run_session(
         // Reading never starts a server: without one, saved sessions are read
         // from disk.
         SessionAction::List { json } => {
-            let client = launcher::connect_current(paths).await?;
+            let client = launcher::connect_current(paths, false).await?;
             if top_level {
                 list_sessions(client.as_ref(), paths, json).await
             } else {
@@ -282,60 +277,68 @@ async fn run_session(
             }
         }
         SessionAction::Show { id } => {
-            let client = launcher::connect_current(paths).await?;
-            let sessions = session_list(client.as_ref(), paths).await?;
-            let id = resolve_session(&sessions, &id)?;
+            let client = launcher::connect_current(paths, false).await?;
+            let id = resolve_session(&session_list(client.as_ref(), paths).await?, &id)?;
             print(match client {
                 Some(client) => {
                     client
                         .call("session.inspect", json!({"session_id":id}))
                         .await?
                 }
-                None => saved_session(&sessions, &id)?,
+                None => Sessions::inspect_saved(paths, &id).await?,
             })
         }
-        action => change_session(&launcher::ensure_server(paths).await?, options, action).await,
+        SessionAction::New { name, no_attach } => {
+            let client = launcher::ensure_server(paths).await?;
+            new_session(&client, options, name, no_attach).await
+        }
+        SessionAction::Attach { id } => {
+            let client = launcher::ensure_server(paths).await?;
+            let id = resolve(&client, &id).await?;
+            attach(&client, &id, &options.pi, options.ui).await
+        }
+        SessionAction::Detach { id } => change(paths, "terminal.detach", &id, json!({})).await,
+        SessionAction::Resume { id } => change(paths, "session.resume", &id, json!({})).await,
+        SessionAction::Suspend { id } => change(paths, "session.suspend", &id, json!({})).await,
+        SessionAction::Close { id } => change(paths, "session.close", &id, json!({})).await,
+        SessionAction::Adopt { id, run_id } => {
+            change(paths, "session.adopt", &id, json!({"run_id":run_id})).await
+        }
     }
 }
 
-async fn change_session(client: &Client, options: &Options, action: SessionAction) -> Result<()> {
-    let (operation, target, mut args) = match action {
-        SessionAction::New { name, no_attach } => {
-            if !no_attach {
-                require_terminal()?;
-            }
-            let mut args = json!({"project":project(options.project.clone())?});
-            if let Some(name) = name {
-                args["name"] = json!(name);
-            }
-            let value = client.call("session.create", args).await?;
-            return if no_attach {
-                print(value)
-            } else {
-                attach(client, value_id(&value)?, &options.pi, options.ui).await
-            };
-        }
-        SessionAction::List { .. } | SessionAction::Show { .. } => {
-            unreachable!("reading sessions changes nothing")
-        }
-        SessionAction::Attach { id } => {
-            let id = resolve(client, &id).await?;
-            return attach(client, &id, &options.pi, options.ui).await;
-        }
-        SessionAction::Detach { id } => ("terminal.detach", id, json!({})),
-        SessionAction::Resume { id } => ("session.resume", id, json!({})),
-        SessionAction::Suspend { id } => ("session.suspend", id, json!({})),
-        SessionAction::Close { id } => ("session.close", id, json!({})),
-        SessionAction::Adopt { id, run_id } => ("session.adopt", id, json!({"run_id":run_id})),
-    };
-    args["session_id"] = json!(resolve(client, &target).await?);
-    // Resuming activates the session with this terminal's environment.
-    print(
+async fn new_session(
+    client: &Client,
+    options: &Options,
+    name: Option<String>,
+    no_attach: bool,
+) -> Result<()> {
+    if !no_attach {
+        require_terminal()?;
+    }
+    let mut args = json!({"project":project(options.project.clone())?});
+    if let Some(name) = name {
+        args["name"] = json!(name);
+    }
+    let value = client.call("session.create", args).await?;
+    if no_attach {
+        print(value)
+    } else {
+        attach(client, value_id(&value)?, &options.pi, options.ui).await
+    }
+}
+
+/// Apply `operation` to the session named `target`. Resuming activates the
+/// session with this terminal's environment.
+async fn change(paths: &Paths, operation: &str, target: &str, mut args: Value) -> Result<()> {
+    let client = launcher::ensure_server(paths).await?;
+    args["session_id"] = json!(resolve(&client, target).await?);
+    let client = if operation == "session.resume" {
+        client.with_environment(Environment::current())
+    } else {
         client
-            .with_environment(Environment::current())
-            .call(operation, args)
-            .await?,
-    )
+    };
+    print(client.call(operation, args).await?)
 }
 
 /// Saved sessions: from the running server, or read from disk without one.
@@ -346,27 +349,18 @@ async fn session_list(client: Option<&Client>, paths: &Paths) -> Result<Value> {
     }
 }
 
-/// A saved session's record, read without a server.
-fn saved_session(sessions: &Value, id: &str) -> Result<Value> {
-    array(sessions, "sessions")?
-        .iter()
-        .find(|session| session["session_id"] == id)
-        .cloned()
-        .ok_or_else(|| AppError::new("session_not_found", format!("No session {id:?}")))
-}
-
-/// A saved run's status, read without a server: nothing of it is running.
+/// A saved run as `run.list` reports it, read without a server: none is open.
 fn saved_run(paths: &Paths, id: &str) -> Value {
     let status = paths
         .run(id)
-        .and_then(|directory| persistence::read_json::<Value>(&directory.join("manifest.json")))
-        .ok()
-        .and_then(|manifest| manifest["status"].as_str().map(str::to_owned));
-    json!({"run_id":id,"status":match status.as_deref() {
-        Some("active") => "suspended",
-        Some(status) => status,
-        None => "unavailable",
-    }})
+        .and_then(|directory| {
+            persistence::read_json::<RunManifest>(&directory.join("manifest.json"))
+        })
+        .map_or_else(
+            |_| "unavailable".to_owned(),
+            |manifest| manifest.resting_status().to_owned(),
+        );
+    json!({"run_id":id,"status":status})
 }
 
 async fn resolve(client: &Client, target: &str) -> Result<String> {

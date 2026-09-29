@@ -76,31 +76,37 @@ pub async fn pi_session_command(
 }
 
 /// The running server of this build, if one runs. An idle server of another
-/// build is stopped, so the current build can take its place; one that may
-/// have sessions running is left alone.
-pub async fn connect_current(paths: &Paths) -> Result<Option<Client>> {
+/// build has nothing running, so what is saved on disk is current; to take
+/// its place, `replace` stops it if it is still idle. One that may have
+/// sessions running is reported instead.
+pub async fn connect_current(paths: &Paths, replace: bool) -> Result<Option<Client>> {
     match Client::connect(&paths.socket).await {
         Ok(client) => Ok(Some(client)),
         Err(error) if error.code == "io_error" => Ok(None),
-        Err(error)
-            if error.code == "incompatible_server"
-                && error
-                    .details
-                    .as_ref()
-                    .is_some_and(|details| details["idle"] == true) =>
-        {
-            Client::stop_server(&paths.socket).await?;
+        Err(error) if idle_elsewhere(&error) => {
+            if replace && !Client::stop_idle_server(&paths.socket).await? {
+                return Err(error);
+            }
             Ok(None)
         }
         Err(error) => Err(error),
     }
 }
 
+/// Whether an error reports an idle server of another build.
+fn idle_elsewhere(error: &AppError) -> bool {
+    error.code == "incompatible_server"
+        && error
+            .details
+            .as_ref()
+            .is_some_and(|details| details["idle"] == true)
+}
+
 /// Connect to this build's server, starting one if none runs. The server
 /// keeps only what it needs of this process's environment; the sessions a
 /// client activates bring their own.
 pub async fn ensure_server(paths: &Paths) -> Result<Client> {
-    if let Some(client) = connect_current(paths).await? {
+    if let Some(client) = connect_current(paths, true).await? {
         return Ok(client);
     }
     let log = paths.root.join("logs/server.log");
@@ -118,7 +124,7 @@ pub async fn ensure_server(paths: &Paths) -> Result<Client> {
         match Client::connect(&paths.socket).await {
             Ok(client) => return Ok(client),
             // An idle server that was just stopped may answer until it exits.
-            Err(error) if matches!(error.code.as_str(), "io_error" | "incompatible_server") => {}
+            Err(error) if error.code == "io_error" || idle_elsewhere(&error) => {}
             Err(error) => return Err(error),
         }
         if let Some(status) = child.try_wait()? {
@@ -139,8 +145,7 @@ pub async fn ensure_server(paths: &Paths) -> Result<Client> {
     ))
 }
 
-/// Native Pi's command, after checking its version in `environment`, the
-/// environment Pi will run with.
+/// Native Pi's command, after checking Pi's version in `environment`.
 pub async fn pi_command(
     paths: &Paths,
     project: &Path,

@@ -99,7 +99,7 @@ ontography call run.inspect --args '{"run_id":"RUN_UUID"}'
 ontography call OPERATION --file /absolute/path/to/arguments.json
 ```
 
-Commands that need the server start it; `ls`, `show`, and `session list` never do. The server exits by itself after 30 seconds in which nothing runs and no client is connected. `server start` still starts one, but it exits once idle too. With none running, `server status` and `server stop` print `{"running": false}` and succeed; a running server's status includes `"running": true`.
+Commands that need the server start it in the background; `ls`, `show`, and `session list` never do. A background server exits by itself after 30 seconds in which nothing runs and no client is connected. It keeps only a few variables of the terminal that started it, including `RUST_LOG` and `RUST_BACKTRACE` for diagnosis. `server start` still starts one, but it exits once idle too. With none running, `server status` and `server stop` print `{"running": false}` and succeed; a running server's status includes `"running": true`.
 
 Server stop settles accepted operations, stops managers, and suspends core runs. Startup loads records without launching every saved manager. Attach to the session you want; `session resume SESSION_UUID` resumes its graph without opening a terminal. A foreground server can be used by an external supervisor:
 
@@ -107,7 +107,7 @@ Server stop settles accepted operations, stops managers, and suspends core runs.
 ontography --data-dir /absolute/path/to/test-data server run
 ```
 
-It also exits when idle. It keeps the environment it was started with; programs that use the server's own environment get it, filtered like a session's ([Environment](SESSIONS.md#environment)).
+Unlike a background server, it does not exit when idle. It keeps the environment it was started with; programs that use the server's own environment get it, filtered like a session's ([Environment](SESSIONS.md#environment)).
 
 `system.hello` returns the operation catalog and schemas. Scope a call with `--session` to resolve and validate its graph target. Preserve string identifiers and decimal-string revisions exactly.
 
