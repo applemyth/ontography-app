@@ -166,6 +166,11 @@ impl ManagedShell {
                 .into_iter()
                 .chain([
                     ("BASH_SILENCE_DEPRECATION_WARNING".into(), "1".into()),
+                    // Commands typed in the shell reach this server's store.
+                    (
+                        "ONTOGRAPHY_DATA_DIR".into(),
+                        service.paths.root.to_string_lossy().into_owned(),
+                    ),
                     ("ONTOGRAPHY_SESSION_ID".into(), session_id.into()),
                     (
                         "ONTOGRAPHY_SOCKET".into(),

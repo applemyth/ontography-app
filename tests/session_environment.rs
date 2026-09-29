@@ -47,6 +47,69 @@ async fn marker(server: &Server, session: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Starts a workflow whose one command reports what it was started with,
+/// and returns that report.
+async fn probe(
+    server: &Arc<Server>,
+    session: &str,
+    environment: Option<BTreeMap<String, String>>,
+) -> String {
+    let probe = r#"printf '%s|%s' "$SESSION_MARKER" "${CLAUDE_CODE_MESSAGING_TOKEN:-none}""#;
+    let document = json!({"name":"environment","entry":"probe","nodes":[
+        {"id":"probe","component":"command","config":{"argv":["/bin/sh","-c",probe]}}]});
+    call(
+        server,
+        Some(session),
+        "flow.start",
+        json!({"document":document,"message":"go"}),
+        environment,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let output = call(
+                server,
+                Some(session),
+                "flow.output",
+                json!({"node":"probe"}),
+                None,
+            )
+            .await
+            .to_string();
+            if output.contains('|') {
+                return output;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the command must run")
+}
+
+async fn session(server: &Arc<Server>, project: &std::path::Path) -> String {
+    call(
+        server,
+        None,
+        "session.create",
+        json!({"project":project}),
+        None,
+    )
+    .await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_scripted_start_gives_the_session_its_clients_environment() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server::new(Paths::initialize(directory.path().join("store")).unwrap()).unwrap();
+    let id = session(&server, directory.path()).await;
+    let output = probe(&server, &id, Some(client("scripted"))).await;
+    assert!(output.contains("scripted|none"), "{output}");
+    server.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn session_programs_start_with_the_activating_clients_environment() {
     let directory = tempfile::tempdir().unwrap();
@@ -72,36 +135,8 @@ async fn session_programs_start_with_the_activating_clients_environment() {
     assert_eq!(marker(&server, id).await.as_deref(), Some("first"));
 
     // The session's command worker runs with it, filtered.
-    let probe = r#"printf '%s|%s' "$SESSION_MARKER" "${CLAUDE_CODE_MESSAGING_TOKEN:-none}""#;
-    let document = json!({"name":"environment","entry":"probe","nodes":[
-        {"id":"probe","component":"command","config":{"argv":["/bin/sh","-c",probe]}}]});
-    call(
-        &server,
-        Some(id),
-        "flow.start",
-        json!({"document":document,"message":"go"}),
-        None,
-    )
-    .await;
-    let output = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let output = call(
-                &server,
-                Some(id),
-                "flow.output",
-                json!({"node":"probe"}),
-                None,
-            )
-            .await;
-            if output.to_string().contains('|') {
-                return output;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the command must run");
-    assert!(output.to_string().contains("first|none"), "{output}");
+    let output = probe(&server, id, None).await;
+    assert!(output.contains("first|none"), "{output}");
 
     // Attaching again never changes a running session's environment.
     call(

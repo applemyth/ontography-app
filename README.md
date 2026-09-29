@@ -37,7 +37,7 @@ Rust server
 
 A new session can start Pi before its graph exists. Its first scoped `run.start` or `project.start` durably binds the resulting run. Each session owns separate Pi state and, once initialized, one graph run. Saved graph definitions remain separate from the current graph of a run.
 
-Server stop suspends graph resources and stops managers. Explicit attachment after restart restores that session's graph and saved Pi conversation. Transcripts do not restore process memory or in-flight agent work.
+After 30 seconds in which nothing runs and no client is connected, the server exits by itself; the next command that needs it starts it again. Server stop suspends graph resources and stops managers. Explicit attachment after restart restores that session's graph and saved Pi conversation. Transcripts do not restore process memory or in-flight agent work. A session's Pi and agents start with the environment of the terminal whose command first reached it, such as `attach`; see [Environment](docs/SESSIONS.md#environment).
 
 ## Use without a model
 

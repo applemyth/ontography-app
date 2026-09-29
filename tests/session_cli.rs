@@ -465,6 +465,13 @@ async fn pi_runs_with_the_attaching_terminals_environment() {
     let has = |line: &str| environment.lines().any(|found| found == line);
     assert!(has("SESSION_MARKER=attacher"), "{environment}");
     assert!(has("TERM=xterm-256color"), "{environment}");
+    // Commands typed in the session's shell reach this server's store.
+    assert!(
+        environment
+            .lines()
+            .any(|line| line.starts_with("ONTOGRAPHY_DATA_DIR=") && line.ends_with("/store")),
+        "{environment}"
+    );
     for absent in ["CLAUDECODE=", "CLAUDE_CODE_MESSAGING_TOKEN="] {
         assert!(
             !environment.lines().any(|line| line.starts_with(absent)),

@@ -20,7 +20,7 @@ If needed, install Pi using your normal Node package setup:
 npm install --global @earendil-works/pi-coding-agent@0.85.1
 ```
 
-Ontography does not install or upgrade Pi during launch. Select a compatible executable with `--pi /absolute/path/to/pi`; that choice is used when starting a manager process. An already running manager is reused.
+Ontography does not install or upgrade Pi during launch. Before starting Pi, it checks Pi's version, waiting up to 30 seconds: macOS can hold a program's first start for several seconds, such as after an install. Select a compatible executable with `--pi /absolute/path/to/pi`; that choice is used when starting a manager process. An already running manager is reused.
 
 ```sh
 cargo build --locked
@@ -99,11 +99,15 @@ ontography call run.inspect --args '{"run_id":"RUN_UUID"}'
 ontography call OPERATION --file /absolute/path/to/arguments.json
 ```
 
+Commands that need the server start it; `ls`, `show`, and `session list` never do. The server exits by itself after 30 seconds in which nothing runs and no client is connected. `server start` still starts one, but it exits once idle too. With none running, `server status` and `server stop` print `{"running": false}` and succeed; a running server's status includes `"running": true`.
+
 Server stop settles accepted operations, stops managers, and suspends core runs. Startup loads records without launching every saved manager. Attach to the session you want; `session resume SESSION_UUID` resumes its graph without opening a terminal. A foreground server can be used by an external supervisor:
 
 ```sh
 ontography --data-dir /absolute/path/to/test-data server run
 ```
+
+It also exits when idle. It keeps the environment it was started with; programs that use the server's own environment get it, filtered like a session's ([Environment](SESSIONS.md#environment)).
 
 `system.hello` returns the operation catalog and schemas. Scope a call with `--session` to resolve and validate its graph target. Preserve string identifiers and decimal-string revisions exactly.
 
@@ -123,7 +127,7 @@ npm test
 
 Pi development dependencies are local and pinned. Tests use temporary stores, Unix sockets, PTYs, and local iroh endpoints; environments that prohibit these resources need the relevant execution permission. Most tests make no model calls.
 
-Builds embed app/core source fingerprints. Clients require the server's exact app/core builds; rebuilding the executable does not replace a running server. After a rebuild, use `ontography server stop` with the same data directory, then retry your command to start the current build. Explicit shutdown accepts a different app/core build when its wire protocol matches; ordinary commands still require an exact build match. Shutdown suspends graph resources and stops managers while preserving saved state. Persistent runs still require their stored core build and declaration identities; stopping the server does not migrate saved core data.
+Builds embed app/core source fingerprints. Clients require the server's exact app/core builds. After a rebuild, a command that finds the old build's server with nothing running stops it and, if it needs a server, starts the current build (`server status` only reports it). If the old server may have sessions running, the command fails with `incompatible_server`: run `ontography server stop` with the same data directory, which suspends them, then retry. Servers from builds before idle exit cannot report being idle, so they always need `server stop`. Explicit shutdown accepts a different app/core build when its wire protocol matches. Shutdown suspends graph resources and stops managers while preserving saved state. Persistent runs still require their stored core build and declaration identities; stopping the server does not migrate saved core data.
 
 For startup failures, inspect the Pi version, project/data paths, `server status`, and the server log. Missing previously saved conversation history is reported explicitly. Empty initial conversations have reserved IDs and can be resumed before Pi writes their first history file.
 

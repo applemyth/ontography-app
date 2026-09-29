@@ -131,7 +131,7 @@ impl Server {
             }
             return self.stop().await;
         }
-        if let (Some(id), Some(environment)) = (activated_session(&request), &request.environment)
+        if let (Some(id), Some(environment)) = (target_session(&request), &request.environment)
             && self.service.sessions.get(id).await.is_ok()
         {
             self.service
@@ -330,14 +330,10 @@ impl Server {
     }
 }
 
-/// The session a request activates, giving it the client's environment.
-fn activated_session(request: &Request) -> Option<&str> {
-    if !matches!(
-        request.operation.as_str(),
-        "session.resume" | "terminal.ensure"
-    ) {
-        return None;
-    }
+/// The session a request targets. A client's environment reaches a session
+/// through any request that targets it, such as resuming it or starting its
+/// workflow from a script.
+fn target_session(request: &Request) -> Option<&str> {
     let target = request.args.get("session_id").and_then(Value::as_str);
     match (request.app_session_id.as_deref(), target) {
         (Some(scope), Some(target)) if scope != target => None,

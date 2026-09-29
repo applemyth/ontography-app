@@ -44,6 +44,8 @@ Commands accept an exact session ID or a unique exact name. IDs take precedence 
 
 The existing `ontography session …` forms remain supported. `session list` continues returning raw session records and selection as JSON. API calls themselves use durable IDs; name resolution belongs to the CLI.
 
+`ls`, `show`, and `session list` never start the server. With none running, they read saved sessions from disk and show that nothing runs: a session left active reads as `inactive` (`suspended` in JSON), its terminal and program as `stopped`, and an active graph as `suspended`. Other session commands and `call` start the server when none is running.
+
 `--project` chooses the project only during session creation. Existing attachments use the saved project. `--data-dir` selects the server/store. `--pi` selects the executable when creating a session terminal; a live terminal retains that choice for Pi reentry. Interactive creation requires a terminal before creating any session record; scripts use `new --no-attach`.
 
 Persisted selection records the most recently selected session. Closing that session clears selection. Every bare launch creates a new session regardless of selection, cwd, or list order. Each session owns its Pi state and optional graph; the background server hosts multiple sessions.
@@ -184,9 +186,26 @@ Removing a node requires removing its edges. `add` holds new nodes and edges, wi
 
 Server startup does not relaunch every saved session. Attachment explicitly resumes the selected graph. A live shell terminal is reused; only creation of a new terminal automatically starts Pi with its recorded conversation.
 
+The server keeps sessions running after their clients detach. After 30 seconds in which nothing runs (no session shell, active graph, or operation in progress) and no client is connected, it exits by itself. Saved sessions stay on disk, and the next command that needs the server starts the current build.
+
 Server/machine failure loses PTY resources and process memory. Recovery uses core's durable state and Pi history. Prepared rewrite plans and other transient handles expire across server replacement. General operation receipts are bounded and server-instance-local; reconcile uncertain accepted work against current graph state after restart.
 
 App-session fork/clone, archive/delete, complete portable backups, and multiple-controller/viewer attachment remain deferred. Native Pi conversation forks already operate within the existing graph.
+
+## Environment
+
+The background server outlives the terminal that started it, so it keeps only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `TMPDIR`, `LANG`, and `LC_*` for itself. Each session brings its own environment instead. Session commands and `call` send their terminal's environment; the first to reach a session, such as `attach` or a scripted `--session NAME call flow.start`, gives the session its environment, and its shell, Pi, agents, and command tasks start with it. Later commands do not change it. Suspending or closing the session forgets it; the next command brings its own.
+
+One rule drops the variables that describe the terminal or agent session a command was typed in:
+
+- terminal variables: `TERM`, `TERM_*`, `COLORTERM`, `TMUX*`, `ITERM_*`, `KITTY_*`, `VSCODE_*`, and those of other terminal programs. Each terminal the server creates sets its own `TERM`.
+- shell state: `PWD`, `OLDPWD`, `SHLVL`, and `_`.
+- variables Claude Code and Codex set for their own children, such as `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, and `CODEX_SANDBOX`.
+- every `ONTOGRAPHY_*` variable; the server sets its own. It gives the session's shell `ONTOGRAPHY_DATA_DIR`, so commands typed there reach the same store.
+
+Configuration such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, API keys, and `SSH_AUTH_SOCK` is kept.
+
+Environments are kept in memory only, never saved. Runs no session owns, started with an unscoped `call`, start with the server's own environment.
 
 ## Storage
 

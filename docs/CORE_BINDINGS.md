@@ -153,6 +153,10 @@ Implementation: [document](../src/workflow/document.rs),
 - Requests carry the expected server instance. A replacement server rejects
   stale requests before dispatch. Session-bound requests also carry
   `app_session_id`; the server fills omitted targets and rejects conflicts.
+- Command-line requests also carry the client's environment. The server keeps
+  it, in memory only, for the session a request targets when that session has
+  none yet. `system.hello` reports whether the server is `idle`, so a client of
+  another build can replace an idle server.
 - Accepted mutations retain `(client_id, request_id)` outcomes in a bounded
   server table. Identical retries return the original outcome; conflicting
   arguments reject. `operation.get` reports the receipt. Restart loses this
@@ -289,7 +293,8 @@ Other existing limits remain:
 | Incoming messages, exact receipts, lost acknowledgements, native queueing, and MCP replies | [delivery tests](../src/node_tool/tests/delivery.rs), [controller tests](../src/node_runtime/rpc.rs), [native Codex fixture](../src/node_runtime/codex/tests/native_delivery.rs) |
 | Workspace capture/reopen/export and no-clobber/path validation | [artifact tests](../src/workflow/artifacts.rs), [workspace flow](../tests/workflow_artifacts.rs) |
 | Session ownership, scoped targets, manager catalog, initialization recovery | [session ownership](../tests/session_ownership.rs), [catalog tests](../src/catalog.rs) |
-| Detached server lifetime, abrupt death, receipts, stale instances, multiplexing | [server process tests](../tests/server_lifecycle.rs) |
+| Detached server lifetime, idle exit, abrupt death, receipts, stale instances, multiplexing | [server process tests](../tests/server_lifecycle.rs), [idle exit](../tests/server_idle.rs) |
+| Session environments, the variables programs never inherit, reading sessions without a server | [session environments](../tests/session_environment.rs), [environment rule](../src/environment.rs), [session CLI](../tests/session_cli.rs) |
 | Malformed manifests isolated from healthy runs | [manifest recovery](../tests/state_recovery.rs) |
 | Manager PTY ownership, detach/reattach, graph control | [terminal backend](../src/terminal.rs), [terminal client](../src/terminal_client.rs) |
 | Retained core adapters, bounded content reads, workspace checkpoints | [tool module tests](../src/tools/), [management flow](../tests/management_flow.rs) |

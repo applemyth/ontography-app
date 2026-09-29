@@ -30,7 +30,7 @@ The worker relationship is node → execution → PTY → client view. Each node
 
 ## Implemented launch and initialization
 
-1. `ontography` connects to or starts the server for its canonical data directory.
+1. `ontography` connects to or starts the server for its canonical data directory, replacing an idle server of another build.
 2. Bare launch always creates a session with a reserved initial Pi conversation UUID and pending graph initialization. `new NAME` names it. `attach NAME_OR_ID` or bare `--session NAME_OR_ID` explicitly resumes an existing session. IDs take precedence; names must match exactly and uniquely. Persisted selection does not control default launch.
 3. Attachment resumes the selected graph when present and reuses its live shell terminal as-is. Creating a new terminal starts Pi with the saved active conversation. Only one controlling attachment is admitted per terminal.
 4. Pi's first scoped `run.start` or `project.start` persists a run identity and resolved initialization source before creating core storage. The resulting run is bound to the app session. Retry/recovery reuses that identity.
@@ -40,6 +40,8 @@ The worker relationship is node → execution → PTY → client view. Each node
 8. Shell `exit` causes server-side session suspension, including while detached. The session remains resumable and `ls` displays it as inactive; the API status is `suspended`.
 
 `session new --no-attach` creates records without starting Pi. Existing runs require explicit adoption into an uninitialized session with the same project; no old Pi ownership is inferred.
+
+The background server outlives the terminal that started it, so it keeps only a few basic variables such as `HOME` and `PATH` and never hands that terminal's environment to later sessions. A session's shell, Pi, agents, and command tasks start with the environment of the first client command to reach it, such as attaching or a scripted start; runs no session owns use the server's own. One rule drops the variables of the terminal or agent session a command was typed in, so a session attached from inside Claude Code does not pass on that session's messaging socket and token. Environments stay in memory and are forgotten when the session stops. [SESSIONS.md](SESSIONS.md#environment) gives the rule.
 
 Node creation commits through one core graph edit under the workflow edit policy, then reconciles agent execution. Initial graphs provision their agent sessions on startup. A startup failure preserves committed graph state and remains visible for recovery with `flow.resume`. Agent config changes restart its process; graph grants and scope update in place. Opening a worker view does not create a node, edge, or package delivery. See [WORKFLOWS.md](WORKFLOWS.md) for session configuration and delivery limits.
 
@@ -80,6 +82,7 @@ General accepted-operation receipts remain bounded and server-instance-local. Se
 | Session close | Stop manager; close graph admission; retain durable history and clear default selection if needed. |
 | Server stop | Settle accepted work, stop managers, suspend runs, retain records. |
 | Server restart | Load records; explicitly resume a selected session or attach to restore its graph and manager. |
+| Nothing runs and no client is connected for 30 seconds | The server exits. Records remain; the next command that needs a server starts one. |
 
 Session lifecycle admission serializes graph mutations with suspend/close. Observation waits release session-record/run locks so stop controls remain available. Manager launch/stop is serialized separately; final Pi metadata callbacks can finish without waiting on a held session-record lock.
 

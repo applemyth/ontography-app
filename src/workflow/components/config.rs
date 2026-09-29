@@ -131,7 +131,7 @@ pub struct McpServer {
     pub command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    /// Stored with the workflow; keep secrets in the server's environment.
+    /// Stored with each workflow that uses it; keep secrets out of it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }

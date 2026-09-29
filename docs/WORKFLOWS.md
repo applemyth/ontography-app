@@ -149,8 +149,8 @@ over its component's `config` as a JSON merge patch: objects merge by key,
 A list of MCP server names is read as a map first, so a node can add a server
 to its component's (`"mcp":{"docs":true}`) or remove one
 (`"mcp":{"github":null}`). Library components cannot reuse a built-in name.
-Server `env` values are stored in each workflow that uses them; keep secrets
-in the server's own environment instead.
+Server `env` values are stored in each workflow that uses them, so keep
+secrets out of them.
 
 A document's own `components` use the same format and may extend library
 components; their names cannot reuse an existing component's.
@@ -173,6 +173,13 @@ checkouts. Restarts retain this directory and resume the recorded
 conversation. `timeout_secs` belongs to command tasks and is rejected for
 agents.
 
+Agents and command tasks start with their session's environment: that of the
+terminal whose command first reached the session, such as `attach` or a
+scripted `call flow.start`, less the variables that describe that terminal or
+an enclosing agent session. So `PATH`, API keys, `CODEX_HOME`, and
+`CLAUDE_CONFIG_DIR` come from that terminal. A run no session owns uses the
+server's own environment. See [Environment](SESSIONS.md#environment).
+
 Initial and incoming graph work is delivered automatically as user messages in
 that conversation. The host begins an attempt using the existing join and retry
 rules, then supplies its `attempt_id`, `task_id`, sender names, input handles,
@@ -192,12 +199,15 @@ stops its processes and their child jobs.
 
 ### Codex
 
-The server needs Codex installed and authenticated; a configured `CODEX_HOME`
-must be absolute. Each Codex agent owns a long-lived `codex app-server` on a
-private Unix socket. With a terminal, a Codex client joins that server with
-`--remote` and resumes the exact saved conversation; closing that client
-leaves the server running, and Enter reconnects it. Headless, the server runs
-alone and logs to `codex-server.log` in the node's directory.
+The server needs Codex installed and authenticated. Codex finds its home
+through the session's environment: `CODEX_HOME`, which must be absolute, or
+`$HOME/.codex`. A node's saved conversation belongs to that home; starting the
+node later with a different one fails. Each Codex agent owns a long-lived
+`codex app-server` on a private Unix socket. With a terminal, a Codex client
+joins that server with `--remote` and resumes the exact saved conversation;
+closing that client leaves the server running, and Enter reconnects it.
+Headless, the server runs alone and logs to `codex-server.log` in the node's
+directory.
 
 Codex queues new messages while a turn is active and starts queued work when
 idle. A completed turn may leave its attempt open for later conversation;
@@ -227,7 +237,8 @@ alongside your own MCP servers, and the node's prompt with
 `--append-system-prompt`, re-read on every request so a changed prompt applies
 after a restart. It works in the node's private folder and may also use the
 node tools' checkouts. Variables an enclosing Claude Code session exports are
-removed, so a server started inside Claude Code still runs independent agents.
+dropped from the session's environment, so a session resumed or attached from
+inside Claude Code still runs independent agents.
 
 With a terminal, Claude runs in the node's terminal and reports what it is
 doing through hooks. Graph work is typed into its prompt only while it is idle:
