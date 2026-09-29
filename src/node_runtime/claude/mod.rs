@@ -25,22 +25,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Variables an enclosing Claude Code session exports for its own children.
-/// Removing them lets a server started inside Claude Code launch independent
-/// sessions; Claude's configuration, such as CLAUDE_CONFIG_DIR, is kept.
-const INHERITED: [&str; 10] = [
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_PID",
-    "CLAUDE_EFFORT",
-];
-
 // All dynamic values are positional parameters, never shell source. `start`
 // begins the conversation under its saved ID, or resumes it once Claude has
 // accepted a prompt. The marker and Claude's transcript can disagree after a
@@ -221,7 +205,7 @@ impl Plan {
     fn script(&self, body: &str, program: &Path) -> Vec<String> {
         vec![
             "-c".into(),
-            format!("umask 077\nunset {}{START}{body}", INHERITED.join(" ")),
+            format!("umask 077\n{START}{body}"),
             "ontography-claude".into(),
             program.to_string_lossy().into_owned(),
             self.session_id.clone(),

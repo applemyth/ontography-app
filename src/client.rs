@@ -1,3 +1,4 @@
+use crate::environment::Environment;
 use crate::protocol::{MAX_FRAME_BYTES, Request, Response, VERSION, read_frame};
 use crate::{AppError, Result};
 use serde_json::Value;
@@ -14,6 +15,7 @@ pub struct Client {
     client_id: String,
     server_id: String,
     app_session_id: Option<String>,
+    environment: Option<Environment>,
 }
 
 impl Client {
@@ -24,8 +26,15 @@ impl Client {
             || hello["app_build"] != crate::APP_BUILD
             || hello["core_build"] != crate::CORE_BUILD
         {
-            return Err(AppError::new("incompatible_server", "the existing server uses a different app/core build; run `ontography server stop` with the same --data-dir, then retry to start the current build")
-                .details(serde_json::json!({"server_id":client.server_id,"expected_app":env!("CARGO_PKG_VERSION"),"actual_app":hello["app_version"],"expected_core":ontography::VERSION,"actual_core":hello["core_version"],"expected_app_build":crate::APP_BUILD,"actual_app_build":hello["app_build"],"expected_core_build":crate::CORE_BUILD,"actual_core_build":hello["core_build"]})));
+            // Servers before idle reporting never say they are idle.
+            let idle = hello["idle"] == true;
+            let message = if idle {
+                "the running server is an idle one from another build"
+            } else {
+                "the running server is from another build and may have sessions running; run `ontography server stop` with the same --data-dir, which suspends them, then retry"
+            };
+            return Err(AppError::new("incompatible_server", message)
+                .details(serde_json::json!({"server_id":client.server_id,"idle":idle,"expected_app":env!("CARGO_PKG_VERSION"),"actual_app":hello["app_version"],"expected_core":ontography::VERSION,"actual_core":hello["core_version"],"expected_app_build":crate::APP_BUILD,"actual_app_build":hello["app_build"],"expected_core_build":crate::CORE_BUILD,"actual_core_build":hello["core_build"]})));
         }
         Ok(client)
     }
@@ -44,6 +53,7 @@ impl Client {
             client_id: uuid::Uuid::new_v4().to_string(),
             server_id: String::new(),
             app_session_id: None,
+            environment: None,
         };
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -91,6 +101,15 @@ impl Client {
         }
     }
 
+    /// A client whose requests carry `environment`: the programs of a session
+    /// it activates start with it.
+    pub fn with_environment(&self, environment: Environment) -> Self {
+        Self {
+            environment: Some(environment),
+            ..self.clone()
+        }
+    }
+
     pub async fn call(&self, operation: &str, args: Value) -> Result<Value> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.request(operation, args, request_id)
@@ -116,6 +135,10 @@ impl Client {
                 Some(self.server_id.clone())
             },
             args,
+            environment: self
+                .environment
+                .as_ref()
+                .map(|environment| environment.vars().clone()),
         };
         request.validate()?;
         // Validate/encode before opening the connection: these failures cannot dispatch work.

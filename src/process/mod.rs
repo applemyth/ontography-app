@@ -17,7 +17,7 @@ mod piped;
 
 pub(crate) use lease::lease_process;
 pub use lease::recover_process;
-pub use piped::{Stdin, SupervisedProcess, spawn_supervised, spawn_supervised_with_env};
+pub use piped::{Stdin, SupervisedProcess, spawn_supervised};
 
 use crate::AppError;
 

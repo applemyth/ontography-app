@@ -1,6 +1,7 @@
 use crate::{AppError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const VERSION: u32 = 1;
@@ -20,6 +21,11 @@ pub struct Request {
     pub expected_server_id: Option<String>,
     #[serde(default = "empty_object")]
     pub args: Value,
+    /// The client's environment, for the programs of a session this request
+    /// activates. Only the command line sends it, and never in a handshake,
+    /// which must stay readable by servers of other builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<BTreeMap<String, String>>,
 }
 
 fn empty_object() -> Value {

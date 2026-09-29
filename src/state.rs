@@ -1,6 +1,7 @@
 //! Server ownership of core objects. Connections never own graph resources.
 use crate::declarations::{CompiledGraph, GraphDeclaration};
 use crate::definition::RunDefinition;
+use crate::environment::Environment;
 use crate::persistence::{Paths, read_json, write_json};
 use crate::workspace::{Checkout, WorkspaceStore};
 use crate::{AppError, Result, views};
@@ -137,6 +138,9 @@ pub struct ManagedRun {
     pub registry: Arc<crate::registry::ImplementationRegistry>,
     /// Preserve user checkouts while a faulted core owner is reopened.
     pub recovery_checkouts: BTreeMap<String, WorkspaceHandle>,
+    /// What its programs start with: its session's environment, or the
+    /// server's for a run no session owns. Kept in memory only.
+    pub environment: Environment,
 }
 
 impl ManagedRun {
@@ -424,6 +428,8 @@ pub struct Service {
     pub registry: Arc<crate::registry::ImplementationRegistry>,
     pub recovery_errors: BTreeMap<String, AppError>,
     pub sessions: crate::sessions::Sessions,
+    /// The server's own environment, for work no session owns.
+    pub environment: Environment,
 }
 
 /// The runtime for a compiled run. Workflow runs accept only their editor's
@@ -464,6 +470,7 @@ impl Service {
         paths: Paths,
         registry: Arc<crate::registry::ImplementationRegistry>,
     ) -> Result<Self> {
+        let environment = Environment::current();
         let mut runs = BTreeMap::new();
         let mut recovery_errors = BTreeMap::new();
         for entry in std::fs::read_dir(paths.root.join("runs"))? {
@@ -492,6 +499,7 @@ impl Service {
                             live: None,
                             registry: registry.clone(),
                             recovery_checkouts: BTreeMap::new(),
+                            environment: environment.clone(),
                         })),
                     );
                 }
@@ -508,7 +516,26 @@ impl Service {
             registry,
             recovery_errors,
             sessions,
+            environment,
         })
+    }
+
+    /// Whether any run is open. Never waits: a run busy with an operation
+    /// counts as open.
+    pub fn has_live_runs(&self) -> bool {
+        self.runs.try_lock().map_or(true, |runs| {
+            runs.values()
+                .any(|run| run.try_lock().map_or(true, |run| run.live.is_some()))
+        })
+    }
+
+    /// The environment a session's programs start with: its client's, or the
+    /// server's if no client has given it one.
+    pub async fn session_environment(&self, id: &str) -> Environment {
+        self.sessions
+            .environment(id)
+            .await
+            .unwrap_or_else(|| self.environment.clone())
     }
 
     pub async fn run(&self, id: &str) -> Result<Arc<Mutex<ManagedRun>>> {
@@ -521,18 +548,25 @@ impl Service {
     }
 
     pub async fn start(&self, declaration: GraphDeclaration, project: PathBuf) -> Result<Value> {
-        self.start_reserved(&uuid::Uuid::new_v4().to_string(), declaration, project)
-            .await
+        self.start_reserved(
+            &uuid::Uuid::new_v4().to_string(),
+            declaration,
+            project,
+            self.environment.clone(),
+        )
+        .await
     }
 
-    /// Reconcile a durably reserved identity without creating another run on retry.
+    /// Reconcile a durably reserved identity without creating another run on
+    /// retry. The run's programs start with `environment`.
     pub async fn start_reserved(
         &self,
         id: &str,
         declaration: GraphDeclaration,
         project: PathBuf,
+        environment: Environment,
     ) -> Result<Value> {
-        self.start_reserved_inner(id, declaration, project, None)
+        self.start_reserved_inner(id, declaration, project, None, environment)
             .await
     }
 
@@ -542,8 +576,9 @@ impl Service {
         declaration: GraphDeclaration,
         project: PathBuf,
         workflow: crate::workflow::runtime::InitialWorkflow,
+        environment: Environment,
     ) -> Result<Value> {
-        self.start_reserved_inner(id, declaration, project, Some(workflow))
+        self.start_reserved_inner(id, declaration, project, Some(workflow), environment)
             .await
     }
 
@@ -553,6 +588,7 @@ impl Service {
         declaration: GraphDeclaration,
         project: PathBuf,
         workflow: Option<crate::workflow::runtime::InitialWorkflow>,
+        environment: Environment,
     ) -> Result<Value> {
         let compiled = declaration.compile().map_err(AppError::core)?;
         if workflow.is_none() {
@@ -575,6 +611,7 @@ impl Service {
                     "reserved run identity has different initialization data",
                 ));
             }
+            run.environment = environment;
             if run.live.is_none()
                 && !run.directory.join("core").exists()
                 && run.manifest.status == "creating"
@@ -623,6 +660,7 @@ impl Service {
             live: None,
             registry: self.registry.clone(),
             recovery_checkouts: BTreeMap::new(),
+            environment,
         }));
         self.runs.lock().await.insert(id.into(), run.clone());
         let mut run = run.lock().await;
@@ -659,6 +697,7 @@ impl Service {
             declaration,
             project,
             input,
+            self.environment.clone(),
         )
         .await
     }
@@ -669,6 +708,7 @@ impl Service {
         declaration: crate::application::ApplicationDeclaration,
         project: PathBuf,
         input: ontography::Payload,
+        environment: Environment,
     ) -> Result<Value> {
         let project = std::fs::canonicalize(project)?;
         if !project.is_dir() {
@@ -686,6 +726,7 @@ impl Service {
                     "reserved application identity has different initialization data",
                 ));
             }
+            run.environment = environment;
             let application_runs = run.directory.join("application/runs");
             let has_core_run =
                 application_runs.exists() && std::fs::read_dir(&application_runs)?.next().is_some();
@@ -738,6 +779,7 @@ impl Service {
             live: None,
             registry: self.registry.clone(),
             recovery_checkouts: BTreeMap::new(),
+            environment,
         }));
         self.runs.lock().await.insert(id.into(), run.clone());
         let mut run = run.lock().await;

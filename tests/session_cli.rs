@@ -34,6 +34,7 @@ if [ "$1" = --version ]; then echo 0.85.1; exit; fi
 base=$(dirname "$0")
 launch="$base/launches/$ONTOGRAPHY_SESSION_ID/$$"
 mkdir -p "$launch"
+env > "$launch/env"
 printf '%s\000' "$@" > "$launch/args"
 printf '%s\n' "$ONTOGRAPHY_SESSION_ID" > "$launch/session"
 stty size > "$launch/size"
@@ -91,6 +92,11 @@ done
     }
 
     async fn output(&self, args: &[&str]) -> Output {
+        self.output_with(args, &[]).await
+    }
+
+    /// Runs the CLI with `env` added to this test's environment.
+    async fn output_with(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         tokio::time::timeout(
             Duration::from_secs(20),
             tokio::process::Command::new(&self.binary)
@@ -98,6 +104,7 @@ done
                 .arg(&self.paths.root)
                 .current_dir(self.directory.path())
                 .args(args)
+                .envs(env.iter().copied())
                 .stdin(Stdio::null())
                 .kill_on_drop(true)
                 .output(),
@@ -108,7 +115,11 @@ done
     }
 
     async fn cli(&self, args: &[&str]) -> Value {
-        let output = self.output(args).await;
+        self.cli_with(args, &[]).await
+    }
+
+    async fn cli_with(&self, args: &[&str], env: &[(&str, &str)]) -> Value {
+        let output = self.output_with(args, env).await;
         assert!(
             output.status.success(),
             "{args:?}: {}",
@@ -262,6 +273,11 @@ struct TerminalClient {
 
 impl TerminalClient {
     fn start(fixture: &Fixture, args: &[&str]) -> Self {
+        Self::start_with(fixture, args, &[])
+    }
+
+    /// Starts the CLI in a terminal with `env` added to this test's environment.
+    fn start_with(fixture: &Fixture, args: &[&str], env: &[(&str, &str)]) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -278,6 +294,9 @@ impl TerminalClient {
         command.args(args);
         command.cwd(fixture.directory.path());
         command.env("TERM", "xterm-256color");
+        for (name, value) in env {
+            command.env(name, value);
+        }
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -378,6 +397,76 @@ impl Drop for TerminalClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reading_sessions_never_starts_a_server() {
+    let fixture = Fixture::new();
+    let listed = fixture.output(&["ls"]).await;
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("No sessions"));
+    assert!(
+        !fixture.paths.socket.exists(),
+        "listing must not start a server"
+    );
+    // A session left active when its server stopped reads as not running.
+    fixture.cli(&["new", "kept", "--no-attach"]).await;
+    fixture.cli(&["server", "stop"]).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.paths.socket.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stopped server must remove its socket");
+    assert_eq!(fixture.cli(&["show", "kept"]).await["status"], "suspended");
+    let listed = fixture.output(&["ls"]).await;
+    let table = String::from_utf8(listed.stdout).unwrap();
+    assert!(
+        table.contains("kept") && table.contains("inactive") && table.contains("stopped"),
+        "{table}"
+    );
+    assert!(
+        !fixture.paths.socket.exists(),
+        "reading must not start a server"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pi_runs_with_the_attaching_terminals_environment() {
+    let fixture = Fixture::new();
+    // The server starts from inside an agent session, with its own variables.
+    let created = fixture
+        .cli_with(
+            &["new", "--no-attach"],
+            &[
+                ("SESSION_MARKER", "starter"),
+                ("CLAUDECODE", "1"),
+                ("CLAUDE_CODE_MESSAGING_TOKEN", "secret"),
+            ],
+        )
+        .await;
+    let id = created["session_id"].as_str().unwrap();
+    // Another terminal, itself inside an agent session, attaches.
+    let mut terminal = TerminalClient::start_with(
+        &fixture,
+        &["attach", id],
+        &[("SESSION_MARKER", "attacher"), ("CLAUDECODE", "1")],
+    );
+    terminal.ready_before_selection().await;
+    let status = fixture.mode(id, "pi").await;
+    let path = fixture.launch_dir(id, &status).join("env");
+    wait_file(&path).await;
+    let environment = std::fs::read_to_string(path).unwrap();
+    let has = |line: &str| environment.lines().any(|found| found == line);
+    assert!(has("SESSION_MARKER=attacher"), "{environment}");
+    assert!(has("TERM=xterm-256color"), "{environment}");
+    for absent in ["CLAUDECODE=", "CLAUDE_CODE_MESSAGING_TOKEN="] {
+        assert!(
+            !environment.lines().any(|line| line.starts_with(absent)),
+            "{absent} must not reach Pi: {environment}"
+        );
     }
 }
 

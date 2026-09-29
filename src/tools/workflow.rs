@@ -720,6 +720,7 @@ pub(crate) mod tests {
             live: Some(LiveRun::new(runtime, session)),
             recovery_checkouts: BTreeMap::new(),
             registry: std::sync::Arc::new(crate::registry::ImplementationRegistry::default()),
+            environment: crate::environment::Environment::current(),
         }
     }
 

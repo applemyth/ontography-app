@@ -165,6 +165,7 @@ async fn lost_response_is_recoverable_and_request_identity_prevents_duplicate_mu
     let fixture = Fixture::new();
     let client = fixture.start().await;
     let request = Request {
+        environment: None,
         app_session_id: None,
         version: protocol::VERSION,
         client_id: uuid::Uuid::new_v4().to_string(),
@@ -443,6 +444,7 @@ async fn completing_one_request_does_not_drop_the_partial_frame_of_the_next() {
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let first = Request {
+        environment: None,
         app_session_id: None,
         version: protocol::VERSION,
         client_id: uuid::Uuid::new_v4().to_string(),
@@ -452,6 +454,7 @@ async fn completing_one_request_does_not_drop_the_partial_frame_of_the_next() {
         args: json!({"declaration":declaration(),"project":fixture.directory.path()}),
     };
     let next = Request {
+        environment: None,
         request_id: uuid::Uuid::new_v4().to_string(),
         operation: "system.status".into(),
         args: json!({}),
@@ -508,6 +511,7 @@ async fn status_and_receipt_bypass_a_long_wait_on_the_same_connection() {
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let wait = Request {
+        environment: None,
         app_session_id: None,
         version: protocol::VERSION,
         client_id: client.client_id().into(),
@@ -517,12 +521,14 @@ async fn status_and_receipt_bypass_a_long_wait_on_the_same_connection() {
         args: json!({"run_id":started["run_id"],"after_revision":"0","timeout_ms":30000}),
     };
     let status = Request {
+        environment: None,
         request_id: uuid::Uuid::new_v4().to_string(),
         operation: "system.status".into(),
         args: json!({}),
         ..wait.clone()
     };
     let receipt = Request {
+        environment: None,
         request_id: uuid::Uuid::new_v4().to_string(),
         operation: "operation.get".into(),
         args: json!({"client_id":client.client_id(),"request_id":start_id}),
@@ -581,6 +587,7 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
     let client = fixture.start().await;
     let run_id = create_run(&client, fixture.directory.path()).await;
     let committed = Request {
+        environment: None,
         app_session_id: None,
         version: protocol::VERSION,
         client_id: client.client_id().into(),

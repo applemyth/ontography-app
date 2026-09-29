@@ -150,13 +150,13 @@ mod tests {
     use super::*;
     use crate::process::recover_process;
     use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-    use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
 
     fn spec(directory: &Path, script: &str) -> LaunchSpec {
         LaunchSpec {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
-            env: BTreeMap::new(),
+            env: crate::environment::Environment::current().vars().clone(),
             cwd: directory.into(),
             rows: 24,
             cols: 80,

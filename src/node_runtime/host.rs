@@ -5,7 +5,7 @@
 use super::process::Lifetime;
 use crate::{
     AppError, Result,
-    process::{Stdin, SupervisedProcess, spawn_supervised_with_env},
+    process::{Stdin, SupervisedProcess, spawn_supervised},
     terminal::{LaunchSpec, Terminal},
 };
 use std::{
@@ -58,7 +58,7 @@ impl Host {
         log: &Path,
         read_output: bool,
     ) -> Result<(Self, Pipes)> {
-        let mut process = spawn_supervised_with_env(argv, cwd, directory, env, stdin).await?;
+        let mut process = spawn_supervised(argv, cwd, directory, env, stdin).await?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

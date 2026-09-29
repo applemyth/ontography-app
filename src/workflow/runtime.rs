@@ -293,6 +293,7 @@ pub async fn reconcile(
             NodeRuntime::new(
                 project.clone(),
                 directory.clone(),
+                run.environment.clone(),
                 session.clone(),
                 scope_receiver,
                 ledger.clone(),
@@ -308,14 +309,18 @@ pub async fn reconcile(
                 .map_err(AppError::core)?
         } else {
             let worker_ledger = ledger.clone();
+            let place = harness::Place {
+                project: project.clone(),
+                directory: directory.clone(),
+                environment: run.environment.clone(),
+            };
             run.live()?
                 .host
                 .launch(id.as_str(), move |context| {
                     harness::run(
                         context,
                         receiver.clone(),
-                        project.clone(),
-                        directory.clone(),
+                        place.clone(),
                         input.clone(),
                         session.clone(),
                         worker_ledger.clone(),

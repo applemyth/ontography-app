@@ -297,11 +297,23 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             };
             drop(run);
             service
-                .start_workflow_reserved(&id, declaration, project, initial)
+                .start_workflow_reserved(
+                    &id,
+                    declaration,
+                    project,
+                    initial,
+                    service.environment.clone(),
+                )
                 .await?;
         } else {
             service
-                .start_workflow_reserved(&id, declaration, project, initial)
+                .start_workflow_reserved(
+                    &id,
+                    declaration,
+                    project,
+                    initial,
+                    service.environment.clone(),
+                )
                 .await?;
         }
         return status(&*service.run(&id).await?.lock().await).await;

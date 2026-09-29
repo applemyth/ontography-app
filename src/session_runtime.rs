@@ -186,6 +186,12 @@ impl Managers {
         Ok(())
     }
 
+    /// Whether any session's shell is running, or one is being started or
+    /// stopped. Never waits: a launch holds the lock while its shell starts.
+    pub fn any(&self) -> bool {
+        self.live.try_lock().map_or(true, |live| !live.is_empty())
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         let mut managers = self.live.lock().await;
         let mut first = None;

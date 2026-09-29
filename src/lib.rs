@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod client;
 pub mod declarations;
 pub mod definition;
+pub mod environment;
 pub mod error;
 pub mod launcher;
 pub mod logging;

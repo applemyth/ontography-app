@@ -123,8 +123,10 @@ impl ManagedShell {
                 "resume the Ontography session before starting its shell",
             ));
         }
+        // The shell, and Pi within it, start with the session's environment.
+        let environment = service.session_environment(session_id).await;
         // Check the configured executable before leaving a durable shell running.
-        launcher::pi_command(&service.paths, &record.project, &pi, false).await?;
+        launcher::pi_command(&service.paths, &record.project, &pi, &environment, false).await?;
         let generation = uuid::Uuid::new_v4().to_string();
         let socket = lease_socket(&service.paths, &generation)?;
         let listener = UnixListener::bind(&socket)?;
@@ -158,14 +160,19 @@ impl ManagedShell {
                 rc.to_string_lossy().into_owned(),
                 "-i".into(),
             ],
-            env: BTreeMap::from([
-                ("BASH_SILENCE_DEPRECATION_WARNING".into(), "1".into()),
-                ("ONTOGRAPHY_SESSION_ID".into(), session_id.into()),
-                (
-                    "ONTOGRAPHY_SOCKET".into(),
-                    service.paths.socket.to_string_lossy().into_owned(),
-                ),
-            ]),
+            env: environment
+                .vars()
+                .clone()
+                .into_iter()
+                .chain([
+                    ("BASH_SILENCE_DEPRECATION_WARNING".into(), "1".into()),
+                    ("ONTOGRAPHY_SESSION_ID".into(), session_id.into()),
+                    (
+                        "ONTOGRAPHY_SOCKET".into(),
+                        service.paths.socket.to_string_lossy().into_owned(),
+                    ),
+                ])
+                .collect(),
             cwd: record.project,
             rows,
             cols,
@@ -259,6 +266,7 @@ impl ManagedShell {
             &service.paths,
             &record.project,
             &self.pi,
+            &service.session_environment(&self.session_id).await,
             &PiSessionLaunch {
                 session_id: self.session_id.clone(),
                 conversations_dir: service.sessions.conversations_dir(&self.session_id)?,

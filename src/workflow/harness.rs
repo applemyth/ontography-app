@@ -6,6 +6,7 @@ use super::{
     document::{DocumentNode, WorkflowPayload},
     tasks::{self, RetryLedger, Task},
 };
+use crate::environment::Environment;
 use crate::persistence::write_json;
 use crate::process::{Stdin, recover_process, spawn_supervised};
 use crate::workspace::{AttemptCheckout, WorkspaceStore};
@@ -34,6 +35,15 @@ fn failure(error: impl std::fmt::Display) -> ExecutionFailure {
     ExecutionFailure::new("workflow_worker", error.to_string())
 }
 
+/// Where a task worker runs: the project its commands work in by default, its
+/// node's own directory, and the environment its commands start with.
+#[derive(Clone)]
+pub struct Place {
+    pub project: PathBuf,
+    pub directory: PathBuf,
+    pub environment: Environment,
+}
+
 /// Settings are sampled before each task; an in-flight task keeps its settings.
 /// Human and inbox work remains pending for document-level interaction tools.
 /// A failed task is counted in the node's retry ledger and waits out its
@@ -41,16 +51,16 @@ fn failure(error: impl std::fmt::Display) -> ExecutionFailure {
 pub async fn run(
     mut context: ExecutionContext,
     mut settings: watch::Receiver<BoundNode>,
-    project: PathBuf,
-    directory: PathBuf,
+    place: Place,
     mut initial: Option<Payload>,
     session: SessionHandle,
     ledger: Arc<RetryLedger>,
 ) -> WorkerResult<()> {
-    tokio::fs::create_dir_all(&directory)
+    let directory = &place.directory;
+    tokio::fs::create_dir_all(directory)
         .await
         .map_err(failure)?;
-    recover_process(&directory).await?;
+    recover_process(directory).await?;
     let workspaces = WorkspaceStore::new(
         context.content_store().await.map_err(failure)?,
         directory.join("workspaces"),
@@ -72,13 +82,13 @@ pub async fn run(
         ledger.renew(&definition).map_err(failure)?;
         // Only retry decisions made after this point wake an idle worker.
         retries.mark_unchanged();
-        if initial.is_some() && super::runtime::initial_complete(&directory).map_err(failure)? {
+        if initial.is_some() && super::runtime::initial_complete(directory).map_err(failure)? {
             initial = None;
         }
         if matches!(node.binding.implementation, Implementation::Inbox(_))
             && let Some(input) = initial.take()
         {
-            accept_initial_sink(&context, &node.node, &directory, input).await?;
+            accept_initial_sink(&context, &node.node, directory, input).await?;
         }
         // Human and inbox work waits for the manager.
         if node.binding.implementation.command().is_none() {
@@ -108,7 +118,7 @@ pub async fn run(
             continue;
         }
         // The manager may have discarded the initial input since it was offered.
-        if task.is_initial() && super::runtime::initial_complete(&directory).map_err(failure)? {
+        if task.is_initial() && super::runtime::initial_complete(directory).map_err(failure)? {
             initial = None;
             continue;
         }
@@ -137,22 +147,13 @@ pub async fn run(
                 continue;
             }
         };
-        let outcome = perform(
-            &context,
-            &invocation,
-            &node,
-            &project,
-            &directory,
-            &workspaces,
-            &payloads,
-        )
-        .await;
+        let outcome = perform(&context, &invocation, &node, &place, &workspaces, &payloads).await;
         match outcome {
             Ok(()) => {
                 if task.is_initial() {
                     // Core's accepted invocation is authoritative if this
                     // disposable completion marker cannot be written.
-                    let _ = super::runtime::complete_initial(&directory);
+                    let _ = super::runtime::complete_initial(directory);
                     initial = None;
                 }
                 // Accepted inputs are consumed, so a record left behind by a
@@ -162,7 +163,7 @@ pub async fn run(
             Err(error) if context.stop().is_requested() => {
                 // A stop interrupts the attempt; it is not the task's failure.
                 let _ = invocation.interrupt(error.message()).await;
-                report_failure(&directory, &invocation, &node.node, &error);
+                report_failure(directory, &invocation, &node.node, &error);
                 return Ok(());
             }
             Err(error) => {
@@ -171,7 +172,7 @@ pub async fn run(
                 let recorded =
                     ledger.record_failure(&task, error.message(), true, &policy, &definition);
                 let _ = invocation.fail(error.message()).await;
-                report_failure(&directory, &invocation, &node.node, &error);
+                report_failure(directory, &invocation, &node.node, &error);
                 recorded.map_err(failure)?;
             }
         }
@@ -366,11 +367,11 @@ async fn perform(
     context: &ExecutionContext,
     invocation: &InvocationHandle,
     node: &BoundNode,
-    project: &Path,
-    directory: &Path,
+    place: &Place,
     workspaces: &WorkspaceStore,
     payloads: &[Payload],
 ) -> WorkerResult<()> {
+    let directory = place.directory.as_path();
     let command = node
         .binding
         .implementation
@@ -398,7 +399,7 @@ async fn perform(
         .map_err(failure)?;
     let cwd = workspace
         .as_ref()
-        .map_or(project, |(checkout, _)| checkout.path());
+        .map_or(place.project.as_path(), |(checkout, _)| checkout.path());
     let output = process(
         context,
         ProcessInput {
@@ -408,6 +409,7 @@ async fn perform(
             command,
             cwd,
             directory,
+            environment: &place.environment,
             input: input.into_bytes(),
         },
     )
@@ -520,6 +522,7 @@ struct ProcessInput<'a> {
     command: &'a CommandConfig,
     cwd: &'a Path,
     directory: &'a Path,
+    environment: &'a Environment,
     input: Vec<u8>,
 }
 
@@ -547,6 +550,7 @@ async fn process(
         command,
         cwd,
         directory,
+        environment,
         input,
     } = request;
     let argv = &command.argv;
@@ -554,7 +558,14 @@ async fn process(
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| failure("Worker timeout is too large"))?;
-    let mut supervised = spawn_supervised(argv, cwd, directory, Stdin::Bytes(&input)).await?;
+    let mut supervised = spawn_supervised(
+        argv,
+        cwd,
+        directory,
+        environment.vars(),
+        Stdin::Bytes(&input),
+    )
+    .await?;
     let stdout = supervised.stdout.take().expect("piped stdout");
     let stderr = supervised.stderr.take().expect("piped stderr");
     let mut stop = context.stop();
@@ -617,8 +628,11 @@ mod tests {
                 run(
                     context,
                     settings.clone(),
-                    project.clone(),
-                    directory.clone(),
+                    Place {
+                        project: project.clone(),
+                        directory: directory.clone(),
+                        environment: Environment::current(),
+                    },
                     initial.clone(),
                     session.clone(),
                     worker_ledger.clone(),

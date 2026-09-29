@@ -33,6 +33,8 @@ const SCROLLBACK: usize = 1_000;
 pub struct LaunchSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
+    /// The program's whole environment: nothing is inherited from the
+    /// server. The terminal adds its own description on top.
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
     pub rows: u16,
@@ -571,26 +573,15 @@ impl Terminal {
             let mut command = CommandBuilder::new(&spawn_spec.program);
             command.args(&spawn_spec.args);
             command.cwd(&spawn_spec.cwd);
-            // Advertise the virtual terminal, rather than unsupported capabilities
-            // inherited from a GUI terminal which launched the background server.
-            for name in [
-                "TERM_PROGRAM",
-                "TERM_PROGRAM_VERSION",
-                "KITTY_WINDOW_ID",
-                "WEZTERM_PANE",
-                "ITERM_SESSION_ID",
-                "TMUX",
-                "STY",
-            ] {
-                command.env_remove(name);
+            command.env_clear();
+            for (key, value) in spawn_spec.env {
+                command.env(key, value);
             }
+            // Describe this virtual terminal, whatever terminal its user has.
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");
             command.env("PI_IMAGE_PROTOCOL", "none");
             command.env("PI_HYPERLINKS", "0");
-            for (key, value) in spawn_spec.env {
-                command.env(key, value);
-            }
             let reader = pair.master.try_clone_reader().map_err(pty_error)?;
             let writer = pair.master.take_writer().map_err(pty_error)?;
             if let Some(fd) = pair.master.as_raw_fd() {
@@ -1301,7 +1292,7 @@ mod tests {
             LaunchSpec {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), command.into()],
-                env: BTreeMap::new(),
+                env: crate::environment::Environment::current().vars().clone(),
                 cwd: directory.into(),
                 rows: 24,
                 cols: 80,

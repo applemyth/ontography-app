@@ -1,4 +1,4 @@
-use crate::{AppError, Result, client::Client, persistence::Paths};
+use crate::{AppError, Result, client::Client, environment::Environment, persistence::Paths};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -7,6 +7,11 @@ use std::{
 use tokio::process::Command;
 
 pub const PI_VERSION: &str = "0.85.1";
+
+/// How long Pi may take to report its version. The check catches a missing or
+/// wrong Pi; macOS can hold a program's first start for several seconds, such
+/// as after installing a build, and that must not fail a session.
+const VERSION_CHECK: Duration = Duration::from_secs(30);
 
 /// Integration tests host a server in a test executable under `deps`; its shell
 /// children must still enter the actual application's hidden launcher command.
@@ -53,9 +58,10 @@ pub async fn pi_session_command(
     paths: &Paths,
     project: &Path,
     executable: &Path,
+    environment: &Environment,
     session: &PiSessionLaunch,
 ) -> Result<Command> {
-    let mut command = pi_command(paths, project, executable, false).await?;
+    let mut command = pi_command(paths, project, executable, environment, false).await?;
     command
         .env("ONTOGRAPHY_SESSION_ID", &session.session_id)
         .env("ONTOGRAPHY_TERMINAL", "1")
@@ -69,17 +75,41 @@ pub async fn pi_session_command(
     Ok(command)
 }
 
-pub async fn ensure_server(paths: &Paths) -> Result<Client> {
+/// The running server of this build, if one runs. An idle server of another
+/// build is stopped, so the current build can take its place; one that may
+/// have sessions running is left alone.
+pub async fn connect_current(paths: &Paths) -> Result<Option<Client>> {
     match Client::connect(&paths.socket).await {
-        Ok(client) => return Ok(client),
-        Err(error) if error.code == "io_error" => {}
-        Err(error) => return Err(error),
+        Ok(client) => Ok(Some(client)),
+        Err(error) if error.code == "io_error" => Ok(None),
+        Err(error)
+            if error.code == "incompatible_server"
+                && error
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details["idle"] == true) =>
+        {
+            Client::stop_server(&paths.socket).await?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Connect to this build's server, starting one if none runs. The server
+/// keeps only what it needs of this process's environment; the sessions a
+/// client activates bring their own.
+pub async fn ensure_server(paths: &Paths) -> Result<Client> {
+    if let Some(client) = connect_current(paths).await? {
+        return Ok(client);
     }
     let log = paths.root.join("logs/server.log");
     let mut child = Command::new(std::env::current_exe()?)
         .arg("--data-dir")
         .arg(&paths.root)
         .args(["server", "run", "--detach"])
+        .env_clear()
+        .envs(Environment::current().for_server())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .stdout(Stdio::null())
@@ -87,7 +117,8 @@ pub async fn ensure_server(paths: &Paths) -> Result<Client> {
     for _ in 0..100 {
         match Client::connect(&paths.socket).await {
             Ok(client) => return Ok(client),
-            Err(error) if error.code == "io_error" => {}
+            // An idle server that was just stopped may answer until it exits.
+            Err(error) if matches!(error.code.as_str(), "io_error" | "incompatible_server") => {}
             Err(error) => return Err(error),
         }
         if let Some(status) = child.try_wait()? {
@@ -108,16 +139,21 @@ pub async fn ensure_server(paths: &Paths) -> Result<Client> {
     ))
 }
 
+/// Native Pi's command, after checking its version in `environment`, the
+/// environment Pi will run with.
 pub async fn pi_command(
     paths: &Paths,
     project: &Path,
     executable: &Path,
+    environment: &Environment,
     rpc: bool,
 ) -> Result<Command> {
     let output = tokio::time::timeout(
-        Duration::from_secs(5),
+        VERSION_CHECK,
         Command::new(executable)
             .arg("--version")
+            .env_clear()
+            .envs(environment.vars())
             .kill_on_drop(true)
             .output(),
     )

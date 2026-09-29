@@ -6,6 +6,7 @@
 use super::rpc::Rpc;
 use crate::{
     AppError, Result,
+    environment::Environment,
     node_tool::NodeToolContext,
     persistence::{read_json, write_json},
     terminal::LaunchSpec,
@@ -80,16 +81,24 @@ pub(super) struct Plan {
 }
 
 impl Plan {
+    /// Codex finds the user's own configuration through `environment`, the
+    /// environment it will run with.
     pub fn new(
         node_id: &str,
         config: &AgentConfig,
         directory: &Path,
         cwd: &Path,
         endpoint: &Path,
+        environment: &Environment,
     ) -> Result<Self> {
-        let native_home = std::env::var_os("CODEX_HOME")
+        let native_home = environment
+            .get("CODEX_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .or_else(|| {
+                environment
+                    .get("HOME")
+                    .map(|home| Path::new(home).join(".codex"))
+            })
             .ok_or_else(|| error("Codex requires HOME or CODEX_HOME"))?;
         Self::with_home(node_id, config, directory, cwd, endpoint, &native_home)
     }

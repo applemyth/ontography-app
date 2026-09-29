@@ -860,7 +860,6 @@ mod tests {
         use crate::terminal::{LaunchSpec, Terminal, VERSION};
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         use std::{
-            collections::BTreeMap,
             io::Read,
             os::unix::fs::PermissionsExt,
             sync::{Arc, Mutex},
@@ -873,7 +872,7 @@ mod tests {
                 "-c".into(),
                 r"stty raw -echo; printf '\033[>7u'; dd bs=1 count=13 of=input 2>/dev/null".into(),
             ],
-            env: BTreeMap::new(),
+            env: crate::environment::Environment::current().vars().clone(),
             cwd: directory.path().into(),
             rows: 24,
             cols: 80,

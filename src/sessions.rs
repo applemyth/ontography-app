@@ -2,6 +2,7 @@
 use crate::{
     AppError, Result,
     catalog::Operation,
+    environment::Environment,
     persistence::{Paths, read_json, write_json},
     state::Service,
     views,
@@ -75,6 +76,9 @@ pub struct Sessions {
     selected: Mutex<Option<String>>,
     claims: Mutex<BTreeMap<String, String>>,
     admission: Mutex<BTreeMap<String, Arc<RwLock<()>>>>,
+    /// Each active session's environment, from the client that activated it.
+    /// Kept in memory only: environments often hold credentials.
+    environments: Mutex<BTreeMap<String, Environment>>,
     pub recovery_errors: BTreeMap<String, AppError>,
 }
 
@@ -223,8 +227,51 @@ impl Sessions {
             selected: Mutex::new(selected),
             claims: Mutex::new(claims),
             admission: Mutex::new(admission),
+            environments: Mutex::new(BTreeMap::new()),
             recovery_errors,
         })
+    }
+
+    /// Record the environment a session's programs start with, unless it has
+    /// one already: attaching again never changes a running session.
+    pub async fn offer_environment(&self, id: &str, environment: Environment) {
+        self.environments
+            .lock()
+            .await
+            .entry(id.to_owned())
+            .or_insert(environment);
+    }
+
+    /// The environment a client gave this session when it activated it.
+    pub async fn environment(&self, id: &str) -> Option<Environment> {
+        self.environments.lock().await.get(id).cloned()
+    }
+
+    /// A stopped session forgets its environment; the client that activates
+    /// it next brings its own.
+    async fn forget_environment(&self, id: &str) {
+        self.environments.lock().await.remove(id);
+    }
+
+    /// Every saved session, as `session.list` reports them, read while no
+    /// server runs. Nothing runs without a server, so a session left active
+    /// is reported suspended.
+    pub async fn saved(paths: &Paths) -> Result<Value> {
+        let sessions = Self::open(paths)?;
+        let mut records = sessions.list().await;
+        for record in &mut records {
+            if matches!(
+                record.status,
+                SessionStatus::Active | SessionStatus::Suspending
+            ) {
+                record.status = SessionStatus::Suspended;
+            }
+        }
+        Ok(json!({
+            "sessions": records,
+            "selected_session_id": sessions.selected().await,
+            "recovery_errors": sessions.recovery_errors,
+        }))
     }
 
     pub fn directory(&self, id: &str) -> Result<PathBuf> {
@@ -743,7 +790,11 @@ async fn dispatch_record(
                 initialize_graph(service, record, &intent.operation, &intent.args).await?;
             }
             if let Some(id) = &record.run_id {
-                service.run(id).await?.lock().await.resume().await?;
+                let environment = service.session_environment(&record.session_id).await;
+                let run = service.run(id).await?;
+                let mut run = run.lock().await;
+                run.environment = environment;
+                run.resume().await?;
             }
             record.status = SessionStatus::Active;
             record.updated_at = now();
@@ -786,6 +837,10 @@ async fn dispatch_record(
             };
             record.updated_at = now();
             service.sessions.save(record)?;
+            service
+                .sessions
+                .forget_environment(&record.session_id)
+                .await;
             if close {
                 service.sessions.clear_selection(&record.session_id).await?;
             }
@@ -873,6 +928,7 @@ async fn initialize_graph(
         *record = next;
         intent
     };
+    let environment = service.session_environment(&record.session_id).await;
     let result = match intent.definition {
         RunDefinition::Logical(declaration) => {
             if let Some(workflow) = intent.workflow {
@@ -882,11 +938,17 @@ async fn initialize_graph(
                         declaration,
                         record.project.clone(),
                         workflow,
+                        environment,
                     )
                     .await
             } else {
                 service
-                    .start_reserved(&intent.run_id, declaration, record.project.clone())
+                    .start_reserved(
+                        &intent.run_id,
+                        declaration,
+                        record.project.clone(),
+                        environment,
+                    )
                     .await
             }
         }
@@ -903,6 +965,7 @@ async fn initialize_graph(
                     declaration,
                     record.project.clone(),
                     input.into(),
+                    environment,
                 )
                 .await
         }

@@ -296,8 +296,17 @@ fn the_headless_launch_speaks_stream_json_without_hooks() {
     }
 }
 
-/// Runs a launch command against the fake Claude, as an enclosing Claude Code
-/// session would start it, and returns its output and what the fake recorded.
+/// Variables an enclosing Claude Code session exports for its own children.
+const ENCLOSING: [&str; 4] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+];
+
+/// Runs a launch command against the fake Claude with the environment the
+/// server gives it when its client typed inside Claude Code, and returns its
+/// output and what the fake recorded.
 async fn launch(
     mut command: Command,
     directory: &Path,
@@ -306,13 +315,25 @@ async fn launch(
 ) -> (std::process::Output, Vec<String>) {
     let log = directory.join("fake.log");
     let _ = std::fs::remove_file(&log);
+    let client = ENCLOSING
+        .map(|name| (name, "inherited".to_owned()))
+        .into_iter()
+        .chain([
+            ("PATH", "/usr/bin:/bin".to_owned()),
+            (
+                "CLAUDE_CONFIG_DIR",
+                directory
+                    .join("claude-config")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ("ANTHROPIC_MODEL", "fixture".to_owned()),
+            ("FAKE_LOG", log.to_string_lossy().into_owned()),
+        ])
+        .map(|(name, value)| (name.to_owned(), value));
     command
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .envs(INHERITED.map(|name| (name, "inherited")))
-        .env("CLAUDE_CONFIG_DIR", directory.join("claude-config"))
-        .env("ANTHROPIC_MODEL", "fixture")
-        .env("FAKE_LOG", &log)
+        .envs(crate::environment::Environment::from_vars(client).vars())
         .envs(fake.iter().copied())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());

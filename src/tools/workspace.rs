@@ -402,6 +402,7 @@ mod tests {
             live: None,
             recovery_checkouts: std::collections::BTreeMap::new(),
             registry: std::sync::Arc::new(crate::registry::ImplementationRegistry::default()),
+            environment: crate::environment::Environment::current(),
         };
         run.resume().await.unwrap();
         let restored = dispatch(

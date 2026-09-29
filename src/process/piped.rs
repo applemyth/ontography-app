@@ -224,18 +224,11 @@ impl Drop for SupervisedProcess {
 
 /// Starts `argv` in `cwd` under a new supervisor, leased in `directory`, which
 /// also holds its temporary files. The program waits for its permit.
+///
+/// `env` is the program's whole environment: nothing is inherited from the
+/// server. Values stay out of the command line, where other users could read
+/// them.
 pub async fn spawn_supervised(
-    argv: &[String],
-    cwd: &Path,
-    directory: &Path,
-    stdin: Stdin<'_>,
-) -> Result<SupervisedProcess> {
-    spawn_supervised_with_env(argv, cwd, directory, &BTreeMap::new(), stdin).await
-}
-
-/// Like [`spawn_supervised`], with `env` added to the program's environment.
-/// Values stay out of the command line, where other users could read them.
-pub async fn spawn_supervised_with_env(
     argv: &[String],
     cwd: &Path,
     directory: &Path,
@@ -294,6 +287,7 @@ where
         .arg(files.path("input"))
         .arg(files.path("status"))
         .args(argv)
+        .env_clear()
         .envs(env)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -366,6 +360,11 @@ mod tests {
     use nix::{errno::Errno, sys::signal::kill};
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    /// This test process's environment, as the server would pass it on.
+    fn inherited() -> BTreeMap<String, String> {
+        crate::environment::Environment::current().vars().clone()
+    }
+
     #[tokio::test]
     async fn rejected_timed_out_and_cancelled_startups_reap_and_remove_temporary_files() {
         for timeout in [false, true] {
@@ -433,6 +432,7 @@ mod tests {
                 &["/bin/true".into()],
                 &directory.path().join("missing-working-directory"),
                 directory.path(),
+                &inherited(),
                 Stdin::Bytes(b"input"),
             )
             .await
@@ -448,6 +448,7 @@ mod tests {
             &["/bin/true".into()],
             directory.path(),
             directory.path(),
+            &inherited(),
             Stdin::Bytes(b""),
         )
         .await
@@ -484,6 +485,7 @@ mod tests {
                 ],
                 directory.path(),
                 directory.path(),
+                &inherited(),
                 Stdin::Bytes(b""),
             )
             .await
@@ -522,6 +524,7 @@ mod tests {
             &["/bin/sleep".into(), "30".into()],
             directory.path(),
             directory.path(),
+            &inherited(),
             Stdin::Bytes(b""),
         )
         .await
@@ -558,6 +561,7 @@ mod tests {
             &["/bin/cat".into()],
             directory.path(),
             directory.path(),
+            &inherited(),
             Stdin::Stream,
         )
         .await
@@ -604,6 +608,7 @@ mod tests {
                 ],
                 directory.path(),
                 directory.path(),
+                &inherited(),
                 Stdin::Stream,
             )
             .await
@@ -666,6 +671,7 @@ mod tests {
                 &["/bin/sh".into(), "-c".into(), script.into()],
                 directory.path(),
                 directory.path(),
+                &inherited(),
                 Stdin::Bytes(b""),
             )
             .await

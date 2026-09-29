@@ -10,6 +10,7 @@ mod rpc;
 
 use crate::{
     AppError, Result,
+    environment::Environment,
     node_hooks::NodeHooks,
     node_mcp::NodeMcp,
     node_tool::{NodeScope, NodeToolContext},
@@ -69,6 +70,8 @@ type Driver<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 pub struct NodeRuntime {
     project: PathBuf,
     directory: PathBuf,
+    /// What the session's programs start with, before the node's own variables.
+    environment: Environment,
     session: SessionHandle,
     scope: watch::Receiver<NodeScope>,
     ledger: Arc<RetryLedger>,
@@ -80,6 +83,7 @@ impl NodeRuntime {
     pub fn new(
         project: PathBuf,
         directory: PathBuf,
+        environment: Environment,
         session: SessionHandle,
         scope: watch::Receiver<NodeScope>,
         ledger: Arc<RetryLedger>,
@@ -103,6 +107,7 @@ impl NodeRuntime {
             }),
             project,
             directory,
+            environment,
             session,
             scope,
             ledger,
@@ -190,7 +195,9 @@ impl NodeRuntime {
             let scope = self.scope.borrow();
             (scope.node.clone(), scope.binding.clone())
         };
-        let mut env = mcp.environment();
+        // The run's environment, and this node's own variables.
+        let mut env = self.environment.vars().clone();
+        env.extend(mcp.environment());
         env.insert("ONTOGRAPHY_NODE_NAME".into(), node.id.clone());
         env.insert(
             "ONTOGRAPHY_NODE_DIRECTORY".into(),
@@ -295,7 +302,14 @@ impl NodeRuntime {
         resources: &mut Resources<'_>,
     ) -> Result<Option<(codex::Plan, rpc::Rpc, String)>> {
         let endpoint = self.endpoint()?;
-        let plan = codex::Plan::new(node_id, config, &self.directory, cwd, &endpoint)?;
+        let plan = codex::Plan::new(
+            node_id,
+            config,
+            &self.directory,
+            cwd,
+            &endpoint,
+            &self.environment,
+        )?;
         let mut overrides = resources
             .mcp
             .as_ref()

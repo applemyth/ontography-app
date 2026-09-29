@@ -158,6 +158,7 @@ async fn call(
 ) -> ontography_app::Result<Value> {
     server
         .request(Request {
+            environment: None,
             version: ontography_app::protocol::VERSION,
             client_id: "manager-lifecycle-test".into(),
             request_id: uuid::Uuid::new_v4().to_string(),

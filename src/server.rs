@@ -1,6 +1,11 @@
 //! Local transport and operation ownership. A socket never owns a core operation.
+//!
+//! The server keeps sessions running after their clients detach. Once nothing
+//! runs and no client is connected, it exits: saved sessions live on disk,
+//! and the next command starts the current build again.
 use crate::{
     AppError, Result, catalog, declarations,
+    environment::Environment,
     persistence::Paths,
     protocol::{self, Request, Response},
     state::Service,
@@ -18,7 +23,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::BufReader,
@@ -26,6 +31,13 @@ use tokio::{
     sync::{Mutex, Notify, RwLock, watch},
     task::JoinSet,
 };
+
+/// How long the server stays with nothing to do before it exits.
+pub const IDLE_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long a new server waits for an exiting one to release the data
+/// directory, such as when a command arrives just as an idle server stops.
+const HANDOVER: Duration = Duration::from_secs(5);
 
 type Completion = Option<Arc<Result<Value>>>;
 struct Receipt {
@@ -119,6 +131,14 @@ impl Server {
             }
             return self.stop().await;
         }
+        if let (Some(id), Some(environment)) = (activated_session(&request), &request.environment)
+            && self.service.sessions.get(id).await.is_ok()
+        {
+            self.service
+                .sessions
+                .offer_environment(id, Environment::from_vars(environment.clone()))
+                .await;
+        }
         let operation = catalog::operations()
             .iter()
             .find(|o| o.name == request.operation)
@@ -146,7 +166,14 @@ impl Server {
                     "inspection panicked; inspect server and run state before retrying",
                 ))
             });
-            return bounded(result);
+            let mut result = bounded(result);
+            if request.operation == "system.hello"
+                && let Ok(hello) = &mut result
+            {
+                // A client of another build may replace an idle server.
+                hello["idle"] = json!(!self.busy().await);
+            }
+            return result;
         }
         let key = (request.client_id, request.request_id);
         let mut requests = self.requests.lock().await;
@@ -235,6 +262,19 @@ impl Server {
         }
     }
 
+    /// Whether anything runs: a session's shell, an open run, or an accepted
+    /// operation still in progress. Never waits on work in progress, which
+    /// counts as running.
+    async fn busy(&self) -> bool {
+        self.managers.any()
+            || self.service.has_live_runs()
+            || self.requests.try_lock().map_or(true, |requests| {
+                requests
+                    .values()
+                    .any(|receipt| receipt.result.borrow().is_none())
+            })
+    }
+
     /// Reap naturally exited shells independently of attached clients. A stale
     /// terminal is fenced by Managers before it can suspend a newer one.
     fn start_manager_monitor(self: &Arc<Self>) {
@@ -287,6 +327,22 @@ impl Server {
         }
         self.stopped.notify_one();
         Ok(json!({"stopped":true,"runs_preserved":true}))
+    }
+}
+
+/// The session a request activates, giving it the client's environment.
+fn activated_session(request: &Request) -> Option<&str> {
+    if !matches!(
+        request.operation.as_str(),
+        "session.resume" | "terminal.ensure"
+    ) {
+        return None;
+    }
+    let target = request.args.get("session_id").and_then(Value::as_str);
+    match (request.app_session_id.as_deref(), target) {
+        (Some(scope), Some(target)) if scope != target => None,
+        (Some(scope), _) => Some(scope),
+        (None, target) => target,
     }
 }
 
@@ -464,6 +520,16 @@ pub async fn serve_with_registry(
     paths: Paths,
     registry: Arc<crate::registry::ImplementationRegistry>,
 ) -> Result<()> {
+    serve_until_idle(paths, registry, IDLE_LIMIT).await
+}
+
+/// Serve until stopped, or until nothing has run and no client has been
+/// connected for `idle_limit`.
+pub async fn serve_until_idle(
+    paths: Paths,
+    registry: Arc<crate::registry::ImplementationRegistry>,
+    idle_limit: Duration,
+) -> Result<()> {
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -471,12 +537,16 @@ pub async fn serve_with_registry(
         .write(true)
         .mode(0o600)
         .open(paths.root.join("server.lock"))?;
-    lock.try_lock().map_err(|e| {
-        AppError::new(
-            "server_owned",
-            format!("another server owns this data directory: {e}"),
-        )
-    })?;
+    let handover = Instant::now() + HANDOVER;
+    while let Err(error) = lock.try_lock() {
+        if Instant::now() >= handover {
+            return Err(AppError::new(
+                "server_owned",
+                format!("another server owns this data directory: {error}"),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     crate::migration::check_root_available(&paths.root)?;
     if paths.socket.exists() {
         std::fs::remove_file(&paths.socket)?;
@@ -491,6 +561,8 @@ pub async fn serve_with_registry(
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut clients = JoinSet::new();
+    let mut idle_check = tokio::time::interval(Duration::from_secs(1).min(idle_limit));
+    let mut idle_since: Option<Instant> = None;
     loop {
         tokio::select! {
             accepted = listener.accept(), if clients.len() < 256 => {
@@ -502,6 +574,19 @@ pub async fn serve_with_registry(
             _ = terminate.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
             _ = interrupt.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
             _ = clients.join_next(), if !clients.is_empty() => {},
+            _ = idle_check.tick() => {
+                if !clients.is_empty() || server.busy().await {
+                    idle_since = None;
+                } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= idle_limit {
+                    match server.stop().await {
+                        Ok(_) => break,
+                        Err(error) => {
+                            crate::logging::record(&server.service.paths.root, &format!("idle shutdown failed: {error}"));
+                            idle_since = None;
+                        }
+                    }
+                }
+            }
         }
     }
     drop(listener);
