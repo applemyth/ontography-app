@@ -1,5 +1,23 @@
 # Verification
 
+## Stdout envelope refusals park at once — 2026-09-30
+
+Passed: **320 app Rust tests** against core `fcb37a9`, **221 core Rust
+tests**, all-target Clippy with warnings denied and formatting in both, and
+`git diff --check`. Six opt-in native app tests and one core test remain
+ignored. Pi is unchanged. Under heavy load,
+`shell_exit_suspends_while_detached_reaps_jobs_and_resumes_after_server_restart`
+once missed its 20-second suspension deadline; it passed three isolated
+reruns and the full rerun above.
+
+- [Typed execution tests](../tests/typed_execution.rs) send a forged and a
+  malformed stdout envelope under the default retry policy. Each task parks
+  after one attempt with its input pending, publishes nothing, and commits no
+  activation. Both fail without the app fix. The malformed one also fails
+  without core `fcb37a9`, which denies an envelope that core earlier reported
+  as a storage failure, and so retried.
+- A harness unit test keeps core's storage and closed errors retryable.
+
 ## Typed workflow and session recovery fixes — 2026-09-30
 
 Passed: **319 app Rust tests**, **33 Pi tests**, TypeScript checking,

@@ -146,7 +146,8 @@ Core checks every result and every package against its contract and every
 move against authority. A command's result and a human's decision go through
 every outgoing connection; if one refuses it, core rejects the whole
 submission. Commands retry under their task policy, except that output core
-refuses for its contract parks at once; human tasks remain ready
+refuses, for its contract or as a stdout package envelope, parks at once;
+storage faults still retry. Human tasks remain ready
 for a corrected decision. Agents choose connections, authority transitions, and
 outbound object types with the node tools; see [Node tools](NODE_TOOLS.md).
 A run's contracts and authority tags are fixed when it starts: an edit that
@@ -418,8 +419,9 @@ publishes its captured changes. The original directory is preserved. Without a
 workspace, the command runs in the workflow project and publishes stdout's
 exact bytes. Non-UTF-8 output needs a `bytes` contract; a run keeps the
 contracts it started with, so a run without one parks such a command. Stdout
-that is a package envelope is always refused: only a workspace input grants a
-task a package view, and a task with one publishes its checkout, not stdout.
+that is a package envelope, well-formed or not, is always refused and its task
+parks with the input unconsumed: only a workspace input grants a task a package
+view, and a task with one publishes its checkout, not stdout.
 Persistent agents use the selected node tools to open workspace packages in
 attempt checkouts, capture changes, and submit them. Their persistent session
 working directory is not automatically captured as graph output.
@@ -494,8 +496,9 @@ first attempt (1–100; 1 disables retries). The first wait is
 
 A task whose attempts run out is parked, as is one that retrying cannot help,
 such as a task that received two workspaces or a workspace that is not a
-directory, an input core refuses to begin, or output core refuses for its
-contract, like non-UTF-8 stdout under `text`. A parked task stays pending, and
+directory, an input core refuses to begin, or output core refuses, like
+non-UTF-8 stdout under `text` or a package envelope on stdout. A parked task
+stays pending, and
 no attempt starts until the manager intervenes. `flow.status` lists failed
 tasks in `failures`:
 
