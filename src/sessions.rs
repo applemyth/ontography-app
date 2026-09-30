@@ -52,6 +52,96 @@ pub struct GraphInitialization {
     pub workflow: crate::workflow::runtime::InitialWorkflow,
 }
 
+/// Keep old initialization records readable without interpreting or replaying them.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum SavedGraphInitialization {
+    Current(Box<GraphInitialization>),
+    Legacy(LegacyGraphInitialization),
+}
+
+impl<'de> Deserialize<'de> for SavedGraphInitialization {
+    /// Only legacy records name an `operation`. Choosing the format by it
+    /// reports that format's own parse error, not serde's untagged summary.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let saved = if value.get("operation").is_some() {
+            serde_json::from_value(value).map(Self::Legacy)
+        } else {
+            serde_json::from_value(value).map(|intent| Self::Current(Box::new(intent)))
+        };
+        saved.map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyGraphInitialization {
+    run_id: String,
+    operation: LegacyOperation,
+    args: Value,
+    definition: LegacyDefinition,
+    input: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum LegacyOperation {
+    #[serde(rename = "flow.start")]
+    Flow,
+    #[serde(rename = "run.start")]
+    Run,
+    #[serde(rename = "project.start")]
+    Project,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "declaration",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum LegacyDefinition {
+    Logical(BTreeMap<String, Value>),
+    Application(BTreeMap<String, Value>),
+}
+
+impl From<GraphInitialization> for SavedGraphInitialization {
+    fn from(intent: GraphInitialization) -> Self {
+        Self::Current(Box::new(intent))
+    }
+}
+
+impl SavedGraphInitialization {
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::Current(intent) => &intent.run_id,
+            Self::Legacy(intent) => &intent.run_id,
+        }
+    }
+
+    fn current(&self) -> Result<&GraphInitialization> {
+        match self {
+            Self::Current(intent) => Ok(intent),
+            Self::Legacy(legacy) => Err(legacy.unavailable()),
+        }
+    }
+}
+
+impl LegacyGraphInitialization {
+    fn unavailable(&self) -> AppError {
+        AppError::new(
+            "graph_unavailable",
+            "this saved graph initialization uses an unsupported older format; its Pi conversations remain available",
+        )
+        .details(json!({"run_id":self.run_id}))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {
@@ -61,10 +151,30 @@ pub struct SessionRecord {
     pub project: PathBuf,
     pub status: SessionStatus,
     pub run_id: Option<String>,
-    pub graph_initialization: Option<GraphInitialization>,
+    pub graph_initialization: Option<SavedGraphInitialization>,
     pub pi: PiState,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+impl SessionRecord {
+    /// The run this session reserved or bound, if any.
+    fn claimed_run(&self) -> Option<&str> {
+        self.run_id.as_deref().or_else(|| {
+            self.graph_initialization
+                .as_ref()
+                .map(SavedGraphInitialization::run_id)
+        })
+    }
+
+    /// A legacy record keeps its reservation, but is never interpreted, so
+    /// it starts, resumes, and stops no run.
+    fn legacy(&self) -> Option<&LegacyGraphInitialization> {
+        match &self.graph_initialization {
+            Some(SavedGraphInitialization::Legacy(legacy)) => Some(legacy),
+            _ => None,
+        }
+    }
 }
 
 pub struct Sessions {
@@ -76,6 +186,9 @@ pub struct Sessions {
     /// Each active session's environment, from the client that activated it.
     /// Kept in memory only: environments often hold credentials.
     environments: Mutex<BTreeMap<String, Environment>>,
+    /// Why each session's graph last failed to start or resume, until it
+    /// works again. Kept in memory only: a restart retries.
+    graph_errors: Mutex<BTreeMap<String, AppError>>,
     pub recovery_errors: BTreeMap<String, AppError>,
 }
 
@@ -104,12 +217,13 @@ impl Sessions {
         let mut selectable = BTreeSet::new();
         let mut claims = BTreeMap::new();
         let mut recovery_errors = BTreeMap::new();
+        let mut loaded = Vec::new();
         for entry in std::fs::read_dir(&root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let loaded = (|| {
+            let record = (|| {
                 let manifest = entry.path().join("session.json");
                 let mut record: SessionRecord = read_json(&manifest).map_err(|mut error| {
                     error.message = format!(
@@ -160,11 +274,11 @@ impl Sessions {
                     uuid(id, "run_id")?;
                 }
                 if let Some(intent) = &record.graph_initialization {
-                    uuid(&intent.run_id, "run_id")?;
+                    uuid(intent.run_id(), "run_id")?;
                     if record
                         .run_id
                         .as_ref()
-                        .is_some_and(|id| id != &intent.run_id)
+                        .is_some_and(|id| id != intent.run_id())
                     {
                         return Err(AppError::new(
                             "invalid_session",
@@ -172,22 +286,35 @@ impl Sessions {
                         ));
                     }
                 }
-                let claimed = record
-                    .run_id
+                Ok(record)
+            })();
+            loaded.push((entry.file_name().to_string_lossy().into_owned(), record));
+        }
+        // Claim in a fixed order, current records first: a legacy record stays
+        // readable, but cannot take a run a current session already owns.
+        loaded.sort_by(|(a, left), (b, right)| {
+            let legacy = |record: &Result<SessionRecord>| {
+                record
                     .as_ref()
-                    .or_else(|| record.graph_initialization.as_ref().map(|i| &i.run_id));
-                if let Some(run_id) = claimed {
-                    if claims.contains_key(run_id) {
+                    .is_ok_and(|record| record.legacy().is_some())
+            };
+            (legacy(left), a).cmp(&(legacy(right), b))
+        });
+        for (name, record) in loaded {
+            let record = record.and_then(|record| {
+                if let Some(run_id) = record.claimed_run() {
+                    if !claims.contains_key(run_id) {
+                        claims.insert(run_id.to_owned(), record.session_id.clone());
+                    } else if record.legacy().is_none() {
                         return Err(AppError::new(
                             "run_already_owned",
                             "multiple sessions claim the same graph run",
                         ));
                     }
-                    claims.insert(run_id.clone(), record.session_id.clone());
                 }
                 Ok(record)
-            })();
-            match loaded {
+            });
+            match record {
                 Ok(record) => {
                     if !matches!(
                         record.status,
@@ -198,7 +325,7 @@ impl Sessions {
                     records.insert(record.session_id.clone(), Arc::new(Mutex::new(record)));
                 }
                 Err(error) => {
-                    recovery_errors.insert(entry.file_name().to_string_lossy().into_owned(), error);
+                    recovery_errors.insert(name, error);
                 }
             }
         }
@@ -225,8 +352,24 @@ impl Sessions {
             claims: Mutex::new(claims),
             admission: Mutex::new(admission),
             environments: Mutex::new(BTreeMap::new()),
+            graph_errors: Mutex::new(BTreeMap::new()),
             recovery_errors,
         })
+    }
+
+    /// Remember why session `id`'s graph could not start or resume, or
+    /// forget it once the graph works.
+    pub async fn record_graph_error(&self, id: &str, error: Option<AppError>) {
+        let mut errors = self.graph_errors.lock().await;
+        if let Some(error) = error {
+            errors.insert(id.to_owned(), error);
+        } else {
+            errors.remove(id);
+        }
+    }
+
+    async fn graph_error(&self, id: &str) -> Option<AppError> {
+        self.graph_errors.lock().await.get(id).cloned()
     }
 
     /// Give a session `environment` for its programs, unless it has one. A
@@ -520,8 +663,34 @@ fn require_active(record: &SessionRecord) -> Result<()> {
     Ok(())
 }
 
+/// The run a session's graph operations act on, or why there is none:
+/// `failed` is why its pending start last failed, if it did.
+fn graph_run<'a>(record: &'a SessionRecord, failed: Option<&AppError>) -> Result<&'a str> {
+    if let Some(legacy) = record.legacy() {
+        return Err(legacy.unavailable());
+    }
+    match (&record.run_id, &record.graph_initialization) {
+        (Some(id), _) => Ok(id),
+        (None, Some(_)) => Err(failed.cloned().unwrap_or_else(|| {
+            AppError::new(
+                "graph_unavailable",
+                "this session's graph has not finished starting; resume the session to finish it",
+            )
+        })),
+        (None, None) => Err(AppError::new(
+            "graph_uninitialized",
+            "this Ontography session has no graph run yet",
+        )),
+    }
+}
+
 /// Resolve implicit targets while the caller holds the app session's lifecycle lock.
-fn scoped_args(record: &SessionRecord, operation: &str, args: &Value) -> Result<Value> {
+fn scoped_args(
+    record: &SessionRecord,
+    failed: Option<&AppError>,
+    operation: &str,
+    args: &Value,
+) -> Result<Value> {
     let mut args = args.clone();
     let object = args
         .as_object_mut()
@@ -543,12 +712,7 @@ fn scoped_args(record: &SessionRecord, operation: &str, args: &Value) -> Result<
         object.insert("session_id".into(), json!(record.session_id));
     }
     if properties.get("run_id").is_some() {
-        let run_id = record.run_id.as_ref().ok_or_else(|| {
-            AppError::new(
-                "graph_uninitialized",
-                "this Ontography session has no graph run yet",
-            )
-        })?;
+        let run_id = graph_run(record, failed)?;
         if object
             .get("run_id")
             .is_some_and(|id| id.as_str() != Some(run_id))
@@ -613,7 +777,8 @@ pub async fn dispatch_scoped(
     };
     let handle = service.sessions.get(session_id).await?;
     let mut record = handle.lock().await;
-    let args = scoped_args(&record, operation, args)?;
+    let failed = service.sessions.graph_error(&record.session_id).await;
+    let args = scoped_args(&record, failed.as_ref(), operation, args)?;
     if operation == "session.list" {
         return Ok(json!({"sessions":[&*record],"selected_session_id":record.session_id}));
     }
@@ -627,14 +792,37 @@ pub async fn dispatch_scoped(
         return initialize_graph(service, &mut record, &args).await;
     }
     if operation == "run.list" {
-        let runs = match &record.run_id {
-            Some(id) => vec![service.run(id).await?.lock().await.summary()],
-            None => vec![],
-        };
-        return Ok(json!({"runs":runs,"next_after":null,"recovery_errors":{}}));
+        let mut listing = json!({"runs":[],"next_after":null,"recovery_errors":{}});
+        if let Some(id) = record
+            .run_id
+            .as_deref()
+            .filter(|_| record.legacy().is_none())
+        {
+            match service.run(id).await {
+                Ok(run) => listing["runs"] = json!([run.lock().await.summary()]),
+                Err(error) => {
+                    listing["recovery_errors"][id] = json!(recovery_error(service, id, error));
+                }
+            }
+        }
+        return Ok(listing);
     }
+    // A run that failed to load reports why, whatever the operation.
+    if let Some(error) = args
+        .get("run_id")
+        .and_then(Value::as_str)
+        .and_then(|id| service.recovery_errors.get(id))
+    {
+        return Err(error.clone());
+    }
+    let session_id = record.session_id.clone();
     drop(record);
-    crate::tools::dispatch(service, operation, &args).await
+    let result = crate::tools::dispatch(service, operation, &args).await;
+    if mutating && result.is_ok() {
+        // The graph works again, so its last failure no longer describes it.
+        service.sessions.record_graph_error(&session_id, None).await;
+    }
+    result
 }
 
 pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Result<Value> {
@@ -700,24 +888,77 @@ async fn context(service: &Service, record: &mut SessionRecord) -> Result<Value>
         record.updated_at = now();
         service.sessions.save(record)?;
     }
-    let graph = match &record.run_id {
-        Some(id) => {
-            let handle = service.run(id).await?;
-            crate::workflow::tools::status(&*handle.lock().await).await?
-        }
-        None => Value::Null,
-    };
+    let graph = graph_view(service, record).await;
+    let mut session = view(record)?;
+    if graph["status"] == "unavailable" {
+        session["graph"] = graph.clone();
+    }
     Ok(
-        json!({"session":view(record)?,"conversations_dir":service.sessions.conversations_dir(&record.session_id)?,"graph":graph}),
+        json!({"session":session,"conversations_dir":service.sessions.conversations_dir(&record.session_id)?,"graph":graph}),
     )
+}
+
+fn unavailable_graph(run_id: &str, error: AppError) -> Value {
+    json!({"run_id":run_id,"status":"unavailable","error":error})
+}
+
+fn recovery_error(service: &Service, run_id: &str, error: AppError) -> AppError {
+    service
+        .recovery_errors
+        .get(run_id)
+        .cloned()
+        .unwrap_or(error)
+}
+
+/// A session's graph as it stands, or why it cannot run. A failure to start
+/// or resume stays visible until the graph works again.
+async fn graph_view(service: &Service, record: &SessionRecord) -> Value {
+    let Some(id) = record.claimed_run() else {
+        return Value::Null;
+    };
+    let failed = service.sessions.graph_error(&record.session_id).await;
+    let Some(bound) = &record.run_id else {
+        return match (record.legacy(), failed) {
+            (Some(legacy), _) => unavailable_graph(id, legacy.unavailable()),
+            (None, Some(error)) => unavailable_graph(id, error),
+            (None, None) => Value::Null,
+        };
+    };
+    let handle = match service.run(bound).await {
+        Ok(handle) => handle,
+        Err(error) => return unavailable_graph(bound, recovery_error(service, bound, error)),
+    };
+    if let Some(legacy) = record.legacy() {
+        return unavailable_graph(bound, legacy.unavailable());
+    }
+    let run = handle.lock().await;
+    match failed {
+        // A run that never opened has nothing to show but why.
+        Some(error) if run.live.is_none() => unavailable_graph(bound, error),
+        failed => match crate::workflow::tools::status(&run).await {
+            Ok(mut graph) => {
+                if let Some(error) = failed {
+                    graph["resume_error"] = json!(error);
+                }
+                graph
+            }
+            Err(error) => unavailable_graph(bound, error),
+        },
+    }
 }
 
 /// A session as `session.inspect` shows it: its record, with a workflow's
 /// initialization summarized.
 fn view(record: &SessionRecord) -> Result<Value> {
     let mut session = serde_json::to_value(record)?;
-    if record.graph_initialization.is_some() {
-        session["graph_initialization"] = json!({"run_id":record.run_id,"operation":"flow.start"});
+    if let Some(intent) = &record.graph_initialization {
+        session["graph_initialization"] =
+            json!({"run_id":intent.run_id(),"operation":"flow.start"});
+        if let SavedGraphInitialization::Legacy(legacy) = intent {
+            session["graph_initialization"]["operation"] = serde_json::to_value(&legacy.operation)?;
+            session["graph_initialization"]["status"] = json!("unavailable");
+            session["graph_initialization"]["error"] = json!(legacy.unavailable());
+        }
     }
     Ok(session)
 }
@@ -795,21 +1036,20 @@ async fn dispatch_record(
                     "a closed session cannot resume",
                 ));
             }
-            if record.run_id.is_none()
-                && let Some(intent) = record.graph_initialization.clone()
-            {
-                initialize_graph(service, record, &intent.args).await?;
-            }
-            if let Some(id) = &record.run_id {
-                let environment = service.session_environment(&record.session_id).await;
-                let run = service.run(id).await?;
-                let mut run = run.lock().await;
-                run.environment = environment;
-                run.resume().await?;
-            }
-            record.status = SessionStatus::Active;
-            record.updated_at = now();
-            service.sessions.save(record)?;
+            // Activate before touching the graph, so a failed save never
+            // leaves work running under a suspended session. A graph that
+            // cannot start or resume keeps the session active with the reason
+            // kept, so its manager can repair it.
+            let mut next = record.clone();
+            next.status = SessionStatus::Active;
+            next.updated_at = now();
+            service.sessions.save(&next)?;
+            *record = next;
+            let failed = resume_graph(service, record).await.err();
+            service
+                .sessions
+                .record_graph_error(&record.session_id, failed)
+                .await;
             Ok(context(service, record).await?["session"].clone())
         }
         "session.suspend" | "session.close" => {
@@ -830,17 +1070,23 @@ async fn dispatch_record(
             };
             record.updated_at = now();
             service.sessions.save(record)?;
-            let run_id = record.run_id.as_ref().or_else(|| {
-                record
-                    .graph_initialization
-                    .as_ref()
-                    .map(|intent| &intent.run_id)
-            });
-            if let Some(id) = run_id
+            if record.legacy().is_none()
+                && let Some(id) = record.claimed_run()
                 && let Ok(run) = service.run(id).await
             {
-                run.lock().await.suspend(close).await?;
+                let mut run = run.lock().await;
+                // A run this build cannot open has nothing live to stop and
+                // could never close; the session closes around it, as it is.
+                if let Err(error) = run.suspend(close).await
+                    && (!close || run.live.is_some())
+                {
+                    return Err(error);
+                }
             }
+            service
+                .sessions
+                .record_graph_error(&record.session_id, None)
+                .await;
             record.status = if close {
                 SessionStatus::Closed
             } else {
@@ -861,12 +1107,37 @@ async fn dispatch_record(
     }
 }
 
+/// Start a session's pending graph, then resume its bound one.
+async fn resume_graph(service: &Service, record: &mut SessionRecord) -> Result<()> {
+    if let Some(legacy) = record.legacy() {
+        return Err(legacy.unavailable());
+    }
+    if record.run_id.is_none()
+        && let Some(saved) = &record.graph_initialization
+    {
+        let args = saved.current()?.args.clone();
+        initialize_graph(service, record, &args).await?;
+    }
+    if let Some(id) = &record.run_id {
+        let environment = service.session_environment(&record.session_id).await;
+        let run = service
+            .run(id)
+            .await
+            .map_err(|error| recovery_error(service, id, error))?;
+        let mut run = run.lock().await;
+        run.environment = environment;
+        run.resume().await?;
+    }
+    Ok(())
+}
+
 async fn initialize_graph(
     service: &Service,
     record: &mut SessionRecord,
     args: &Value,
 ) -> Result<Value> {
-    let intent = if let Some(intent) = &record.graph_initialization {
+    let intent = if let Some(saved) = &record.graph_initialization {
+        let intent = saved.current()?;
         if intent.args != *args {
             return Err(AppError::new(
                 "graph_already_initialized",
@@ -895,7 +1166,7 @@ async fn initialize_graph(
             workflow,
         };
         let mut next = record.clone();
-        next.graph_initialization = Some(intent.clone());
+        next.graph_initialization = Some(intent.clone().into());
         next.updated_at = now();
         service
             .sessions

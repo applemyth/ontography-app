@@ -144,12 +144,15 @@ async fn graph_initialization_recovers_reserved_identity_before_and_after_run_cr
         {
             let session = service.sessions.get(&id).await.unwrap();
             let mut record = session.lock().await;
-            record.graph_initialization = Some(GraphInitialization {
-                run_id: reserved.clone(),
-                args: args.clone(),
-                definition: definition.clone(),
-                workflow: workflow.clone(),
-            });
+            record.graph_initialization = Some(
+                GraphInitialization {
+                    run_id: reserved.clone(),
+                    args: args.clone(),
+                    definition: definition.clone(),
+                    workflow: workflow.clone(),
+                }
+                .into(),
+            );
             service.sessions.save(&record).unwrap();
         }
         if phase == 1 {

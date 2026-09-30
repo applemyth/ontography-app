@@ -149,7 +149,7 @@ Pi writes new histories lazily. Ontography reserves the initial UUID before laun
 
 Pi can save reusable documents with `flow.define` before starting a graph. The first scoped `flow.start` binds its resulting run. A run whose nodes are all `external` runs no process and waits for an outside client's moves.
 
-Initialization persists a reserved run ID, operation arguments, compiled declaration, and initial workflow and input before constructing core storage. Per-session serialization prevents competing initialization; retries recover the same identity. Recovery does not reinject fresh input. Partial state that core cannot reopen remains an explicit recovery error.
+Initialization persists a reserved run ID, operation arguments, compiled declaration, and initial workflow before constructing core storage. Per-session serialization prevents competing initialization; retries recover the same identity. Recovery does not reinject fresh input. Partial state that core cannot reopen remains an explicit recovery error.
 
 To associate an existing run:
 
@@ -183,6 +183,10 @@ Server startup does not relaunch every saved session. Attachment explicitly resu
 The server keeps sessions running after their clients detach. After 30 seconds in which nothing runs (no session shell, active graph, or operation in progress) and no client is connected, it exits by itself. Saved sessions stay on disk, and the next command that needs the server starts the current build.
 
 Server/machine failure loses PTY resources and process memory. Recovery uses core's durable state and Pi history. Prepared rewrite plans and other transient handles expire across server replacement. General operation receipts are bounded and server-instance-local; reconcile uncertain accepted work against current graph state after restart.
+
+Older session initialization records remain readable even when their graph format is unsupported. Session inspection, selection, and Pi conversations remain available. The saved initialization, run reservation, and conversation files are retained: an unsupported old graph is never replayed, resumed, stopped, or replaced, no start outside the session can take its reserved run, and a current session that already owns the same run keeps it.
+
+Resume saves the session as active before touching its graph, so a failed save starts no work. If the graph then cannot start or resume, the session stays active so its manager can repair it, and the reason stays reported until the graph works again. A graph that never opened shows as `unavailable` with its run ID and that reason; a run that opened but could not finish resuming carries the reason as `resume_error` beside its status. Graph operations report the same reason: a legacy or unfinished start says why it has not run, and a run that failed to load reports its recovery error. Closing a session whose run this build cannot open leaves that run as it is.
 
 App-session fork/clone, archive/delete, complete portable backups, and multiple-controller/viewer attachment remain deferred. Native Pi conversation forks already operate within the existing graph.
 

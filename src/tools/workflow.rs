@@ -2,15 +2,16 @@
 
 use crate::catalog::Operation;
 use crate::state::{ManagedRun, Service};
+use crate::workflow::edit::WorkflowState;
 use crate::{AppError, Result, persistence, views};
 use ontography::{
-    Activation, ActivationId, ActivationProposal, ContentId, Emission, OutputAuthority, PackageId,
-    PackageRecord, PendingFrontier, Retirement, SessionSnapshot, Trigger,
+    Activation, ActivationId, ActivationProposal, ContentId, Emission, Kernel, OutputAuthority,
+    PackageId, PackageRecord, PendingFrontier, Retirement, SessionSnapshot, Trigger,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 /// The result and emissions of a single root or package-triggered activation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -257,53 +258,232 @@ pub async fn dispatch_wait(service: &Service, args: &Value) -> Result<Value> {
     )
 }
 
-/// Core moves act only for external nodes: programs and people own the rest.
-/// A node the workflow does not know is left to core to refuse.
-async fn require_external(run: &ManagedRun, node: &str) -> Result<()> {
-    let state = crate::workflow::runtime::load(run)?;
-    let kernel = run.live()?.session.kernel().await.map_err(AppError::core)?;
-    let Some(name) = state.node_names(&kernel).remove(node) else {
-        return Ok(());
-    };
-    let Some(binding) = state.bindings.get(&name) else {
-        return Ok(());
-    };
-    if binding.implementation.is_external() {
-        return Ok(());
-    }
-    Err(AppError::new(
-        "not_external",
-        format!(
-            "{name:?} runs a {} component; core moves act only for external nodes",
-            binding.implementation.kind()
-        ),
-    ))
+/// What a move or inspection names: a node or a connection.
+#[derive(Clone, Copy)]
+enum Part {
+    Node,
+    Edge,
 }
 
-/// Moving a live package acts for the node holding it.
-async fn require_holder_external(run: &ManagedRun, package: PackageId) -> Result<()> {
-    let history = run
-        .live()?
-        .session
-        .package_history(package)
-        .await
-        .map_err(AppError::core)?;
-    match history.filter(|history| history.package().is_live()) {
-        Some(history) => require_external(run, history.package().holder()).await,
-        None => Ok(()),
+impl Part {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+        }
+    }
+
+    /// `id`, if it is a live identity in core's graph.
+    fn live<'k>(self, kernel: &'k Kernel, id: &str) -> Option<&'k str> {
+        match self {
+            Self::Node => kernel.graph().node(id).map(|node| node.id()),
+            Self::Edge => kernel.graph().edge(id).map(|edge| edge.id()),
+        }
+    }
+
+    /// `name`'s live identity in the pending document, else the current one:
+    /// `Some(None)` until its edit applies, `None` if neither document has it.
+    fn named<'a>(
+        self,
+        state: &'a WorkflowState,
+        kernel: &Kernel,
+        name: &str,
+    ) -> Option<Option<&'a str>> {
+        let mut ids = state
+            .pending
+            .iter()
+            .map(|plan| &plan.identities)
+            .chain([&state.identities])
+            .filter_map(|ids| match self {
+                Self::Node => ids.nodes.get(name),
+                Self::Edge => ids.edges.get(name),
+            })
+            .peekable();
+        ids.peek()?;
+        Some(
+            ids.map(String::as_str)
+                .find(|id| self.live(kernel, id).is_some()),
+        )
+    }
+}
+
+/// Resolve names and ownership from one workflow/graph read per request.
+/// A pending replacement takes effect when its identity is present in core.
+struct WorkflowGraph {
+    state: WorkflowState,
+    kernel: Arc<Kernel>,
+}
+
+impl WorkflowGraph {
+    async fn load(run: &ManagedRun) -> Result<Self> {
+        Ok(Self {
+            state: crate::workflow::runtime::load(run)?,
+            kernel: run.live()?.session.kernel().await.map_err(AppError::core)?,
+        })
+    }
+
+    fn node_id(&self, input: &str) -> Result<&str> {
+        self.resolve(Part::Node, input)
+    }
+
+    fn edge_id(&self, input: &str) -> Result<&str> {
+        self.resolve(Part::Edge, input)
+    }
+
+    fn resolve(&self, part: Part, input: &str) -> Result<&str> {
+        let named = part.named(&self.state, &self.kernel, input);
+        resolve_reference(part, input, named, part.live(&self.kernel, input))
+    }
+
+    /// Never authorize a live node without the binding of that exact identity.
+    fn require_external(&self, node: &str) -> Result<()> {
+        let (name, binding) = self
+            .state
+            .pending
+            .iter()
+            .map(|plan| (&plan.identities.nodes, &plan.bindings))
+            .chain(std::iter::once((
+                &self.state.identities.nodes,
+                &self.state.bindings,
+            )))
+            .find_map(|(ids, bindings)| {
+                ids.iter()
+                    .find(|(_, id)| id.as_str() == node)
+                    .map(|(name, _)| (name, bindings.get(name)))
+            })
+            .ok_or_else(|| {
+                AppError::new("workflow_drift", "The live node has no workflow identity")
+            })?;
+        let binding = binding.ok_or_else(|| {
+            AppError::new("workflow_drift", "The live node has no workflow binding")
+        })?;
+        if self
+            .state
+            .identities
+            .nodes
+            .get(name)
+            .is_some_and(|id| id == node)
+        {
+            let previous = self.state.bindings.get(name).ok_or_else(|| {
+                AppError::new("workflow_drift", "The live node has no workflow binding")
+            })?;
+            // A settings edit can change ownership without replacing the core
+            // identity. Until publication/reconciliation, custody is ambiguous.
+            if previous.implementation.is_external() != binding.implementation.is_external() {
+                return Err(AppError::new(
+                    "pending_edit",
+                    "Complete the pending ownership change before making core moves at this node",
+                ));
+            }
+        }
+        if binding.implementation.is_external() {
+            return Ok(());
+        }
+        Err(AppError::new(
+            "not_external",
+            format!(
+                "{name:?} runs a {} component; core moves act only for external nodes",
+                binding.implementation.kind()
+            ),
+        ))
+    }
+
+    /// Moving a live package acts for the node holding it. Core decides whether
+    /// an absent or ended package can participate in the requested operation.
+    async fn require_holder_external(&self, run: &ManagedRun, package: PackageId) -> Result<()> {
+        let history = run
+            .live()?
+            .session
+            .package_history(package)
+            .await
+            .map_err(AppError::core)?;
+        match history.filter(|history| history.package().is_live()) {
+            Some(history) => self.require_external(history.package().holder()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Names and observed core identities share an input field. A document name,
+/// current or pending, means only its own identity, even before its edit
+/// applies: refuse one that is also a different live identity instead of
+/// silently sending work to a different node or connection.
+fn resolve_reference<'a>(
+    part: Part,
+    input: &str,
+    named: Option<Option<&'a str>>,
+    exact: Option<&'a str>,
+) -> Result<&'a str> {
+    match (named, exact) {
+        (Some(named), Some(exact)) if named != Some(exact) => Err(AppError::new(
+            "ambiguous_reference",
+            format!(
+                "{} reference {input:?} is both a document name and a different core identity; use an unambiguous name or identity",
+                part.noun()
+            ),
+        )),
+        (Some(Some(id)), _) | (_, Some(id)) => Ok(id),
+        _ => Err(AppError::new(
+            "rejected",
+            format!("unknown {}: {input}", part.noun()),
+        )),
+    }
+}
+
+/// Inspections take a live core identity as itself, as before names were
+/// accepted, so they read the workflow only to resolve a name, at most once
+/// per request. Core reports whatever neither resolves.
+struct Inspection<'r> {
+    run: &'r ManagedRun,
+    kernel: Arc<Kernel>,
+    state: Option<WorkflowState>,
+}
+
+impl<'r> Inspection<'r> {
+    async fn new(run: &'r ManagedRun) -> Result<Self> {
+        let kernel = run.live()?.session.kernel().await.map_err(AppError::core)?;
+        Ok(Self {
+            run,
+            kernel,
+            state: None,
+        })
+    }
+
+    fn id(&mut self, part: Part, input: &str) -> Result<String> {
+        if part.live(&self.kernel, input).is_none() {
+            let state = match &mut self.state {
+                Some(state) => state,
+                empty => empty.insert(crate::workflow::runtime::load(self.run)?),
+            };
+            if let Some(Some(id)) = part.named(state, &self.kernel, input) {
+                return Ok(id.to_owned());
+            }
+        }
+        Ok(input.to_owned())
     }
 }
 
 pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Result<Value> {
     match operation {
         "workflow.submit" => {
-            let input: ProposalInput = parse_args(run, args)?;
-            match &input.trigger {
-                TriggerInput::Root { node_id, .. } => require_external(run, node_id).await?,
+            let mut input: ProposalInput = parse_args(run, args)?;
+            let graph = WorkflowGraph::load(run).await?;
+            match &mut input.trigger {
+                TriggerInput::Root { node_id, .. } => {
+                    *node_id = graph.node_id(node_id)?.to_owned();
+                    graph.require_external(node_id)?;
+                }
                 TriggerInput::Packages { package_ids } => {
                     for id in package_ids {
-                        require_holder_external(run, views::package_id(id)?).await?;
+                        graph
+                            .require_holder_external(run, views::package_id(id)?)
+                            .await?;
                     }
+                }
+            }
+            for emission in &mut input.emissions {
+                if let Some(edge) = &mut emission.edge_id {
+                    *edge = graph.edge_id(edge)?.to_owned();
                 }
             }
             let proposal = input.compile()?;
@@ -317,11 +497,13 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         "workflow.transfer" => {
             let input: TransferInput = parse_args(run, args)?;
             let package_id = views::package_id(&input.package_id)?;
-            require_holder_external(run, package_id).await?;
+            let graph = WorkflowGraph::load(run).await?;
+            graph.require_holder_external(run, package_id).await?;
+            let edge_id = graph.edge_id(&input.edge_id)?;
             let delivery = run
                 .live()?
                 .session
-                .transfer(package_id, &input.edge_id)
+                .transfer(package_id, edge_id)
                 .await
                 .map_err(AppError::core)?
                 .map_err(|error| AppError::new("rejected", error.to_string()))?;
@@ -332,7 +514,10 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         "workflow.retire" => {
             let input: RetireInput = parse_args(run, args)?;
             let id = views::package_id(&input.package_id)?;
-            require_holder_external(run, id).await?;
+            WorkflowGraph::load(run)
+                .await?
+                .require_holder_external(run, id)
+                .await?;
             let evidence = input
                 .evidence_activation_id
                 .as_deref()
@@ -362,15 +547,19 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
             let input: FrontierInput = parse_args(run, args)?;
             check_limit(input.limit)?;
             let after = input.after.as_deref().map(views::package_id).transpose()?;
+            let node = match input.node_id.as_deref() {
+                Some(node) => Some(Inspection::new(run).await?.id(Part::Node, node)?),
+                None => None,
+            };
             let session = &run.live()?.session;
             let frontier = match input.phase {
-                FrontierPhase::Received => match input.node_id.as_deref() {
+                FrontierPhase::Received => match node.as_deref() {
                     Some(node) => session.pending_page_at(node, after, input.limit).await,
                     None => session.pending_page(after, input.limit).await,
                 },
                 FrontierPhase::Outbound => {
                     session
-                        .outbound_page(input.node_id.as_deref(), after, input.limit)
+                        .outbound_page(node.as_deref(), after, input.limit)
                         .await
                 }
             }
@@ -389,14 +578,16 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         }
         "inspect.trigger" => {
             let input: TriggerQuery = parse_args(run, args)?;
+            let mut inspection = Inspection::new(run).await?;
+            let node = inspection.id(Part::Node, &input.node_id)?;
+            let edge = input
+                .edge_id
+                .map(|edge| inspection.id(Part::Edge, &edge))
+                .transpose()?;
             let session = &run.live()?.session;
-            let frontier = match input.edge_id {
-                Some(edge) => {
-                    session
-                        .next_pending_on_edge_at(input.node_id.as_str(), edge.as_str())
-                        .await
-                }
-                None => session.next_trigger_at(input.node_id.as_str()).await,
+            let frontier = match edge {
+                Some(edge) => session.next_pending_on_edge_at(node, edge).await,
+                None => session.next_trigger_at(node).await,
             }
             .map_err(AppError::core)?;
             Ok(frontier_view(&frontier))
@@ -656,14 +847,14 @@ pub fn operations() -> Vec<Operation> {
     vec![
         operation(
             "workflow.submit",
-            "Submit one root or package-triggered activation for an external node, with explicit result, emissions, and content dependencies.",
+            "Submit one root or package-triggered activation for an external node, with explicit result, emissions, and content dependencies. Node and edge inputs resolve document names to their current core identities.",
             json!({"trigger":trigger,"result":payload_schema(),"emissions":emissions_schema(),"contents":{"type":"array","items":content_id_schema()}}),
             &["trigger", "result"],
             true,
         ),
         operation(
             "workflow.transfer",
-            "Deliver a live outbound package held at an external node through an accepting edge. A package can be delivered only once.",
+            "Deliver a live outbound package held at an external node through an accepting edge, named by its document name or exact core identity. A package can be delivered only once.",
             json!({"package_id":{"type":"string"},"edge_id":{"type":"string"}}),
             &["package_id", "edge_id"],
             true,
@@ -684,14 +875,14 @@ pub fn operations() -> Vec<Operation> {
         ),
         operation(
             "inspect.frontier",
-            "Page current received or outbound packages. Restart pagination if revision changes.",
+            "Page current received or outbound packages, optionally at a node named by its document name or exact core identity. Restart pagination if revision changes.",
             json!({"phase":{"type":"string","enum":["received","outbound"]},"node_id":{"type":"string"},"after":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}}),
             &[],
             false,
         ),
         operation(
             "inspect.trigger",
-            "Observe the next complete node trigger, or the next package on an incoming edge. This reserves no work.",
+            "Observe the next complete node trigger, or the next package on an incoming edge. Node and edge inputs accept document names or exact core identities. This reserves no work.",
             json!({"node_id":{"type":"string"},"edge_id":{"type":"string"}}),
             &["node_id"],
             false,

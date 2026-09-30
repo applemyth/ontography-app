@@ -238,7 +238,7 @@ impl Agent {
     }
 }
 
-/// A program run once per task, with input messages on stdin.
+/// A program run once per task, with input bytes on stdin.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CommandSettings {
@@ -246,6 +246,9 @@ struct CommandSettings {
     argv: Vec<String>,
     /// Seconds before a task's process is stopped (default 300).
     timeout_secs: Option<u64>,
+    /// Send outputs with exactly these tags through a declared transition;
+    /// omitted, carry the task's authority.
+    authority: Option<Vec<String>>,
 }
 
 struct Command;
@@ -264,6 +267,7 @@ impl ProjectComponent for Command {
         bound(Implementation::Command(CommandConfig {
             argv: settings.argv,
             timeout_secs: settings.timeout_secs,
+            authority: settings.authority,
         }))
     }
 }

@@ -13,7 +13,7 @@ const directory = "/private/tmp/onto-history";
 function fixture() {
   const requests: Array<{ operation: string; args: Arguments }> = [];
   const state = { active: "conversation-1", groups: ["content"], run: "run-1", revision: "1", failRegistration: false, failContext: false,
-    historyExists: false, materialized: false };
+    historyExists: false, materialized: false, graph: undefined as unknown };
   const membership = new Map([["conversation-1", `${directory}/conversation-1.jsonl`], ["conversation-2", `${directory}/conversation-2.jsonl`]]);
   const hello: Hello = {
     protocol_version: 1, server_id: "server-1", app_version: "test", core_version: "test", app_build: "test", core_build: "test",
@@ -65,7 +65,7 @@ function fixture() {
       } else if (operation === "session.context") {
         if (state.failContext) throw new BridgeError("session_binding", "Context unavailable");
         result = { session: { session_id: sessionId, run_id: state.run, pi: { active_conversation_id: state.active, preferences: { tool_groups: [...state.groups] } } },
-          conversations_dir: directory, graph: { run_id: state.run, revision: state.revision } };
+          conversations_dir: directory, graph: state.graph ?? { run_id: state.run, revision: state.revision } };
       } else if (operation === "session.preferences") {
         state.groups = [...(args.preferences as { tool_groups: string[] }).tool_groups];
         result = { preferences: { tool_groups: [...state.groups] } };
@@ -165,6 +165,15 @@ test("fresh graph context is injected after tree changes and graph command targe
   assert.match(prompt.systemPrompt, /do not create, copy, or rewind/i);
   await runtime.commands.get("graph")!.handler("", runtime.context());
   assert.deepEqual(server.requests.at(-1), { operation: "terminal.graph", args: { session_id: sessionId } });
+});
+
+test("an unavailable graph's reason reaches the agent", async () => {
+  const server = fixture();
+  server.state.graph = { run_id: "run-1", status: "unavailable", error: { code: "graph_unavailable", message: "this build cannot open the run" } };
+  const runtime = server.load();
+  await runtime.fire("session_start");
+  const prompt = await runtime.fire("before_agent_start", { systemPrompt: "Base prompt" }) as { systemPrompt: string };
+  assert.match(prompt.systemPrompt, /Bound graph run: run-1\. The graph is unavailable: this build cannot open the run\./);
 });
 
 test("server replacement re-registers the current conversation before continuing", async () => {

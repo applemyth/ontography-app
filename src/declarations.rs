@@ -123,9 +123,18 @@ impl ValidatorKind {
     /// Whether `bytes` satisfy this validator. Like core, every validator
     /// refuses a malformed package envelope.
     pub fn check(self, bytes: &[u8]) -> Result<(), ContractViolation> {
-        let envelope = PackageEnvelope::from_payload(&Payload::from(bytes)).map_err(|error| {
-            ContractViolation::new(format!("invalid package envelope: {error}"))
-        })?;
+        // An envelope must be a JSON object; most payloads need no owned copy.
+        let object = bytes
+            .iter()
+            .find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            == Some(&b'{');
+        let envelope = if object {
+            PackageEnvelope::from_payload(&Payload::from(bytes)).map_err(|error| {
+                ContractViolation::new(format!("invalid package envelope: {error}"))
+            })?
+        } else {
+            None
+        };
         match self {
             Self::Bytes => Ok(()),
             Self::Text => std::str::from_utf8(bytes)
@@ -557,11 +566,21 @@ mod tests {
                 .activate(&mut state, root(br#"{"ontography_package":7}"#))
                 .is_err()
         );
+        assert!(
+            kernel
+                .activate(&mut state, root(b" \n\t{\"ontography_package\":7}"))
+                .is_err()
+        );
         assert!(kernel.activate(&mut state, root(b"text")).is_ok());
         declaration.contracts[0].validator = ValidatorKind::Bytes;
         let kernel = declaration.compile().unwrap();
         let mut state = kernel.empty_state();
         assert!(kernel.activate(&mut state, root(&[0xff])).is_ok());
+        assert!(
+            kernel
+                .activate(&mut state, root(b" \n\t{\"ontography_package\":7}"))
+                .is_err()
+        );
         declaration.contracts[0].validator = ValidatorKind::Workspace;
         let kernel = declaration.compile().unwrap();
         let mut state = kernel.empty_state();

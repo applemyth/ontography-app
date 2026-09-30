@@ -14,7 +14,7 @@ use crate::{
 };
 use ontography::{
     ContextPolicy, Emission, InvocationTrigger, OutputAuthority, PackageStore, Payload,
-    ProposalDecision, RetireError,
+    ProposalDecision, Reject, RetireError,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -89,8 +89,8 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.decide",
-            "Complete a specific human task with a message or captured workspace. The result goes to all connected successors.",
-            json!({"run_id":text,"node":text,"task_id":text,"message":text,"workspace_id":text}),
+            "Complete a specific human task with a message or captured workspace. The result goes to all connected successors, carrying the task's authority unless authority requests a declared transition.",
+            json!({"run_id":text,"node":text,"task_id":text,"message":text,"workspace_id":text,"authority":{"type":"array","items":{"type":"string"}}}),
             &["run_id", "node", "task_id"],
             true,
         ),
@@ -230,6 +230,7 @@ pub fn plan(
     ))
 }
 
+/// A new run's declaration and initial workflow from flow.start's arguments.
 pub fn prepare_start(
     service: &Service,
     args: &Value,
@@ -238,12 +239,31 @@ pub fn prepare_start(
     crate::declarations::GraphDeclaration,
     runtime::InitialWorkflow,
 )> {
+    prepare(service, args, id, true)
+}
+
+/// As `prepare_start`, but a retry (`new` false) repeats a start accepted
+/// under the rules of its time.
+fn prepare(
+    service: &Service,
+    args: &Value,
+    id: &str,
+    new: bool,
+) -> Result<(
+    crate::declarations::GraphDeclaration,
+    runtime::InitialWorkflow,
+)> {
     let document = start_document(service, args)?;
+    // A document given inline is newly written; a saved revision loads as saved.
+    if new && args.get("document").is_some() {
+        document.check_connection_names(None)?;
+    }
     if args.get("message").is_some() && args.get("workspace").is_some() {
         return Err(AppError::invalid("Supply message or workspace, not both"));
     }
     let catalog = components(service)?;
-    let external = catalog.bind(&document)?[&document.entry]
+    let (declaration, mut initial) = plan(&catalog, document, id, None, None)?;
+    let external = initial.state.bindings[&initial.state.current.entry]
         .implementation
         .is_external();
     if external && (args.get("message").is_some() || args.get("workspace").is_some()) {
@@ -252,7 +272,7 @@ pub fn prepare_start(
         ));
     }
     let message = optional_str(args, "message")?.unwrap_or("");
-    let input = (!external).then(|| json!({"message": message}));
+    initial.input = (!external).then(|| json!({"message": message}));
     let workspace = args
         .get("workspace")
         .map(|value| {
@@ -272,7 +292,8 @@ pub fn prepare_start(
             Ok(path)
         })
         .transpose()?;
-    plan(&catalog, document, id, input, workspace)
+    initial.workspace = workspace;
+    Ok((declaration, initial))
 }
 
 pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Result<Value> {
@@ -280,14 +301,13 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         return library(service);
     }
     if operation == "flow.define" {
-        return save_document(
-            service,
-            &serde_json::from_value(
-                args.get("document")
-                    .cloned()
-                    .ok_or_else(|| AppError::invalid("document is required"))?,
-            )?,
-        );
+        let document: Document = serde_json::from_value(
+            args.get("document")
+                .cloned()
+                .ok_or_else(|| AppError::invalid("document is required"))?,
+        )?;
+        document.check_connection_names(None)?;
+        return save_document(service, &document);
     }
     if operation == "flow.start" {
         let id = optional_str(args, "start_id")?
@@ -295,8 +315,9 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         uuid::Uuid::parse_str(&id).map_err(|_| AppError::invalid("start_id must be a UUID"))?;
         let project = std::fs::canonicalize(views::field(args, "project")?)?;
-        let (mut declaration, mut initial) = prepare_start(service, args, &id)?;
-        if let Ok(run) = service.run(&id).await {
+        let existing = service.run(&id).await.ok();
+        let (mut declaration, mut initial) = prepare(service, args, &id, existing.is_none())?;
+        if let Some(run) = existing {
             let run = run.lock().await;
             let original = &run.manifest.workflow;
             if original.state.current != initial.state.current
@@ -871,6 +892,13 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
             ));
         }
     };
+    let payload = result.encode()?;
+    let authority = match args.get("authority") {
+        Some(value) => OutputAuthority::Transition(views::authority(&serde_json::from_value::<
+            Vec<String>,
+        >(value.clone())?)?),
+        None => OutputAuthority::Carry,
+    };
     let session = &run.live()?.session;
     let core_node = &state.identities.nodes[node];
     let input = if task.task.is_initial() {
@@ -903,18 +931,19 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
         )
         .await
         .map_err(AppError::core)?;
-    let payload = result.encode()?;
     let emissions = kernel
         .graph()
         .edges()
         .iter()
         .filter(|edge| edge.source() == core_node)
-        .map(|edge| Emission::new(edge.id(), OutputAuthority::Carry, payload.clone()))
+        .map(|edge| Emission::new(edge.id(), authority.clone(), payload.clone()))
         .collect();
     let contents = dependencies(session, &payload).await?;
     let directory = runtime::node_directory(run, core_node);
+    let path = directory.join("output.json");
+    let previous: Option<Value> = persistence::read_json(&path).ok();
     let mut output = json!({"node":node,"invocation_id":invocation.id().to_string(),"result":result,"publication_status":"prepared"});
-    persistence::write_json(&directory.join("output.json"), &output)?;
+    persistence::write_json(&path, &output)?;
     match invocation
         .submit(payload, emissions, contents)
         .await
@@ -924,16 +953,48 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
             output["publication_status"] = json!("committed");
             // Core has committed; these caches can be reconstructed if either
             // write fails. A cache failure must not invite repeating the work.
-            let _ = persistence::write_json(&directory.join("output.json"), &output);
+            let _ = persistence::write_json(&path, &output);
             if task.task.is_initial() {
                 let _ = runtime::complete_initial(&directory);
             }
             status(run).await
         }
         ProposalDecision::Rejected(error) => {
-            Err(AppError::new("stale_task", views::rejection(&error)))
+            // The task stays ready for a corrected decision; the node keeps its last result.
+            let _ = match &previous {
+                Some(previous) => persistence::write_json(&path, previous),
+                None => std::fs::remove_file(&path).map_err(AppError::from),
+            };
+            Err(refusal(state, &error))
         }
     }
+}
+
+/// Why core refused a decision, in workflow terms. An authority refusal
+/// names its rule, so the decision can be corrected.
+fn refusal(state: &edit::WorkflowState, reject: &Reject) -> AppError {
+    let message = match reject {
+        Reject::AuthorityOutsideSchema { authority, .. } => {
+            format!(
+                "authority {} has a tag this run does not declare",
+                json!(authority)
+            )
+        }
+        Reject::UnauthorizedAuthorityTransition { from, to, .. } => format!(
+            "no declared transition changes authority {} to {}",
+            json!(from),
+            json!(to)
+        ),
+        Reject::EdgeAuthorityMismatch {
+            edge_id, authority, ..
+        } => format!(
+            "connection {:?} does not admit authority {}",
+            edit::edge_label(&state.edge_names(), edge_id),
+            json!(authority)
+        ),
+        _ => views::rejection(reject),
+    };
+    AppError::new("rejected", message)
 }
 
 /// Saved edit approvals use core package IDs internally; callers identify the

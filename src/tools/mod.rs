@@ -44,6 +44,17 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         }
         "inspect.wait_frontier" => workflow::dispatch_wait(service, args).await,
         name if name.starts_with("flow.") => {
+            // A session's reservation holds even for starts outside any session.
+            if name == "flow.start"
+                && let Some(id) = args.get("start_id").and_then(Value::as_str)
+                && let Some(owner) = service.sessions.owner(id).await
+            {
+                return Err(AppError::new(
+                    "run_already_owned",
+                    "a session reserves this run; start it through that session",
+                )
+                .details(json!({"session_id":owner})));
+            }
             crate::workflow::tools::dispatch(service, operation, args).await
         }
         name if name.starts_with("execution.") => {

@@ -5,7 +5,9 @@
 //! and core's graph records whether it applied: recovery computes the edit
 //! again and finds either the whole edit or nothing left to do.
 
-use super::components::{Binding, Bindings, BoundNode, Catalog};
+#[cfg(test)]
+use super::components::Catalog;
+use super::components::{Binding, Bindings, BoundNode};
 use super::document::{CoreNode, Document, IdentityMap};
 use crate::declarations::{EdgeDeclaration, GraphFragmentDeclaration};
 use crate::{AppError, Result, persistence};
@@ -45,7 +47,6 @@ pub struct WorkflowState {
     pub version: u64,
     pub current: Document,
     /// What each node of `current` is bound to.
-    #[serde(default)]
     pub bindings: Bindings,
     pub identities: IdentityMap,
     pub pending: Option<Plan>,
@@ -60,22 +61,6 @@ impl WorkflowState {
             identities,
             pending: None,
         })
-    }
-
-    /// State saved before components had no bindings. Its documents could
-    /// only place built-in components, which bind the same way today.
-    pub fn with_bindings(mut self) -> Result<Self> {
-        if self.bindings.is_empty() {
-            self.bindings = Catalog::builtin().bind(&self.current)?;
-        }
-        if let Some(plan) = self
-            .pending
-            .as_mut()
-            .filter(|plan| plan.bindings.is_empty())
-        {
-            plan.bindings = Catalog::builtin().bind(&plan.document)?;
-        }
-        Ok(self)
     }
 
     /// A new run's state for a document that places only built-in components.
@@ -165,13 +150,11 @@ pub struct Plan {
     pub document: Document,
     /// Bindings made when the plan was previewed; a later library change
     /// cannot alter an accepted edit.
-    #[serde(default)]
     pub bindings: Bindings,
     pub identities: IdentityMap,
     pub retirements: BTreeMap<String, String>,
     /// Nodes and connections the edit adds to or removes from core's graph;
     /// none when only settings change.
-    #[serde(alias = "steps")]
     pub changes: usize,
 }
 
@@ -184,7 +167,7 @@ pub struct EditOutcome {
 }
 
 pub fn load(path: &Path) -> Result<WorkflowState> {
-    persistence::read_json::<WorkflowState>(path)?.with_bindings()
+    persistence::read_json(path)
 }
 
 pub fn store(path: &Path, state: &WorkflowState) -> Result<()> {
@@ -223,6 +206,7 @@ pub async fn preview(
         }
         (pending.bindings.clone(), pending.identities.clone())
     } else {
+        document.check_connection_names(Some(&state.current))?;
         if graph_edit(&kernel, &state.current, &state.bindings, &state.identities)?.is_some() {
             return Err(AppError::new(
                 "workflow_drift",
@@ -941,35 +925,28 @@ mod tests {
         assert_eq!(error.code, "unknown_authority_tag");
     }
 
-    #[test]
-    fn state_saved_before_components_binds_its_built_in_kinds() {
-        let (_directory, _runtime, _session, state) = fixture();
-        let mut saved = serde_json::to_value(&state).unwrap();
-        saved.as_object_mut().unwrap().remove("bindings");
-        for node in saved["current"]["nodes"].as_array_mut().unwrap() {
-            let component = node.as_object_mut().unwrap().remove("component").unwrap();
-            node["kind"] = component;
-        }
-        let loaded: WorkflowState = serde_json::from_value(saved).unwrap();
-        assert!(loaded.bindings.is_empty());
-        let loaded = loaded.with_bindings().unwrap();
-        assert_eq!(loaded.bindings, state.bindings);
-        assert_eq!(loaded.current, state.current);
-    }
-
     #[tokio::test]
-    async fn plans_saved_with_steps_still_load() {
-        let (directory, _runtime, session, mut state) = fixture();
+    async fn runs_from_before_the_connection_name_rule_stay_editable() {
+        // Documents could once name a connection like a node.
+        let mut legacy = document();
+        legacy.edges[0].name = Some("review".into());
+        let (directory, _runtime, session, mut state) = fixture_with(legacy);
         let mut next = state.current.clone();
-        next.edges.clear();
-        state.pending = Some(preview(&session, &state, next).await.unwrap());
-        let mut saved = serde_json::to_value(&state).unwrap();
-        let pending = saved["pending"].as_object_mut().unwrap();
-        let changes = pending.remove("changes").unwrap();
-        pending.insert("steps".into(), changes);
+        next.nodes
+            .iter_mut()
+            .find(|node| node.id == "writer")
+            .unwrap()
+            .config = json!({"prompt":"after"});
+        // An accepted edit that keeps the name can be previewed again.
+        state.pending = Some(preview(&session, &state, next.clone()).await.unwrap());
+        let plan = preview(&session, &state, next).await.unwrap();
         let path = directory.path().join("workflow.json");
-        persistence::write_json(&path, &saved).unwrap();
-        assert_eq!(load(&path).unwrap().pending.unwrap().changes, 1);
+        commit(&session, &mut state, &path, plan).await.unwrap();
+        // Only a name the edit introduces is refused.
+        let mut shadowing = state.current.clone();
+        shadowing.edges[0].name = Some("writer".into());
+        let error = preview(&session, &state, shadowing).await.unwrap_err();
+        assert_eq!(error.code, "invalid_workflow_document");
     }
 
     #[tokio::test]

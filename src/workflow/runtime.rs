@@ -57,7 +57,7 @@ pub fn load(run: &ManagedRun) -> Result<WorkflowState> {
     if path.exists() {
         edit::load(&path)
     } else {
-        let state = initial.state.clone().with_bindings()?;
+        let state = initial.state.clone();
         edit::store(&path, &state)?;
         Ok(state)
     }
