@@ -295,3 +295,33 @@ async fn shutdown_suspends_every_run_it_can_and_names_the_rest() {
     service.shutdown().await.unwrap();
     assert!(!service.has_live_runs());
 }
+
+#[tokio::test]
+async fn a_restarted_service_removes_metadata_writes_a_crash_cut_short() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let paths = Paths::initialize(root.path().join("data")).unwrap();
+    let service = Service::new(paths.clone()).unwrap();
+    let run_id = start(&service, project.path()).await;
+    service.shutdown().await.unwrap();
+    drop(service);
+    let run = paths.root.join("runs").join(&run_id);
+    let node = std::fs::read_dir(run.join("nodes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let leftover = |directory: &Path| directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let (in_run, in_node) = (leftover(&run), leftover(&node));
+    // What a node's program makes in its own directory is its own.
+    let working = node.join("workspace");
+    std::fs::create_dir_all(&working).unwrap();
+    let (kept, other) = (leftover(&working), node.join(".notes.tmp"));
+    for path in [&in_run, &in_node, &kept, &other] {
+        std::fs::write(path, b"partial").unwrap();
+    }
+    let _service = Service::new(paths).unwrap();
+    assert!(!in_run.exists() && !in_node.exists());
+    assert!(kept.exists() && other.exists());
+}

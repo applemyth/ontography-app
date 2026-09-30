@@ -407,8 +407,53 @@ fn create_reserved_directory(directory: &std::path::Path) -> Result<()> {
     }
 }
 
+/// Whether `name` is the temporary `write_json` writes beside its target.
+fn is_metadata_temporary(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix('.')?.strip_suffix(".tmp"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+/// A metadata write cut short by a crash leaves its temporary beside the file
+/// it was replacing. Only the server that holds the data directory writes
+/// them, so any found as it starts are leftovers. Only the app's own
+/// metadata directories are swept: a node's working directory holds whatever
+/// its program made.
+fn remove_leftover_temporaries(root: &std::path::Path) {
+    let entries = |directory: &std::path::Path| {
+        std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    let mut directories = vec![
+        root.join("definitions"),
+        root.join("definitions/workflows"),
+        root.join("sessions"),
+    ];
+    for session in entries(&root.join("sessions")) {
+        directories.push(session.path());
+    }
+    for run in entries(&root.join("runs")) {
+        directories.push(run.path().join("edit-plans"));
+        directories.extend(entries(&run.path().join("nodes")).iter().map(|n| n.path()));
+        directories.push(run.path());
+    }
+    for directory in directories {
+        for entry in entries(&directory) {
+            if is_metadata_temporary(&entry.file_name())
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 impl Service {
     pub fn new(paths: Paths) -> Result<Self> {
+        remove_leftover_temporaries(&paths.root);
         let environment = programs(&paths, Environment::current());
         let mut runs = BTreeMap::new();
         let mut recovery_errors = BTreeMap::new();
