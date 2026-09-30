@@ -1,10 +1,10 @@
 use super::{Fixture, document};
-use crate::{node_mcp::NodeMcp, protocol};
+use crate::{node_mcp::NodeMcp, node_tool::context::context_error, protocol};
 use ontography::{ContentDigest, InvocationId, ReceiptState};
 use serde_json::{Value, json};
 use std::{os::unix::fs::PermissionsExt, process::Stdio, str::FromStr, time::Duration};
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, ChildStdin, ChildStdout, Command},
 };
@@ -288,6 +288,85 @@ async fn receipt_delivery_waits_for_stdout_ack_and_lost_replies_stay_prepared() 
     assert!(!events.iter().any(
         |event| event.receipt_sequence == receipt.sequence && event.state == ReceiptState::Sent
     ));
+    drop(server);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn an_acknowledgement_after_its_attempt_ended_keeps_the_proxy_serving() {
+    let (fixture, _directory, server) = hosted(json!({})).await;
+    // Larger than a pipe holds: the proxy acknowledges reading this input
+    // only after the client has read the whole reply.
+    fixture.deliver(&"x".repeat(200 * 1024)).await;
+    let mut client = Client::new(&server).await;
+    let next = tool_value(&client.call(1, "next_trigger", json!({})).await);
+    let begun = tool_value(
+        &client
+            .call(2, "begin_invocation", json!({"task_id":next["task_id"]}))
+            .await,
+    );
+    let attempt = begun["attempt_id"].as_str().unwrap();
+    client.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_package","arguments":{"attempt_id":attempt,"handle":begun["inputs"][0]["handle"]}}})).await;
+    // Once the reply is being written, core ends the attempt before the
+    // client has read it, as when an attempt is abandoned.
+    tokio::time::timeout(Duration::from_secs(5), client.output.fill_buf())
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .tools
+        .with_attempt(attempt, async |attempt, _| {
+            attempt
+                .invocation
+                .interrupt("ended during delivery")
+                .await
+                .map_err(context_error)
+        })
+        .await
+        .unwrap();
+    let read = client.read().await;
+    assert_eq!(read["id"], 3);
+    let digest = ContentDigest::compute(
+        read["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_bytes(),
+    );
+    // The late acknowledgement leaves the receipt prepared, and the
+    // connection keeps serving calls.
+    assert_eq!(
+        tool_value(&client.call(4, "inspect_node", json!({})).await)["node"],
+        "worker"
+    );
+    let events = fixture
+        .session
+        .invocation_events(InvocationId::from_str(attempt).unwrap(), 0, 100)
+        .await
+        .unwrap();
+    let receipt = events
+        .iter()
+        .find(|event| event.content_digest == digest)
+        .unwrap();
+    assert!(!events.iter().any(
+        |event| event.receipt_sequence == receipt.sequence && event.state == ReceiptState::Sent
+    ));
+    client.close().await;
+    drop(server);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn an_unknown_acknowledgement_changes_nothing() {
+    let (fixture, _directory, server) = hosted(json!({})).await;
+    let mut client = Raw::new(&server).await;
+    protocol::write_frame(&mut client.input, &json!({"delivered":42}))
+        .await
+        .unwrap();
+    client
+        .send(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+        .await;
+    assert_eq!(client.read().await["message"]["id"], 1);
+    drop(client);
     drop(server);
     fixture.stop().await;
 }

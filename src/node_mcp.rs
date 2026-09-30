@@ -307,8 +307,13 @@ async fn connection(stream: UnixStream, token: &str, context: Arc<NodeToolContex
                 let incoming: Inbound = serde_json::from_slice(&bytes?)?;
                 let message = match incoming {
                     Inbound::Delivered { delivered } => {
-                        let reply = pending.remove(&delivered).ok_or_else(|| AppError::invalid("Unknown MCP delivery acknowledgement"))?;
-                        reply.reply.sent().await?;
+                        // The reply was already written, so a mark that fails,
+                        // as when its attempt ended first, leaves its receipt
+                        // prepared, like a lost acknowledgement. Neither that
+                        // nor an unknown acknowledgement affects other calls.
+                        if let Some(reply) = pending.remove(&delivered) {
+                            let _ = reply.reply.sent().await;
+                        }
                         continue;
                     }
                     Inbound::Message { message } => message,
