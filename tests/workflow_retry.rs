@@ -150,15 +150,20 @@ async fn a_definition_change_unparks_even_after_a_failed_ledger_write() {
         json!({"run_id":run_id,"document":document}),
     )
     .await;
-    let committed = tools::dispatch(
+    let committed = call(
         &service,
         "flow.commit",
-        &json!({"run_id":run_id,"plan_id":plan["plan_id"]}),
+        json!({"run_id":run_id,"plan_id":plan["plan_id"]}),
     )
     .await;
-    // The edit is live, but its failures could not be forgotten yet.
-    assert!(committed.is_err(), "{committed:?}");
-    // The disk recovers; the manager resumes, as the error suggests.
+    // The edit is live, but its failures could not be forgotten yet: the
+    // reply says so with a warning, since an error would invite a repeat.
+    assert!(committed["warning"]["code"].is_string(), "{committed}");
+    assert_eq!(
+        committed["version"],
+        status["version"].as_u64().unwrap() + 1
+    );
+    // The disk recovers; the manager resumes, as the warning suggests.
     std::fs::remove_dir(&ledger).unwrap();
     call(&service, "flow.resume", json!({"run_id":run_id})).await;
     let mut status = Value::Null;

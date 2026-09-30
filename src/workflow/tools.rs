@@ -13,7 +13,7 @@ use crate::{
     views,
 };
 use ontography::{
-    ContextPolicy, Emission, InvocationTrigger, OutputAuthority, PackageStore, Payload,
+    ContextPolicy, Emission, InvocationTrigger, OutputAuthority, PackageId, PackageStore, Payload,
     ProposalDecision, Reject, RetireError,
 };
 use serde::Serialize;
@@ -103,7 +103,7 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.discard",
-            "Discard a parked task so it is never attempted again: its pending input is retired, or a parked initial input is marked complete. Take its task_id from status failures.",
+            "Discard a parked task, or a human task no decision can satisfy, so it is never attempted again: its pending input is retired, or the initial input is marked complete. Take a parked task_id from status failures, a human one from status tasks.",
             task,
             &["run_id", "node", "task_id"],
             true,
@@ -338,7 +338,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         service
             .start_reserved(&id, declaration, project, initial, service.environment())
             .await?;
-        return status(&*service.run(&id).await?.lock().await).await;
+        return applied(&*service.run(&id).await?.lock().await, None).await;
     }
     let id = views::field(args, "run_id")?;
     let handle = service.run(id).await?;
@@ -352,7 +352,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         "flow.output" => output::inspect(&run, &state, args).await,
         "flow.resume" => {
             run.resume().await?;
-            status(&run).await
+            applied(&run, None).await
         }
         "flow.promote" => {
             if state.pending.is_some() {
@@ -397,8 +397,10 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             edit::commit(&session, &mut state, &runtime::state_path(&run), plan)
                 .await
                 .map_err(public_error)?;
-            runtime::reconcile(&mut run, &state, false).await?;
-            status(&run).await
+            // The edit is saved; workers that failed to restart for it are a
+            // warning, since flow.resume or their own restart applies it.
+            let reconciled = runtime::reconcile(&mut run, &state, false).await.err();
+            applied(&run, reconciled).await
         }
         "flow.decide" => decide(&mut run, &state, args).await,
         "flow.retry" => {
@@ -411,7 +413,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
                 }
                 None => ledger.retry_all()?,
             }
-            status(&run).await
+            applied(&run, None).await
         }
         "flow.discard" => discard(&run, &state, args).await,
         "flow.workspace" => {
@@ -737,8 +739,17 @@ fn unknown_failure() -> AppError {
     )
 }
 
+fn stale_task() -> AppError {
+    AppError::new(
+        "stale_task",
+        "This task is no longer ready; read status again",
+    )
+}
+
 /// Retires a parked task's input before forgetting it. Its worker never
-/// selects a parked task, so no attempt can start in between.
+/// selects a parked task, so no attempt can start in between. A human task
+/// is discarded while it waits: only a decision would end it otherwise, and
+/// one that no decision can satisfy would hold up every task behind it.
 async fn discard(run: &ManagedRun, state: &edit::WorkflowState, args: &Value) -> Result<Value> {
     if state.pending.is_some() {
         return Err(AppError::new(
@@ -746,8 +757,22 @@ async fn discard(run: &ManagedRun, state: &edit::WorkflowState, args: &Value) ->
             "Complete the edit before discarding a task",
         ));
     }
-    let (node, ledger) = failure_ledger(run, state, args)?;
     let key = TaskKey::parse(views::field(args, "task_id")?)?;
+    let name = views::field(args, "node")?;
+    if matches!(
+        state.binding(name)?.implementation,
+        Implementation::Human(_)
+    ) {
+        let task = ready_tasks(run, state, Some(name), initial_holder(run).await?)
+            .await?
+            .into_iter()
+            .map(|candidate| candidate.task)
+            .find(|task| task.key == key)
+            .ok_or_else(stale_task)?;
+        end_task(run, &state.identities.nodes[name], &task.ids()).await?;
+        return applied(run, None).await;
+    }
+    let (node, ledger) = failure_ledger(run, state, args)?;
     let failures = ledger.get(&key).ok_or_else(unknown_failure)?;
     if !failures.parked {
         return Err(AppError::new(
@@ -769,19 +794,78 @@ async fn discard(run: &ManagedRun, state: &edit::WorkflowState, args: &Value) ->
         let _ = ledger.clear(&key);
         return Err(unknown_failure());
     }
-    if failures.inputs.is_empty() {
+    end_task(run, node, &failures.inputs).await?;
+    // The record is stale now, and status drops a stale record, so failing to
+    // forget it here changes nothing: the task is discarded either way.
+    let _ = ledger.clear(&key);
+    applied(run, None).await
+}
+
+/// Ends a task for good: retires its inputs, or marks the run's initial input
+/// complete. Inputs retire one at a time, so an error names those already
+/// retired.
+async fn end_task(run: &ManagedRun, node: &str, inputs: &[PackageId]) -> Result<()> {
+    if inputs.is_empty() {
         // The initial input is not a package; completing it ends its attempts.
-        runtime::complete_initial(&runtime::node_directory(run, node))?;
+        return runtime::complete_initial(&runtime::node_directory(run, node));
     }
-    for input in &failures.inputs {
-        match session.retire(*input, None).await.map_err(AppError::core)? {
+    let session = &run.live()?.session;
+    let mut retired = Vec::new();
+    for input in inputs {
+        let refused = match session.retire(*input, None).await {
             // Consumed or retired elsewhere: nothing is left to discard.
-            Ok(_) | Err(RetireError::NotLive(_)) => {}
-            Err(error) => return Err(views::retire_refusal(&error)),
+            Ok(Ok(_) | Err(RetireError::NotLive(_))) => None,
+            Ok(Err(error)) => Some(views::retire_refusal(&error)),
+            Err(error) => Some(AppError::core(error)),
+        };
+        if let Some(error) = refused {
+            if retired.is_empty() {
+                return Err(error);
+            }
+            let message = format!(
+                "{}; {} of the task's inputs were already retired",
+                error.message,
+                retired.len()
+            );
+            return Err(AppError::new(error.code, message).details(json!({"retired":retired})));
         }
+        retired.push(tasks::work_id(input));
     }
-    ledger.clear(&key)?;
-    status(run).await
+    Ok(())
+}
+
+/// How many failed tasks status lists, in document order; `failures_total`
+/// counts them all. Each error is already bounded, so the list is too.
+const LISTED_FAILURES: usize = 100;
+
+/// The largest status a change's reply carries; status alone may use the
+/// whole response budget.
+const APPLIED_STATUS_BYTES: usize = crate::protocol::MAX_FRAME_BYTES / 4;
+
+/// The reply to a change that has been applied. Nothing after the change
+/// turns into an error, which would invite repeating it: a later step that
+/// failed is a `warning`, and a status that cannot be read, or would be too
+/// large to send, is replaced by `{"applied":true,"run_id":…,"status_error":…}`.
+async fn applied(run: &ManagedRun, warning: Option<AppError>) -> Result<Value> {
+    let mut reply = applied_reply(&run.manifest.run_id, status(run).await);
+    if let Some(warning) = warning {
+        reply["warning"] = json!(warning);
+    }
+    Ok(reply)
+}
+
+fn applied_reply(run_id: &str, status: Result<Value>) -> Value {
+    let error = match status {
+        Ok(status) => match serde_json::to_vec(&status) {
+            Ok(bytes) if bytes.len() <= APPLIED_STATUS_BYTES => return status,
+            _ => AppError::new(
+                "result_too_large",
+                "the run's status is too large for this reply; the change was applied",
+            ),
+        },
+        Err(error) => error,
+    };
+    json!({"applied":true,"run_id":run_id,"status_error":error})
 }
 
 pub async fn status(run: &ManagedRun) -> Result<Value> {
@@ -791,9 +875,10 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
     for candidate in ready_tasks(run, &state, None, initial).await? {
         tasks.push(task_view(run, candidate).await?);
     }
-    let failures: Vec<_> = failed_tasks(run, &state, None, initial)
-        .await?
+    let failed = failed_tasks(run, &state, None, initial).await?;
+    let failures: Vec<_> = failed
         .iter()
+        .take(LISTED_FAILURES)
         .map(Failed::view)
         .collect();
     let counts = if let Some(live) = &run.live {
@@ -823,7 +908,8 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
     // The existing graph view uses workflow names, including intermediate
     // topology during an unfinished edit. No incarnation IDs leave this view.
     let mut result = json!({"run_id":run.manifest.run_id,"version":state.version,"document":state.current,"status":run.summary()["status"],
-        "pending_edit":state.pending.as_ref().map(|plan|json!({"plan_id":plan.id,"document":plan.document})),"nodes":nodes,"tasks":tasks,"failures":failures});
+        "pending_edit":state.pending.as_ref().map(|plan|json!({"plan_id":plan.id,"document":plan.document})),"nodes":nodes,"tasks":tasks,"failures":failures,
+        "failures_total":failed.len()});
     if let Some(view) = counts {
         let names = state.node_names(view.kernel());
         let name = |id: &str| edit::label(&names, id);
@@ -863,12 +949,7 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
         .await?
         .into_iter()
         .find(|task| task.node == node && task.task_id == args["task_id"])
-        .ok_or_else(|| {
-            AppError::new(
-                "stale_task",
-                "This task is no longer ready; read status again",
-            )
-        })?;
+        .ok_or_else(stale_task)?;
     if !matches!(
         state.binding(node)?.implementation,
         Implementation::Human(_)
@@ -957,7 +1038,7 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
             if task.task.is_initial() {
                 let _ = runtime::complete_initial(&directory);
             }
-            status(run).await
+            applied(run, None).await
         }
         ProposalDecision::Rejected(error) => {
             // The task stays ready for a corrected decision; the node keeps its last result.
@@ -971,7 +1052,9 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
 }
 
 /// Why core refused a decision, in workflow terms. An authority refusal
-/// names its rule, so the decision can be corrected.
+/// names its rule, so the decision can be corrected; a task that no decision
+/// can satisfy, since every connection must accept the same one, is
+/// discarded instead.
 fn refusal(state: &edit::WorkflowState, reject: &Reject) -> AppError {
     let message = match reject {
         Reject::AuthorityOutsideSchema { authority, .. } => {
@@ -994,7 +1077,12 @@ fn refusal(state: &edit::WorkflowState, reject: &Reject) -> AppError {
         ),
         _ => views::rejection(reject),
     };
-    AppError::new("rejected", message)
+    AppError::new(
+        "rejected",
+        format!(
+            "{message}. The task stays ready: correct the decision, or discard the task with flow.discard if no decision can satisfy every outgoing connection"
+        ),
+    )
 }
 
 /// Saved edit approvals use core package IDs internally; callers identify the
@@ -1058,4 +1146,26 @@ async fn retirements(
         result.push(json!({"work_id":tasks::work_id(&package),"node":node,"reason":reason}));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_applied_change_replies_with_its_status_or_says_why_not() {
+        let status = json!({"run_id":"run","failures":[],"failures_total":0});
+        assert_eq!(applied_reply("run", Ok(status.clone())), status);
+        let unreadable = applied_reply("run", Err(AppError::core("storage failed")));
+        assert_eq!(unreadable["applied"], true);
+        assert_eq!(unreadable["run_id"], "run");
+        assert_eq!(unreadable["status_error"]["code"], "core_error");
+        let large = applied_reply(
+            "run",
+            Ok(json!({"document":"x".repeat(APPLIED_STATUS_BYTES)})),
+        );
+        assert_eq!(large["applied"], true);
+        assert_eq!(large["run_id"], "run");
+        assert_eq!(large["status_error"]["code"], "result_too_large");
+    }
 }

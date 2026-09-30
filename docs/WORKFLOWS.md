@@ -148,7 +148,10 @@ every outgoing connection; if one refuses it, core rejects the whole
 submission. Commands retry under their task policy, except that output core
 refuses, for its contract or as a stdout package envelope, parks at once;
 storage faults still retry. Human tasks remain ready
-for a corrected decision. Agents choose connections, authority transitions, and
+for a corrected decision. A human node's tasks wait in turn, so one that no
+decision can satisfy, say because two of its connections admit no common
+authority, would hold up the rest: `flow.discard` retires it instead, and the
+next becomes ready. Agents choose connections, authority transitions, and
 outbound object types with the node tools; see [Node tools](NODE_TOOLS.md).
 A run's contracts and authority tags are fixed when it starts: an edit that
 changes a contract or uses a new tag is refused, and needs a new run.
@@ -407,6 +410,16 @@ version or unexpected graph changes. If a response is
 lost, read `operation.get` or current status before retrying. Repeating a saved
 commit recovers that edit; accepted initial input is not replayed on resume.
 
+`flow.start`, `flow.resume`, `flow.commit`, `flow.decide`, `flow.retry`, and
+`flow.discard` reply with the run's status once their change is applied, and
+nothing after that turns the reply into an error. A commit whose workers did
+not all restart adds a `warning`; `flow.resume` restarts them. If the status
+cannot be read, or exceeds 1 MiB, the reply is
+`{"applied":true,"run_id":…,"status_error":…}` instead: the change stands,
+so read `flow.status` rather than repeat it. Other changes whose result is too
+large to send fail with `result_too_large` and `details.committed`, as
+`flow.edit` would for a document of several MiB.
+
 `flow.define` saves a reusable document revision. `flow.start` accepts that
 `revision` instead of a document. `flow.promote` saves the current run document
 as a reusable revision after any pending edit finishes.
@@ -499,8 +512,9 @@ such as a task that received two workspaces or a workspace that is not a
 directory, an input core refuses to begin, or output core refuses, like
 non-UTF-8 stdout under `text` or a package envelope on stdout. A parked task
 stays pending, and
-no attempt starts until the manager intervenes. `flow.status` lists failed
-tasks in `failures`:
+no attempt starts until the manager intervenes. `flow.status` lists up to 100
+failed tasks, in document order, in `failures`, and counts all of them in
+`failures_total`:
 
 ```json
 {"node":"draft","task_id":"task_…","attempts":1,"state":"retrying","retry_in_secs":5,
@@ -517,7 +531,9 @@ or parked appears only in `failures`. Its `task_id` also selects its input in
   at the node.
 - `flow.discard` with `node` and `task_id` retires a parked task's pending
   input; the run's initial input is marked complete instead. Either way, the
-  task is never attempted again.
+  task is never attempted again. It discards a human node's ready task from
+  `tasks` the same way. A join's inputs retire one at a time; if one fails,
+  the error's `details.retired` lists the `work_id`s already retired.
 - Any change to a node's definition (its config, retry, grants, join, or kind)
   gives its failed tasks fresh attempts. The node's worker, or `flow.resume`,
   applies it even if the edit reported an error, and an attempt already
