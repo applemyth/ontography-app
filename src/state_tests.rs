@@ -1,10 +1,10 @@
 //! Lifecycle gates at the public service boundary, using real core ownership.
 
-use crate::persistence::Paths;
-use crate::state::Service;
+use crate::persistence::{Paths, read_json};
+use crate::state::{RunManifest, Service};
 use crate::tools;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::{os::unix::fs::MetadataExt, path::PathBuf};
 
 /// An outside client feeds a command worker, the run's one execution.
 fn document() -> Value {
@@ -132,5 +132,32 @@ async fn a_closed_run_never_starts_its_workers_again() {
         .unwrap();
     assert_eq!(readable["admission"], "closed");
     assert!(readable["executions"].as_array().unwrap().is_empty());
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn opening_a_closed_run_leaves_its_manifest_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths::initialize(directory.path().join("data")).unwrap();
+    let service = Service::new(paths.clone()).unwrap();
+    let run_id = start(&service, directory.path()).await;
+    tools::dispatch(&service, "run.close", &json!({"run_id":run_id}))
+        .await
+        .unwrap();
+    let path = paths.run(&run_id).unwrap().join("manifest.json");
+    let closed = std::fs::metadata(&path).unwrap().ino();
+    tools::dispatch(&service, "run.resume", &json!({"run_id":run_id}))
+        .await
+        .unwrap();
+    let manifest: RunManifest = read_json(&path).unwrap();
+    assert_eq!(manifest.status, "closed");
+    // Nothing changed, so nothing was written.
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), closed);
+    // A server stopped now leaves it closed, not recoverable.
+    let restarted = Service::new(paths).unwrap();
+    let listed = tools::dispatch(&restarted, "run.list", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(listed["runs"][0]["status"], "closed");
     service.shutdown().await.unwrap();
 }

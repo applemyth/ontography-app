@@ -256,13 +256,22 @@ impl ManagedRun {
         let session = runtime
             .open_persistent(self.core_path()?)
             .map_err(AppError::core)?;
+        // A closed run stays closed; only its reads come back.
+        let status = if session.status() == SessionStatus::Closed {
+            "closed"
+        } else {
+            "active"
+        };
         self.live = Some(LiveRun::new(runtime, session));
         self.live
             .as_mut()
             .expect("opened")
             .checkouts
             .append(&mut self.recovery_checkouts);
-        self.manifest.status = "active".into();
+        if self.manifest.status == status {
+            return Ok(());
+        }
+        self.manifest.status = status.into();
         self.save()
     }
 
