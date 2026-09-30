@@ -629,22 +629,6 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, args: &Args) -> Result<
         for name in stage.names.values() {
             stage.note(name, &format!("CRASH {crashes}"));
         }
-        // What the crash struck, kept with the trial.
-        let struck: String = live
-            .iter()
-            .map(|(p, l)| {
-                format!(
-                    "{} {} {} {:?} ppid {}: {}\n",
-                    p.pid,
-                    stage.name(l.session.as_deref()),
-                    l.role,
-                    l.generation,
-                    p.ppid,
-                    p.command
-                )
-            })
-            .collect();
-        std::fs::write(dir.join(format!("crash-{crashes}.txt")), struck)?;
         let shells = live
             .iter()
             .filter(|(_, l)| l.role == Role::Shell)
@@ -671,11 +655,30 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, args: &Args) -> Result<
                 sockets,
                 at,
             });
-        // What the crash itself did not end.
+        // What the crash itself did not end, kept with the trial.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        left_by_crashes += stage
-            .alive(|p, l| stage.crash_of(p, l) == Some(crashes))
-            .len();
+        let left = stage.alive(|p, l| stage.crash_of(p, l) == Some(crashes));
+        left_by_crashes += left.len();
+        let struck: String = live
+            .iter()
+            .map(|(p, l)| {
+                let fate = if left.iter().any(|(q, _)| key(q) == key(p)) {
+                    "survived"
+                } else {
+                    "ended"
+                };
+                format!(
+                    "{} {} ({}, {fate}) ppid {} generation {:?}: {}\n",
+                    p.pid,
+                    stage.name(l.session.as_deref()),
+                    l.role,
+                    p.ppid,
+                    l.generation,
+                    p.command
+                )
+            })
+            .collect();
+        std::fs::write(dir.join(format!("crash-{crashes}.txt")), struck)?;
         if let Err(error) = server.restart().await {
             handles.iter().for_each(|h| h.abort());
             watching.store(false, Ordering::SeqCst);
@@ -780,26 +783,44 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, args: &Args) -> Result<
         }
     }
     outcome.problems.extend(leftovers(&stage));
-    let tracker = stage.tracker.lock().unwrap_or_else(|p| p.into_inner());
-    outcome.counts.insert("processes", tracker.count());
-    tracker.kill_survivors();
-    drop(tracker);
+    {
+        let tracker = stage.tracker.lock().unwrap_or_else(|p| p.into_inner());
+        outcome.counts.insert("processes", tracker.count());
+        tracker.kill_survivors();
+    }
     // Anything of this trial that escaped the tracker, such as a child
     // started between observations of a crashing server.
-    let marker = stage.witness.to_string_lossy().into_owned();
-    for process in crate::procs::snapshot().unwrap_or_default() {
-        if process.command.contains(&marker) {
-            outcome.problems.push(format!(
-                "untracked process {} of this trial still ran at the end: {}",
-                process.pid, process.command
-            ));
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(process.pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for process in sweep(dir) {
+        outcome.problems.push(format!(
+            "untracked process {} of this trial still ran at the end: {}",
+            process.pid, process.command
+        ));
     }
     Ok(outcome)
+}
+
+/// Kills the fake Pi and its children of the trial in `dir` wherever they
+/// run, and returns those it found running.
+pub fn sweep(dir: &Path) -> Vec<Proc> {
+    let marker = dir.join("witness").to_string_lossy().into_owned();
+    let found: Vec<Proc> = crate::procs::snapshot()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|process| process.command.contains(&marker))
+        .collect();
+    let dead = zombies(&found.iter().map(|p| p.pid).collect::<Vec<_>>());
+    let running: Vec<Proc> = found
+        .into_iter()
+        .filter(|process| !dead.contains(&process.pid))
+        .collect();
+    for process in &running {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(process.pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    running
 }
 
 /// Where `session.list` disagrees with the scripts' models.
@@ -996,16 +1017,35 @@ fn leftovers(stage: &Stage) -> Vec<String> {
                     })
                     .count()
             });
+            // Its parent when the crash struck: its Pi, or none if Pi had
+            // already quit and left it to launchd.
+            let parent = stage
+                .crashes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(leftover.crash - 1)
+                .and_then(|crash| {
+                    crash
+                        .live
+                        .iter()
+                        .find(|(p, _)| key(p) == key(&leftover.process))
+                        .map(|(p, _)| p.ppid)
+                });
+            let why = match (leftover.label.role, parent) {
+                (Role::Child { .. }, Some(1)) => "; its Pi had quit before the crash",
+                (Role::Child { .. }, Some(_)) => "; its Pi ran until the crash",
+                _ => "",
+            };
+            let hangup = match (leftover.label.role, hangups) {
+                (Role::Child { .. }, 0) => "; no SIGHUP reached it".to_owned(),
+                (_, 0) => String::new(),
+                (_, n) => format!("; it ignored {n} SIGHUP"),
+            };
             format!(
-                "process {} of {} ({}{}), running when crash {} struck, still ran after {}: {}",
+                "process {} of {} ({}{why}{hangup}), running when crash {} struck, still ran after {}: {}",
                 leftover.process.pid,
                 stage.name(session),
                 leftover.label.role,
-                if hangups > 0 {
-                    format!("; it ignored {hangups} SIGHUP")
-                } else {
-                    String::new()
-                },
                 leftover.crash,
                 when.join(" and after "),
                 leftover.process.command

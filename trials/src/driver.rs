@@ -747,11 +747,25 @@ impl Driver {
     /// how it was launched.
     async fn await_pi(&mut self, g: u64) -> Played {
         let before = self.last_pi;
-        let view = self
+        let view = match self
             .screen(g, "Pi's READY", PI_START, |v| {
                 ready_pid(v).is_some_and(|pid| Some(pid) != before)
             })
-            .await?;
+            .await
+        {
+            Ok(view) => view,
+            Err(Failure::Problem(problem)) => {
+                // What the server says of its manager tells why.
+                let status = self.terminal_status(g).await.map_or(String::new(), |s| {
+                    format!(
+                        "; the server has {} with error {}",
+                        s["manager_mode"], s["manager_error"]
+                    )
+                });
+                return Err(Failure::Problem(format!("{problem}{status}")));
+            }
+            Err(crash) => return Err(crash),
+        };
         let pid = ready_pid(&view).expect("seen");
         self.until(g, "the server to see Pi running", |s| {
             s["manager_mode"] == "pi" && s["manager_pid"].as_u64() == Some(u64::from(pid))

@@ -272,9 +272,13 @@ async fn play_sessions(
     let clock = Instant::now();
     let mut outcome = sessions::trial(seed, &dir, &binary, &args)
         .await
-        .unwrap_or_else(|error| game::Outcome {
-            problems: vec![format!("the trial could not run: {error:#}")],
-            ..Default::default()
+        .unwrap_or_else(|error| {
+            // Pi's children outlive a server; leave none behind.
+            sessions::sweep(&dir);
+            game::Outcome {
+                problems: vec![format!("the trial could not run: {error:#}")],
+                ..Default::default()
+            }
         });
     let mut seen = std::collections::BTreeSet::new();
     outcome

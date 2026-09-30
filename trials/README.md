@@ -69,8 +69,60 @@ Crashes widen what the judges accept only where the documentation says a
 crash may: a lost reply may or may not have committed, and an interrupted
 program may run again.
 
+## The sessions trial
+
+```sh
+cargo run -p ontography-trials -- sessions --seed 1                   # about ten seconds
+cargo run -p ontography-trials -- sessions --sessions 5 --rounds 3 --crashes 2
+```
+
+Several app sessions share one server, each following a seeded script of
+what a person does with a session's terminal, all at once: attach (resume,
+`terminal.ensure`, then the terminal socket), type lines, resize, browse
+history, detach three ways (`detach`, closing the connection, `ontography
+detach` from another client), try a second controller, `/graph`, `/quit` and
+`pi` at the shell, `exit` at the shell with or without a client, suspend,
+resume and close. This binary is their Pi (`pi` mode, which the server runs
+through a small `pi` script): it registers its conversation as Pi's
+extension does, echoes each line as `ECHO <line>`, reports its size, starts
+children in their own process groups (`/child`, and `/child-hup`, which
+ignores SIGHUP), and records all it sees in a witness file per session. One
+session binds a graph of external nodes with a scoped `flow.start` and plays
+moves at it. Chaos kills the server while shells and Pi are live, once the
+scripts are far enough along; the sessions attach again, which resumes them.
+Then the server stops in order with sessions still live, restarts, and stops
+again.
+
+The judges, from docs/SESSIONS.md and docs/SESSION_DESIGN.md:
+
+- **States**: `session.list` and `terminal.status` agree with each script's
+  model after every step (state, run, conversation, whether the terminal
+  runs, is attached, and shows Pi or the shell), after the play, and after a
+  restart, which starts no terminal.
+- **Terminals**: detaching keeps the shell and Pi; reattaching shows the
+  screen as it is; a second controller is refused; `/quit` keeps the shell,
+  and `pi` there, or a new terminal, resumes the session's saved
+  conversation with the environment of the command that activated the
+  session; history stays frozen while Pi runs on; a closed session never
+  resumes.
+- **Lines**: every line typed shows on screen once, in order, and reached
+  Pi once, in order (the witness); resizing reaches Pi.
+- **Processes**: after a suspension, a close or an orderly stop, nothing of
+  the session runs: shell, launcher, Pi, or Pi's children. Processes are told
+  apart by session ID, so whatever a crash struck, however late it started,
+  is judged with the crash: none may run once its session has resumed or the
+  server has stopped. Each crash's processes are kept in `crash-N.txt`.
+- **Files**: terminal sockets (`pty-*.sock`, `pi-*.sock`), shell rc files and
+  half-written files are gone after each stop, and the server's socket
+  directory too.
+- **Graph**: moves the server accepted are in history once after crashes and
+  restarts, and the run is active, suspended or closed with its session.
+
+A trial with problems keeps `trials/runs/sessions-<seed>`, with a log of
+each session's steps (`s0.log`, …).
+
 ## Not yet played
 
-Sessions and terminals, workspaces, the agent grants
-(`originate`, `send_later`, `retire`), systematic crash points, and scripted
-models for the real Pi, Codex and Claude.
+Agent node terminals, Pi's `/new` and `/resume`, workspaces, the agent
+grants (`originate`, `send_later`, `retire`), systematic crash points, and
+scripted models for the real Pi, Codex and Claude.
