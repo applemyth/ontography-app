@@ -24,6 +24,12 @@ echo $! > "$base/job-ignoring-hangup.pid"
 # terminate.
 perl -e 'use POSIX; POSIX::setsid() or die; select(undef, undef, undef, 0.05) while -e $ARGV[0]' "$base/hold" &
 echo $! > "$base/tool.pid"
+# Asked for, a child in the shell's OS session but a process group of its own,
+# which is neither the shell's job nor in Pi's group.
+if [ -e "$base/own-group" ]; then
+  perl -e 'setpgrp(0, 0); select(undef, undef, undef, 0.05) while -e $ARGV[0]' "$base/hold" &
+  echo $! > "$base/own-group.pid"
+fi
 trap 'kill -KILL -- -$(cat "$base/tool.pid"); exit 143' TERM HUP
 printf ready > "$base/ready"
 while [ -e "$base/hold" ]; do sleep 0.05; done
@@ -45,12 +51,47 @@ struct Fixture {
     server: tokio::process::Child,
     session: Client,
     processes: Vec<(&'static str, Pid)>,
+    paths: Paths,
+    binary: PathBuf,
     _endpoint: Endpoint,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
+}
+
+/// Starts a server on `paths` and connects to it.
+async fn serve(binary: &std::path::Path, paths: &Paths) -> (tokio::process::Child, Client) {
+    let server = tokio::process::Command::new(binary)
+        .arg("--data-dir")
+        .arg(&paths.root)
+        .args(["server", "run", "--detach"])
+        .env_clear()
+        .envs(Environment::current().for_server())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(client) = Client::connect(&paths.socket).await {
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("server must start")
+    .with_environment(Environment::current());
+    (server, client)
 }
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// With `own_group`, Pi also starts a child in a process group of its own.
+    async fn start_with(own_group: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let base = directory.path();
         let paths = Paths::initialize(base.join("store")).unwrap();
@@ -58,32 +99,13 @@ impl Fixture {
         let binary = base.join("ontography-test");
         std::fs::copy(BIN, &binary).unwrap();
         std::fs::write(base.join("hold"), b"").unwrap();
+        if own_group {
+            std::fs::write(base.join("own-group"), b"").unwrap();
+        }
         let pi = base.join("pi");
         std::fs::write(&pi, PI).unwrap();
         std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let server = tokio::process::Command::new(&binary)
-            .arg("--data-dir")
-            .arg(&paths.root)
-            .args(["server", "run", "--detach"])
-            .env_clear()
-            .envs(Environment::current().for_server())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let client = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(client) = Client::connect(&paths.socket).await {
-                    break client;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("server must start")
-        .with_environment(Environment::current());
+        let (server, client) = serve(&binary, &paths).await;
         let created = client
             .call("session.create", json!({"project":base}))
             .await
@@ -122,8 +144,10 @@ impl Fixture {
             server,
             session,
             processes,
+            paths,
+            binary,
             _endpoint: endpoint,
-            _directory: directory,
+            directory,
         }
     }
 
@@ -158,4 +182,47 @@ async fn suspending_a_session_stops_everything_pi_started() {
         .await
         .unwrap();
     fixture.ended("its suspended session").await;
+}
+
+#[tokio::test]
+async fn the_next_server_reclaims_what_a_crash_left_of_a_session() {
+    let mut fixture = Fixture::start_with(true).await;
+    let base = fixture.directory.path().to_owned();
+    let child = Pid::from_raw(
+        std::fs::read_to_string(base.join("own-group.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+    fixture.server.start_kill().unwrap();
+    fixture.server.wait().await.unwrap();
+    fixture.ended("its server").await;
+    // Neither the shell's job nor in Pi's group, it survives the crash.
+    assert!(kill(child, None).is_ok());
+    let shells = |extension: &str| {
+        let sessions = std::fs::read_dir(fixture.paths.root.join("sessions")).unwrap();
+        sessions
+            .flatten()
+            .flat_map(|session| {
+                std::fs::read_dir(session.path().join("pi/shell"))
+                    .into_iter()
+                    .flatten()
+            })
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == extension))
+            .count()
+    };
+    assert_eq!((shells("bashrc"), shells("shell")), (1, 1));
+    let (mut server, _client) = serve(&fixture.binary, &fixture.paths).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while kill(child, None) != Err(Errno::ESRCH) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the next server must end what the crash left of the session");
+    assert_eq!((shells("bashrc"), shells("shell")), (0, 0));
+    server.start_kill().unwrap();
+    server.wait().await.unwrap();
 }

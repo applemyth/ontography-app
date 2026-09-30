@@ -24,7 +24,7 @@ use std::{
     collections::BTreeMap,
     io::Write,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, Mutex, Weak,
@@ -148,6 +148,8 @@ impl ManagedShell {
             .join("shell");
         std::fs::create_dir_all(&shell_dir)?;
         std::fs::set_permissions(&shell_dir, std::fs::Permissions::from_mode(0o700))?;
+        // A session runs one shell: whatever an earlier one left is stale.
+        reclaim_shells(&shell_dir, true).await?;
         let rc = shell_dir.join(format!("{generation}.bashrc"));
         let executable = launcher::application_executable()?;
         let source = format!(
@@ -202,6 +204,14 @@ impl ManagedShell {
                 return Err(error);
             }
         };
+        // The shell's pid, beside its rc file, lets a later server reclaim
+        // what a crash leaves of its OS session.
+        if let Some(pid) = terminal.status().pid {
+            crate::persistence::write_json(
+                &rc.with_extension("shell"),
+                &ShellRecord { pid: pid as i32 },
+            )?;
+        }
         let (stop, _) = watch::channel(false);
         let shell = Arc::new(Self {
             terminal,
@@ -492,6 +502,7 @@ impl ManagedShell {
         }
         let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_file(&self.rc);
+        let _ = std::fs::remove_file(self.rc.with_extension("shell"));
         Ok(())
     }
 
@@ -611,11 +622,82 @@ fn signal_session(owner: Pid, reaped: bool, members: &[Pid], signal: Signal) -> 
     Ok(found)
 }
 
+/// What a shell generation leaves beside its rc file.
+#[derive(Serialize, Deserialize)]
+struct ShellRecord {
+    pid: i32,
+}
+
+/// Reclaims the shells a crashed server left in `shell_dir`: kills what
+/// remains of each ended shell's OS session, and removes its files. A shell
+/// still running, or whose pid now names another process, is left alone.
+/// `orphans` also removes rc files that no record accounts for, which only a
+/// session about to start its one shell may do.
+async fn reclaim_shells(shell_dir: &Path, orphans: bool) -> Result<()> {
+    let entries: Vec<PathBuf> = std::fs::read_dir(shell_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    let records: Vec<&PathBuf> = entries
+        .iter()
+        .filter(|path| path.extension().is_some_and(|e| e == "shell"))
+        .collect();
+    let members = if records.is_empty() {
+        Vec::new()
+    } else {
+        process_ids().await?
+    };
+    for record in records {
+        let Ok(ShellRecord { pid }) = crate::persistence::read_json(record) else {
+            let _ = std::fs::remove_file(record);
+            continue;
+        };
+        let owner = Pid::from_raw(pid);
+        if kill(owner, None) != Err(Errno::ESRCH) {
+            continue;
+        }
+        signal_session(owner, true, &members, Signal::SIGKILL)?;
+        let _ = std::fs::remove_file(record.with_extension("bashrc"));
+        let _ = std::fs::remove_file(record);
+    }
+    if orphans {
+        for rc in entries
+            .iter()
+            .filter(|path| path.extension().is_some_and(|e| e == "bashrc"))
+            .filter(|rc| !rc.with_extension("shell").exists())
+        {
+            let _ = std::fs::remove_file(rc);
+        }
+    }
+    Ok(())
+}
+
+/// Reclaims, as a server starts, what the shells of a crashed server left in
+/// every session.
+pub async fn reclaim_crashed_shells(paths: &Paths) {
+    for session in std::fs::read_dir(paths.root.join("sessions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let shell_dir = session.path().join("pi").join("shell");
+        if let Err(error) = reclaim_shells(&shell_dir, false).await {
+            crate::logging::record(
+                &paths.root,
+                &format!("could not reclaim {}: {error}", shell_dir.display()),
+            );
+        }
+    }
+}
+
 impl Drop for ManagedShell {
     fn drop(&mut self) {
         self.stop.send_replace(true);
         let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_file(&self.rc);
+        let _ = std::fs::remove_file(self.rc.with_extension("shell"));
         if let Ok(mode) = self.mode.lock()
             && let Some(lease) = &mode.lease
         {

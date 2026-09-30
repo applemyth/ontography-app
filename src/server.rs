@@ -610,6 +610,10 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
         socket: paths.socket.clone(),
     };
     remove_stale_sockets(paths.endpoint())?;
+    // No shell of a crashed server still runs; what it left is reclaimed
+    // beside the new server's work.
+    let reclaim = paths.clone();
+    tokio::spawn(async move { crate::managed_shell::reclaim_crashed_shells(&reclaim).await });
     let listener = UnixListener::bind(&paths.socket)?;
     std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
     let server = Server::new(paths)?;
