@@ -2845,10 +2845,12 @@ dependencies = [
  "ontography-core",
  "rand 0.9.5",
  "rand_chacha",
+ "rustix",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "uuid",
+ "vt100",
 ]
 
 [[package]]

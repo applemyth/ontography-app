@@ -4,18 +4,23 @@
 //! players, a person deciding tasks, a manager, and chaos: server crashes and
 //! killed programs. Then it drains the run, restarts the server in order, and
 //! judges what the server kept, what its programs did, which processes it
-//! left, and its store.
+//! left, and its store. The sessions trial plays app sessions instead: live
+//! shells and Pi on one server, crashes, and orderly stops.
 
 mod agent;
+mod attach;
 mod audit;
+mod driver;
 mod game;
 mod history;
 mod judge;
 mod mcp;
 mod node;
+mod pi;
 mod procs;
 mod roles;
 mod server;
+mod sessions;
 mod world;
 
 use anyhow::{Context, Result, bail};
@@ -111,6 +116,12 @@ enum Mode {
     Node(node::Args),
     /// Act as an agent node's program, pulling work through the node tools.
     Agent(agent::Args),
+    /// Act as Pi, a session's manager program, as the sessions trial has the
+    /// server run it.
+    Pi(pi::Args),
+    /// Play the sessions trial: app sessions with live shells and Pi on one
+    /// server, crashes, and orderly stops.
+    Sessions(sessions::Args),
 }
 
 /// Builds the server from the tree this harness was built from.
@@ -221,21 +232,8 @@ fn signature(problem: &str) -> String {
     kind
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    match args.mode {
-        Some(Mode::Node(node)) => return node::run(node),
-        Some(Mode::Agent(agent)) => return agent::run(agent).await,
-        None => {}
-    }
-    let plan = args.preset.plan();
-    std::fs::create_dir_all(&args.runs)?;
-    clear_stale(&args.runs);
-    let binary = match &args.ontography {
-        Some(path) => path.clone(),
-        None => build_server()?,
-    };
+/// On an interrupt, stops every server and program this harness started.
+fn stop_on_interrupt() {
     tokio::spawn(async {
         use tokio::signal::unix::{SignalKind, signal};
         let (Ok(mut interrupt), Ok(mut terminate)) = (
@@ -252,6 +250,66 @@ async fn main() -> Result<()> {
         eprintln!("interrupted: stopped every server and program of this harness");
         std::process::exit(130);
     });
+}
+
+/// One sessions trial; its directory is `runs/sessions-<seed>`.
+async fn play_sessions(
+    args: sessions::Args,
+    runs: &Path,
+    ontography: Option<PathBuf>,
+) -> Result<()> {
+    std::fs::create_dir_all(runs)?;
+    clear_stale(runs);
+    let binary = match ontography {
+        Some(path) => path,
+        None => build_server()?,
+    };
+    stop_on_interrupt();
+    let seed = args.seed.unwrap_or_else(|| rand::random::<u32>() as u64);
+    let dir = runs.join(format!("sessions-{seed}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let clock = Instant::now();
+    let mut outcome = sessions::trial(seed, &dir, &binary, &args)
+        .await
+        .unwrap_or_else(|error| game::Outcome {
+            problems: vec![format!("the trial could not run: {error:#}")],
+            ..Default::default()
+        });
+    let mut seen = std::collections::BTreeSet::new();
+    outcome
+        .problems
+        .retain(|problem| seen.insert(problem.clone()));
+    report(seed, &outcome, clock.elapsed());
+    if outcome.problems.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    } else {
+        println!("  kept {}", dir.display());
+        std::process::exit(1);
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    match args.mode {
+        Some(Mode::Node(node)) => return node::run(node),
+        Some(Mode::Agent(agent)) => return agent::run(agent).await,
+        Some(Mode::Pi(pi)) => return pi::run(pi).await,
+        Some(Mode::Sessions(trial)) => {
+            return play_sessions(trial, &args.runs, args.ontography).await;
+        }
+        None => {}
+    }
+    let plan = args.preset.plan();
+    std::fs::create_dir_all(&args.runs)?;
+    clear_stale(&args.runs);
+    let binary = match &args.ontography {
+        Some(path) => path.clone(),
+        None => build_server()?,
+    };
+    stop_on_interrupt();
 
     let started = Instant::now();
     let mut seeds: Box<dyn Iterator<Item = u64>> = match (args.seed, plan.seeds) {
