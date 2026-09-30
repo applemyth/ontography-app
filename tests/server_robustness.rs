@@ -1,12 +1,12 @@
 //! The server keeps the receipts clients may still need, says when a change
-//! applied though its result could not be sent, and leaves no endpoint
-//! directory behind.
+//! applied though its result could not be sent, survives running out of
+//! descriptors, and leaves no endpoint directory behind.
 #![cfg(unix)]
 
 use ontography_app::{
     client::Client,
     persistence::Paths,
-    protocol::{self, Request},
+    protocol::{self, Request, Response},
     server::Server,
 };
 use serde_json::{Value, json};
@@ -17,7 +17,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::process::{Child, Command};
+use tokio::{
+    io::BufReader,
+    net::UnixStream,
+    process::{Child, Command},
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ontography");
 
@@ -86,6 +90,10 @@ async fn exit(server: &mut Child) -> ExitStatus {
         .await
         .expect("the server must exit")
         .unwrap()
+}
+
+fn log(paths: &Paths) -> String {
+    std::fs::read_to_string(paths.root.join("logs/server.log")).unwrap_or_default()
 }
 
 struct Fixture {
@@ -207,6 +215,67 @@ async fn a_change_whose_result_is_too_large_says_it_was_applied() {
     assert_eq!(error.details, None);
     server.stop().await.unwrap();
     assert!(!paths.endpoint().exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_out_of_descriptors_does_not_end_the_server() {
+    let fixture = Fixture::new();
+    // The hard limit is too low for the server to raise.
+    let (mut server, _) = fixture.run("ulimit -Sn 48 && ulimit -Hn 48 && ").await;
+    // Far more connections than the server has descriptors for.
+    let mut flood = Vec::new();
+    for _ in 0..64 {
+        flood.push(UnixStream::connect(&fixture.paths.socket).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(flood);
+    let client = connect(&fixture.paths).await;
+    assert!(
+        server.try_wait().unwrap().is_none(),
+        "the server must survive"
+    );
+    client.call("system.status", json!({})).await.unwrap();
+    let log = log(&fixture.paths);
+    assert!(log.contains("Too many open files"), "{log}");
+    fixture.stop(&mut server).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_server_raises_a_low_soft_descriptor_limit() {
+    let fixture = Fixture::new();
+    // As launchd starts programs: a low soft limit under a high hard one.
+    let (mut server, client) = fixture.run("ulimit -Sn 64 && ").await;
+    let hello = Request {
+        environment: None,
+        app_session_id: None,
+        version: protocol::VERSION,
+        client_id: client.client_id().into(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        expected_server_id: None,
+        operation: "system.hello".into(),
+        args: json!({}),
+    };
+    // More connections at once than 64 descriptors allow, each answered.
+    let mut connections = Vec::new();
+    for _ in 0..100 {
+        let mut socket = UnixStream::connect(&fixture.paths.socket).await.unwrap();
+        protocol::write_frame(&mut socket, &hello).await.unwrap();
+        connections.push(socket);
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for socket in &mut connections {
+            let frame = protocol::read_frame(&mut BufReader::new(socket))
+                .await
+                .unwrap()
+                .expect("the server must answer every connection");
+            let response: Response = serde_json::from_slice(&frame).unwrap();
+            response.into_result().unwrap();
+        }
+    })
+    .await
+    .expect("every open connection must be answered");
+    drop(connections);
+    fixture.stop(&mut server).await;
 }
 
 #[test]

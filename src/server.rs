@@ -536,6 +536,22 @@ fn remove_stale_sockets(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Raise this process's soft limit on open files toward its hard limit. A
+/// server admits 256 connections besides its terminals, stores and sockets,
+/// while launchd starts programs with a soft limit of 256. macOS refuses a
+/// limit above its per-process maximum, so ask for at most its OPEN_MAX,
+/// 10240; a limit that cannot be raised stays. Only the dedicated server
+/// process calls this, never an embedding application.
+pub fn raise_file_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    const OPEN_MAX: nix::sys::resource::rlim_t = 10240;
+    if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE)
+        && soft < hard.min(OPEN_MAX)
+    {
+        let _ = setrlimit(Resource::RLIMIT_NOFILE, hard.min(OPEN_MAX), hard);
+    }
+}
+
 /// Serve until stopped. With an `idle_limit`, as for a background server,
 /// also stop once nothing has run and no client has connected for that long.
 /// A server under an external supervisor runs without one.
@@ -582,16 +598,33 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
             limit.min(Duration::from_secs(1))
         }));
     let mut idle_since: Option<Instant> = None;
+    // Why accepting last failed, while it still fails.
+    let mut accept_error: Option<String> = None;
     loop {
         tokio::select! {
-            accepted = listener.accept(), if clients.len() < 256 => {
-                let (socket,_) = accepted?;
-                // A command's connections come and go between idle checks;
-                // any of them means the server is in use.
-                idle_since = None;
-                let server = server.clone();
-                clients.spawn(async move { let _ = connection(server,socket).await; });
-            }
+            accepted = listener.accept(), if clients.len() < 256 => match accepted {
+                Ok((socket, _)) => {
+                    if let Some(error) = accept_error.take() {
+                        // Recording the failure may have needed a descriptor too.
+                        crate::logging::record(&server.service.paths.root, &format!("accepting connections again after: {error}"));
+                    }
+                    // A command's connections come and go between idle checks;
+                    // any of them means the server is in use.
+                    idle_since = None;
+                    let server = server.clone();
+                    clients.spawn(async move { let _ = connection(server,socket).await; });
+                }
+                // Running out of descriptors must not end the server: they
+                // return as connections close. Pause rather than spin.
+                Err(error) => {
+                    let error = error.to_string();
+                    if accept_error.as_ref() != Some(&error) {
+                        crate::logging::record(&server.service.paths.root, &format!("cannot accept connections: {error}"));
+                        accept_error = Some(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
             _ = server.stopped.notified() => break,
             _ = terminate.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
             _ = interrupt.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },

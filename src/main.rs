@@ -189,6 +189,7 @@ async fn run(cli: Cli) -> Result<()> {
             action: ServerAction::Run { detach },
         }) => {
             ontography_app::logging::install_panic_hook(&paths.root);
+            server::raise_file_limit();
             if detach {
                 nix::unistd::setsid().map_err(|e| AppError::new("detach_failed", e.to_string()))?;
             }
