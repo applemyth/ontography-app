@@ -177,7 +177,7 @@ fn a_conversation_is_saved_once_and_continues_only_at_its_node_and_workspace() {
 async fn the_terminal_launch_passes_hooks_tools_and_instructions_as_options() {
     let directory = node_directory();
     let plan = new_plan(directory.path(), &config()).unwrap();
-    let (hooks, _events) = NodeHooks::bind(directory.path()).unwrap();
+    let (hooks, _events) = NodeHooks::bind(directory.path(), None).unwrap();
     let spec = plan
         .session(
             Path::new("claude"),
@@ -397,7 +397,7 @@ async fn launch_scripts_begin_or_resume_the_conversation_without_inherited_varia
     assert_eq!(runs, [resume, begin]);
 
     std::fs::remove_file(marker).unwrap();
-    let (hooks, _events) = NodeHooks::bind(directory.path()).unwrap();
+    let (hooks, _events) = NodeHooks::bind(directory.path(), None).unwrap();
     let spec = plan
         .session(&fake, node_tools(), &hooks, BTreeMap::new())
         .unwrap();

@@ -6,7 +6,11 @@
 //! and exit status 2 would block it. A hook that cannot reach its execution
 //! fails with status 1, which Claude reports without blocking anything.
 
-use crate::{AppError, Result, protocol};
+use crate::{
+    AppError, Result,
+    node_mcp::{AcceptLog, next_connection},
+    protocol,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -73,7 +77,9 @@ pub struct NodeHooks {
 
 impl NodeHooks {
     /// Listen in a private directory. Events arrive in order on the receiver.
-    pub fn bind(directory: &Path) -> Result<(Self, mpsc::Receiver<HookEvent>)> {
+    /// Accept errors are recorded in the server log of the data directory
+    /// `log`, when given.
+    pub fn bind(directory: &Path, log: Option<&Path>) -> Result<(Self, mpsc::Receiver<HookEvent>)> {
         let metadata = std::fs::symlink_metadata(directory)?;
         if !metadata.is_dir()
             || metadata.uid() != nix::unistd::geteuid().as_raw()
@@ -90,9 +96,11 @@ impl NodeHooks {
         let token = uuid::Uuid::new_v4().to_string();
         let (events, receiver) = mpsc::channel(64);
         let expected = token.clone();
+        let mut errors = AcceptLog::new(&socket, log);
         // Connections are handled one at a time, so events keep Claude's order.
         let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            loop {
+                let (stream, _) = next_connection(|| listener.accept(), &mut errors).await;
                 // A failed hook connection never ends the node execution.
                 let _ = tokio::time::timeout(TIMEOUT, accept(stream, &expected, &events)).await;
                 if events.is_closed() {
@@ -247,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn events_arrive_in_order_and_only_with_the_current_identity() {
         let directory = directory();
-        let (hooks, mut events) = NodeHooks::bind(directory.path()).unwrap();
+        let (hooks, mut events) = NodeHooks::bind(directory.path(), None).unwrap();
         let environment = hooks.environment();
         let socket = PathBuf::from(&environment[SOCKET_ENV]);
         let token = environment[TOKEN_ENV].clone();

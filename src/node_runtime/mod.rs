@@ -189,7 +189,7 @@ impl NodeRuntime {
         let endpoint = self.endpoint()?;
         let mcp = resources
             .mcp
-            .insert(NodeMcp::bind(&endpoint, tools.clone())?);
+            .insert(NodeMcp::bind(&endpoint, tools.clone(), self.log())?);
         resources.tools = Some(tools.clone());
         let (node, binding) = {
             let scope = self.scope.borrow();
@@ -387,7 +387,7 @@ impl NodeRuntime {
         };
         if config.pty {
             let endpoint = self.endpoint()?;
-            let (hooks, events) = NodeHooks::bind(&endpoint)?;
+            let (hooks, events) = NodeHooks::bind(&endpoint, self.log())?;
             let spec = plan.session(program, node_tools, &hooks, env)?;
             let host =
                 Host::terminal(spec, &self.directory, endpoint.join("terminal.sock")).await?;
@@ -447,6 +447,12 @@ impl NodeRuntime {
         ));
         private_directory(&endpoint)?;
         Ok(endpoint)
+    }
+
+    /// The data directory whose server log records errors of this node's
+    /// sockets: the store the run's programs reach.
+    fn log(&self) -> Option<&Path> {
+        self.environment.get("ONTOGRAPHY_DATA_DIR").map(Path::new)
     }
 }
 

@@ -126,8 +126,8 @@ async fn delivered(fixture: &Fixture) -> InvocationId {
 async fn native_claude_takes_delivered_work_in_its_terminal() {
     let fixture = fixture().await;
     let native = Native::new();
-    let mut mcp = NodeMcp::bind(native.directory.path(), fixture.tools.clone()).unwrap();
-    let (hooks, events) = NodeHooks::bind(native.directory.path()).unwrap();
+    let mut mcp = NodeMcp::bind(native.directory.path(), fixture.tools.clone(), None).unwrap();
+    let (hooks, events) = NodeHooks::bind(native.directory.path(), None).unwrap();
     let spec = native
         .plan
         .session(
@@ -186,7 +186,7 @@ async fn native_claude_takes_delivered_work_in_its_terminal() {
 async fn native_headless_claude_takes_delivered_work() {
     let fixture = fixture().await;
     let native = Native::new();
-    let mut mcp = NodeMcp::bind(native.directory.path(), fixture.tools.clone()).unwrap();
+    let mut mcp = NodeMcp::bind(native.directory.path(), fixture.tools.clone(), None).unwrap();
     let argv = native
         .plan
         .headless(Path::new("claude"), mcp.server().unwrap());

@@ -13,7 +13,7 @@ async fn hosted(settings: Value) -> (Fixture, tempfile::TempDir, NodeMcp) {
     let fixture = Fixture::new(document(settings), "worker", None).await;
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let server = NodeMcp::bind(directory.path(), fixture.tools.clone()).unwrap();
+    let server = NodeMcp::bind(directory.path(), fixture.tools.clone(), None).unwrap();
     (fixture, directory, server)
 }
 
@@ -518,7 +518,7 @@ async fn proxy_disconnect_keeps_node_alive_and_server_loss_exits_with_stdin_open
 #[tokio::test]
 async fn a_different_execution_token_cannot_select_this_nodes_tools() {
     let (fixture, directory, server) = hosted(json!({})).await;
-    let replacement = NodeMcp::bind(directory.path(), fixture.tools.clone()).unwrap();
+    let replacement = NodeMcp::bind(directory.path(), fixture.tools.clone(), None).unwrap();
     let mut environment = server.environment();
     environment.insert(
         "ONTOGRAPHY_NODE_MCP_TOKEN".into(),

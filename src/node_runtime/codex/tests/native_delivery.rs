@@ -141,7 +141,7 @@ approval_mode = {approval:?}
             }
         }
     });
-    let mut mcp = NodeMcp::bind(dir.path(), fixture.tools.clone()).unwrap();
+    let mut mcp = NodeMcp::bind(dir.path(), fixture.tools.clone(), None).unwrap();
     let scope = fixture.scope.borrow().clone();
     let crate::workflow::Implementation::Codex(config) = &scope.binding.implementation else {
         panic!("the fixture's worker is a Codex agent");
