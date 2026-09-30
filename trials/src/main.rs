@@ -179,12 +179,46 @@ fn report(seed: u64, outcome: &game::Outcome, took: Duration) {
         .map(|(phase, time)| format!("{phase} {:.1}s", time.as_secs_f64()))
         .collect();
     println!("  time: {}", timing.join(", "));
-    for problem in outcome.problems.iter().take(30) {
-        println!("  PROBLEM {problem}");
+    // Problems of one kind are reported once, with how often they occurred.
+    let mut kinds: Vec<(String, usize, &String)> = Vec::new();
+    for problem in &outcome.problems {
+        let kind = signature(problem);
+        match kinds.iter_mut().find(|(seen, _, _)| *seen == kind) {
+            Some((_, count, _)) => *count += 1,
+            None => kinds.push((kind, 1, problem)),
+        }
     }
-    if outcome.problems.len() > 30 {
-        println!("  … {} more", outcome.problems.len() - 30);
+    for (_, count, example) in &kinds {
+        match count {
+            1 => println!("  PROBLEM {example}"),
+            n => println!("  PROBLEM ({n}×) {example}"),
+        }
     }
+}
+
+/// A problem with what varies between occurrences taken out: identities,
+/// digests, counts, node names and quoted text.
+fn signature(problem: &str) -> String {
+    let mut kind = String::new();
+    let mut quoted = false;
+    for word in problem.split(' ') {
+        if word.starts_with('"') {
+            quoted = !(word.len() > 1 && word.ends_with('"'));
+            kind.push_str("\"…\" ");
+            continue;
+        }
+        if quoted {
+            quoted = !word.ends_with('"');
+            continue;
+        }
+        let varies = word.chars().any(|c| c.is_ascii_digit())
+            || word.len() >= 16 && word.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+        kind.push_str(if varies { "# " } else { word });
+        if !varies {
+            kind.push(' ');
+        }
+    }
+    kind
 }
 
 #[tokio::main]
