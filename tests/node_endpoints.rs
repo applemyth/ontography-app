@@ -98,3 +98,23 @@ async fn a_node_execution_removes_its_endpoint_directory_however_it_ends() {
     }
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_node_execution_clears_the_sockets_a_crash_left_in_its_endpoint() {
+    let temporary = tempfile::tempdir().unwrap();
+    let service = Service::new(Paths::initialize(temporary.path().join("data")).unwrap()).unwrap();
+    let running = |worker: &Value| worker["session"]["state"] == "running";
+    let run = start(&service, temporary.path(), json!(["/bin/cat"])).await;
+    let directory = endpoint(&worker(&service, &run, running).await);
+    call(&service, "run.suspend", json!({"run_id":run})).await;
+    // A killed server leaves its node's sockets behind.
+    std::fs::create_dir_all(&directory).unwrap();
+    let stale = directory.join(format!("mcp-{}.sock", uuid::Uuid::new_v4().simple()));
+    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    call(&service, "run.resume", json!({"run_id":run})).await;
+    worker(&service, &run, running).await;
+    assert!(!stale.exists());
+    call(&service, "run.suspend", json!({"run_id":run})).await;
+    assert!(!directory.exists());
+    service.shutdown().await.unwrap();
+}

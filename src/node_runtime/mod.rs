@@ -186,7 +186,12 @@ impl NodeRuntime {
             .await?,
         );
         lock(&self.state).tools = Arc::downgrade(&tools);
-        let endpoint = resources.endpoint.insert(self.endpoint()?).clone();
+        let endpoint = self.endpoint()?;
+        // One execution serves a node at a time, and the one before this was
+        // just reclaimed: sockets a crashed execution could not remove are
+        // stale, and would keep the directory from ever being removed.
+        remove_stale_sockets(&endpoint);
+        let endpoint = resources.endpoint.insert(endpoint).clone();
         let mcp = resources
             .mcp
             .insert(NodeMcp::bind(&endpoint, tools.clone(), self.log())?);
@@ -578,6 +583,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Removes the sockets an execution puts in its endpoint directory.
+fn remove_stale_sockets(endpoint: &Path) {
+    for entry in std::fs::read_dir(endpoint).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ours = name == "terminal.sock"
+            || (name.ends_with(".sock")
+                && ["mcp-", "hooks-", "codex-"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix)));
+        if ours {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn private_directory(path: &Path) -> Result<()> {
