@@ -147,9 +147,9 @@ Pi writes new histories lazily. Ontography reserves the initial UUID before laun
 
 ## Initialize or adopt a graph
 
-Pi can save/validate reusable definitions before starting a graph. The first scoped `run.start` or `project.start` binds its resulting run. Logical runs can remain idle and need not contain executable implementations.
+Pi can save reusable documents with `flow.define` before starting a graph. The first scoped `flow.start` binds its resulting run. A run whose nodes are all `external` runs no process and waits for an outside client's moves.
 
-Initialization persists a reserved run ID, operation arguments, resolved definition, and initial application input before constructing core storage. Per-session serialization prevents competing initialization; retries recover the same identity. Application recovery does not reinject fresh input. Partial state that core cannot reopen remains an explicit recovery error.
+Initialization persists a reserved run ID, operation arguments, compiled declaration, and initial workflow and input before constructing core storage. Per-session serialization prevents competing initialization; retries recover the same identity. Recovery does not reinject fresh input. Partial state that core cannot reopen remains an explicit recovery error.
 
 To associate an existing run:
 
@@ -162,13 +162,7 @@ ontography session attach SESSION_UUID
 
 Adoption preserves its run ID and history. Pi state begins with the new app session unless history is explicitly imported. Ownership is never inferred from project paths, names, or old transcripts.
 
-A declaration sets which edits its run accepts: `"edits": "fixed"`, the default, keeps the graph as declared, and `"any"` accepts any edit core admits. `rewrite.prepare` takes an explicit edit as its `request`. [examples/remove-receiver.json](../examples/remove-receiver.json) removes node `B` and its edge from [examples/flow.json](../examples/flow.json):
-
-```json
-{"remove_nodes": ["B"], "remove_edges": ["A_to_B"]}
-```
-
-Removing a node requires removing its edges. `add` holds new nodes and edges, with identities never used in the run, and their roots and authority transitions; a surviving node or edge cannot change, so replace it instead. An edit the run's `edits` do not allow reports `edit_denied`. New declarations cannot contain rewrite productions; runs saved with them still open, but their graphs are fixed. A run keeps the declaration it started with, so editing a saved declaration does not change what a running graph accepts.
+A run's graph changes only through its document: `flow.edit` previews the new document as one explicit core graph edit and `flow.commit` applies it; see [Edit and recover](WORKFLOWS.md#edit-and-recover). A run keeps the document revision it started from, so editing a saved document does not change a running graph.
 
 ## Lifecycle and recovery
 

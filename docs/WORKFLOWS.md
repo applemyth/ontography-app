@@ -1,8 +1,11 @@
 # Workflows
 
 A workflow document names the steps, their worker settings, how they connect,
-and where the first input goes. The app translates it into the existing core
-graph. Core records accepted work; the app harness runs the workers.
+and where the first input goes. It is the one way to start a run: the app
+compiles it into core's graph, core records accepted work, and the app harness
+runs the workers. Typing is optional; a document without it carries messages
+and workspaces everywhere, and a document can declare as much of core's typed
+model as it needs (see [Typing](#typing)).
 
 ## Start a small workflow
 
@@ -56,6 +59,7 @@ start and `run_id` afterward; a stable UUID `start_id` makes startup retryable.
 | `name` | Name for the reusable workflow. |
 | `entry` | The node receiving the initial message or workspace. |
 | `components` | Optional: this document's own components; see [The library](#the-library). |
+| `contracts` | Optional: named contracts, each `{object_type, validator}`; see [Typing](#typing). |
 | `nodes[].id` | Unique name used by tools and connections. |
 | `nodes[].component` | The component the node places: a built-in, one from the library, or one from `components`. Documents saved with `kind` still load. |
 | `nodes[].config` | This placement's settings, merged over its component's defaults; defaults to `{}`. |
@@ -63,11 +67,76 @@ start and `run_id` afterward; a stable UUID `start_id` makes startup retryable.
 | `nodes[].retry` | Agent and command nodes only; see [Failed tasks](#failed-tasks). |
 | `nodes[].grants` | Agent and command nodes only: node-tool powers beyond the base set (`originate`, `send_later`, `retire`); see [Node tools](NODE_TOOLS.md). |
 | `nodes[].tools` | Optional shared node-tool allowlist for agent/command nodes. Omitted uses the grant-filtered default; `[]` exposes none. |
+| `nodes[].result` | Optional: the contract of the node's results; `payload` by default. |
+| `nodes[].root` | Optional: the authority tags work the node starts may carry. Only nodes with a root start work; the entry has `["workflow"]` unless given. |
+| `nodes[].transitions` | Optional: `[{from, to}]` authority changes the node may make to what it sends. |
 | `edges` | Directed `{from,to}` connections; defaults to `[]`. |
+| `edges[].name` | Optional; needed to connect the same two nodes twice. Otherwise a connection is named `from:to`. |
+| `edges[].contract` | Optional: what it carries; its source's `result` by default. |
+| `edges[].authority` | Optional: the tags it admits; `["workflow"]` by default. |
+| `edges[].match` | `any_of` by default, or `all_of`: whether work needs any or all of those tags. |
 
 `any` takes one available incoming package. `all` waits for one package on
-every incoming connection. Cycles and self loops are supported; duplicate
-connections are rejected.
+every incoming connection. Cycles and self loops are supported. Names of
+nodes, connections, contracts, object types, and tags use letters, digits,
+`-`, and `_`: a new run uses the document's names as core's identities.
+
+## Typing
+
+Every part of core's typed model is optional, and what a document leaves out
+takes a default:
+
+- **Contracts.** `payload` is built in: object type `Payload`, validator
+  `text`, which accepts a message or a workspace, all that programs send. A
+  document names more under `contracts`, each an object type and one of three
+  trusted validators: `text` (valid UTF-8, including a workspace), `bytes`
+  (anything), or `workspace` (only a workspace).
+- **Results and connections.** A node's `result` names the contract its results
+  satisfy. A connection carries its source's result contract unless it names
+  its own, so a type is written once.
+- **Authority.** Connections admit `["workflow"]` and the entry starts work
+  under it, unless the document says otherwise. Authority is never inferred
+  beyond that default: a connection that needs other tags names them, a node
+  that starts work declares its `root`, and a node that changes authority
+  declares its `transitions`.
+
+```json
+{"name": "smelting", "entry": "mine",
+ "contracts": {"ore": {"object_type": "Ore", "validator": "text"}},
+ "components": {"mine": {"extends": "external", "types": ["Mine"]}},
+ "nodes": [
+   {"id": "mine", "component": "mine", "result": "ore", "root": ["red"]},
+   {"id": "smelter", "component": "command", "config": {"argv": ["./smelt"]},
+    "transitions": [{"from": ["red"], "to": ["sealed"]}]},
+   {"id": "vault", "component": "inbox"}],
+ "edges": [
+   {"from": "mine", "to": "smelter", "authority": ["red"]},
+   {"from": "smelter", "to": "vault", "authority": ["sealed"], "match": "all_of"}]}
+```
+
+Core checks every result and every package against its contract and every
+move against authority. A command's result and a human's decision go through
+every outgoing connection; if one refuses it, the task fails and retries like
+any other failure. Agents choose connections, authority transitions, and
+outbound object types with the node tools; see [Node tools](NODE_TOOLS.md).
+A run's contracts and authority tags are fixed when it starts: an edit that
+changes a contract or uses a new tag is refused, and needs a new run.
+
+## External nodes
+
+An `external` node runs nothing: an outside client acts for it with core
+moves, `workflow.submit`, `workflow.transfer`, and `workflow.retire`, which
+name nodes and connections by their document names. Those moves act only for
+external nodes; programs and people own the rest. An external entry takes no
+initial input. `workspace.import` puts a directory from the project into the
+run's store and returns its `root`, to send as the envelope
+`{"ontography_package": ROOT}`, and the `dependencies` the submission declares
+in `contents`. `inspect.*` and `run.inspect` read what happened.
+
+```json
+{"trigger": {"kind": "root", "node_id": "client", "authority": ["workflow"]},
+ "result": "sent", "emissions": [{"edge_id": "client:worker", "payload": "hello"}]}
+```
 
 ## Components
 
@@ -78,7 +147,8 @@ implementation and its exact configuration. Node types are labels, such as
 for life, so switching it to a component with other types replaces it (see
 [Edit and recover](#edit-and-recover)). Types never choose behavior; the
 implementation does: agent and command nodes run tasks, people decide human
-tasks, and inboxes hold work. Any node may connect to any other.
+tasks, inboxes hold work, and outside clients act for external nodes. Any node
+may connect to any other.
 
 | Component | Node types | Settings | What runs |
 | --- | --- | --- | --- |
@@ -88,6 +158,7 @@ tasks, and inboxes hold work. Any node may connect to any other.
 | `command` | Command | Required nonempty `argv`; optional `timeout_secs` | The command once per task, with input messages on stdin |
 | `human` | Human | Optional `prompt` | Waits for `flow.decide` on each task |
 | `inbox` | Inbox | None | Holds incoming work for inspection and export |
+| `external` | External | None | Nothing; an outside client acts for it (see [External nodes](#external-nodes)) |
 
 `flow.library` lists every component a document can place, with its node types,
 description, and settings schema, and the library's MCP servers. `flow.status`
@@ -143,7 +214,7 @@ and the component it `extends`, which may be another library component.
 `types` adds node types to those of the component it extends, so a `reviewer`
 node has the types `Agent` and `Reviewer` and still runs Claude. A component
 that extends `reviewer` keeps both and may add more. Type names use letters,
-digits, `-`, or `_`; `WorkflowNode` is reserved. A node's settings are merged
+digits, `-`, or `_`. A node's settings are merged
 over its component's `config` as a JSON merge patch: objects merge by key,
 `null` removes a key, and other values replace.
 A list of MCP server names is read as a map first, so a node can add a server
@@ -279,12 +350,14 @@ A command config change takes effect on the next task. A change to what an
 agent node is bound to (its settings over its component's defaults) stops and
 replaces its process, retaining its node directory and recorded conversation.
 Tool selection, grants, retry policy, and changes elsewhere in the graph refresh
-the agent's scoped tooling without restarting its process. Changing a node's
-types, join, or entry status replaces its core node, which retires its
-pending work; the preview reports that work, and the old worker stops before
-its replacement starts. In runs created before node types, every node has one
-shared `WorkflowNode` type, so only a join or entry change replaces a node.
-The initial entry cannot be replaced before its initial task completes.
+the agent's scoped tooling without restarting its process. Changing what core
+declares about a node, its types, join, result contract, root (the entry's
+default one included), or transitions, replaces its core node, which retires
+its pending work; the preview reports that work, and the old worker stops
+before its replacement starts. Likewise, changing a connection's contract,
+authority, or match replaces it. A replaced node or connection takes a new
+core identity. The initial entry cannot be replaced before its initial task
+completes.
 
 Each edit is one atomic core graph edit: it adds the target's nodes and
 connections that core lacks and removes those the target lacks. Existing
@@ -295,8 +368,7 @@ retired, it stops with `retirement_preview_required`; preview the same target
 again and review the additional retirements. If ongoing work makes the edit
 stale eight times, it stops with `workflow_busy`; `flow.resume` continues it.
 There is no rollback or substitution of an unrelated target mid-recovery.
-Core accepts edits to a workflow run only from this editor, and only edits
-that keep the graph a workflow.
+Core accepts edits to a run only from this editor.
 
 A stale topology preview before the edit starts needs a new preview. Config-only
 edits tolerate unrelated tasks completing, but still reject a changed document
@@ -424,10 +496,10 @@ attempt.
 
 ## Current policies and limits
 
-- Each successful task broadcasts the same result through every outgoing
-  connection. There is no per-edge routing choice in the document.
-- Each delivery is a message or a workspace. A joined task may receive
-  several messages but at most one workspace. Workspace workers currently
+- A command's result and a human's decision go through every outgoing
+  connection. Agents route per connection with the node tools.
+- Each delivery is a message, a workspace, or, on a `bytes` connection, other
+  bytes. A joined task may receive several messages but at most one workspace. Workspace workers currently
   need an outgoing connection; connect the final worker to an inbox.
 - A failed or timed-out task retries with capped exponential backoff, then
   parks until the manager retries or discards it. An interrupted attempt is not

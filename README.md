@@ -32,10 +32,10 @@ Rust server
 | Rust CLI/client | Select a session; attach input/output; display Pi, shell + session panel, or graph. |
 | Pi | Native conversations, model execution, and management tools. |
 | Rust server | Own sessions, manager and worker processes, terminal screen state, graph runtimes, and accepted operations. |
-| Core | Enforce graph admission, contracts, authority, workflow commits, rewrites, packages, and durable graph history. |
+| Core | Enforce graph admission, contracts, authority, workflow commits, graph edits, packages, and durable graph history. |
 | Rust graph view | Render the bound run using Ratatui; closing the view preserves the manager. |
 
-A new session can start Pi before its graph exists. Its first scoped `run.start` or `project.start` durably binds the resulting run. Each session owns separate Pi state and, once initialized, one graph run. Saved graph definitions remain separate from the current graph of a run.
+A new session can start Pi before its graph exists. Its first scoped `flow.start` durably binds the resulting run. Each session owns separate Pi state and, once initialized, one graph run. Saved workflow documents remain separate from the current graph of a run.
 
 After 30 seconds in which nothing runs and no client is connected, the background server exits by itself; the next command that needs it starts it again. Server stop suspends graph resources and stops managers. Explicit attachment after restart restores that session's graph and saved Pi conversation. Transcripts do not restore process memory or in-flight agent work. A session's Pi and agents start with the environment of the terminal that activated it, such as with `attach`; see [Environment](docs/SESSIONS.md#environment).
 
@@ -51,11 +51,11 @@ After 30 seconds in which nothing runs and no client is connected, the backgroun
 
 CLI targets accept an exact session ID or a unique exact name. Ambiguous names require an ID. The `session …` command forms remain supported; `session list` retains its raw JSON output.
 
-Scoped calls resolve the session's graph and reject conflicting targets. Unscoped calls remain the explicit administration interface. The handshake publishes operation schemas. [examples/flow.json](examples/flow.json) is a logical graph that accepts any edit (`"edits": "any"`; the default, `"fixed"`, keeps a graph as declared). [examples/remove-receiver.json](examples/remove-receiver.json) is an explicit edit for `rewrite.prepare`. Logical nodes can exist before worker implementations are installed.
+Scoped calls resolve the session's graph and reject conflicting targets. Unscoped calls remain the explicit administration interface. The handshake publishes operation schemas. Every run starts from a workflow document. [examples/flow.json](examples/flow.json) is a typed document of two `external` nodes, which an outside client drives with core moves (`workflow.submit`, `workflow.transfer`, `workflow.retire`); see [External nodes](docs/WORKFLOWS.md#external-nodes).
 
 Pi manages workflow documents, runs, edits, task decisions, and artifacts through the workflow tools. Shared node tooling supplies scoped graph and package operations for worker implementations. [The workflow guide](docs/WORKFLOWS.md) describes current behavior; [the binding inventory](docs/CORE_BINDINGS.md) maps it to core's public API.
 
-Each node places a component, following core's project model. The built-in components are `agent` (with `codex` and `claude` presets), `command`, `human`, and `inbox`; each gives its node a core node type, a label such as `Agent`, and binds the node's settings to what runs there. Agents run in a terminal you can open from the graph, or headless with `"pty": false`. Put your own components and MCP servers in `~/.ontography/library.json`; `flow.library` lists everything a document can place. See [Components](docs/WORKFLOWS.md#components).
+Each node places a component, following core's project model. The built-in components are `agent` (with `codex` and `claude` presets), `command`, `human`, `inbox`, and `external`; each gives its node a core node type, a label such as `Agent`, and binds the node's settings to what runs there. Documents may declare contracts, authority, roots, and transitions where they need them; everything else takes a default. See [Typing](docs/WORKFLOWS.md#typing). Agents run in a terminal you can open from the graph, or headless with `"pty": false`. Put your own components and MCP servers in `~/.ontography/library.json`; `flow.library` lists everything a document can place. See [Components](docs/WORKFLOWS.md#components).
 
 ## Development and status
 

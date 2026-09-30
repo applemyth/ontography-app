@@ -44,7 +44,7 @@ pending.
 
 | Tool | What it does | Grant |
 | --- | --- | --- |
-| `inspect_node` | This node's name, types, component, settings, join, grants, retry policy, neighbors, and open attempts. | |
+| `inspect_node` | This node's name, types, component, settings, join, grants, retry policy, result contract, root and transitions, neighbors, its outgoing connections with the contract, object type, and authority each accepts, and open attempts. | |
 | `inspect_graph` | Current nodes and connections, by name. | |
 | `list_inputs` | Pages the inputs waiting here. At an `any` node each input is a task, shown with its retry state. | |
 | `next_trigger` | The next task that may begin: the initial input, one input, or a complete join. | |
@@ -56,7 +56,7 @@ pending.
 | `open_workspace`, `capture_workspace`, `release_workspace` | Check out a workspace input or directory output, capture edits as an output, remove a checkout early. | |
 | `submit_invocation` | Submits the result and outputs. | |
 | `fail_invocation` | Ends the attempt as failed, retryable or not. | |
-| `begin_invocation` with `originate` | Starts new work at a root node with the worker's own message. | `originate` |
+| `begin_invocation` with `originate` | Starts new work at a node with a root, carrying its whole root authority, with the worker's own message. | `originate` |
 | `submit_invocation` outbound outputs, `list_outbound`, `transfer_package` | Create packages to send later, list them, and deliver them to a successor. | `send_later` |
 | `retire_package` | Discards an input waiting here or an outbound package; core records the retirement. | `retire` |
 
@@ -84,11 +84,16 @@ An attempt is one recorded try at a task, bound to a core invocation. A task is
 one input, one complete join, or the initial input at the entry. Each task has
 at most one open attempt. `submit_invocation` takes a `result` (a `message`, or
 a `workspace` handle) and optional `outputs`. Without `outputs`, the result
-goes to every successor; with them, exactly those are sent: each to a
-successor named by `to`, to every successor, or, with the `send_later` grant,
-kept here with `outbound: true`. Invalid arguments leave the attempt open.
-Once core decides, accepting or rejecting the whole submission, the attempt
-ends.
+goes to every successor; with them, exactly those are sent: each along the
+connection `to` names, by the connection's name or by the one successor it
+leads to, to every successor, or, with the `send_later` grant, kept here with
+`outbound: true` under an `object_type` (the node's result object type by
+default). An output carries the task's authority, or exactly the tags in its
+`authority`, which one of the node's transitions must allow. Invalid arguments
+leave the attempt open. Once core decides, accepting or rejecting the whole
+submission, the attempt ends. Core checks the result against the node's result
+contract and each output against its connection's contract and authority; see
+[Typing](WORKFLOWS.md#typing).
 
 A failed or rejected attempt counts against the node's retry policy. The task
 waits out its backoff while other tasks proceed, and parks once its attempts

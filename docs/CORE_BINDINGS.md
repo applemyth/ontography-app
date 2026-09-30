@@ -1,8 +1,8 @@
 # Core bindings and coverage
 
-The workflow layer uses the existing public core API. It adds an app document,
-fixed vocabulary, edit recovery, a task harness, and persistent node sessions;
-it does not change core.
+The workflow layer uses the existing public core API. It adds an app document
+language compiled to core's typed model, edit recovery, a task harness, and
+persistent node sessions; it does not change core.
 [WORKFLOWS.md](WORKFLOWS.md) is the usage guide. [ARCHITECTURE.md](../ARCHITECTURE.md)
 retains the agreed scope and outstanding live-model project acceptance work.
 
@@ -15,44 +15,42 @@ handles independently of attached clients. Core owns graph transitions,
 package custody/history, content, and context records. See
 [session ownership](SESSIONS.md).
 
-A document expands into the existing `GraphDeclaration` and app-owned
-`ExecutionBinding` settings. Workflow startup uses this graph directly; the
-harness handles initial input and workspace preparation. The older native
-`ApplicationDeclaration` path remains a separate compatibility path.
+A document compiles into a `GraphDeclaration`, core's graph, which its run
+stores; component bindings stay in the app's workflow state. Every run starts
+this way. The harness handles initial input and workspace preparation.
 
 Nodes place components, using core's project model (`ontography::project`).
 Built-in and library components implement `ProjectComponent`: each
 `ComponentDescription` gives the node's core node types, and `bind` turns the
 placement's settings into a `BoundComponent`, the trusted implementation kind
 and exact configuration. Library and document specifications load through a
-`ComponentProvider` named `ontography`. The bound kind and configuration
-become the node's execution binding. A run stores its bindings with its
-document, so a later library change reaches a node only through an edit.
+`ComponentProvider` named `ontography`. The bound kind and configuration are
+the node's binding. A run stores its bindings with its document, so a later
+library change reaches a node only through an edit.
 
 A binding carries the node's types: labels such as `Agent` or `Reviewer` that
 core records on the node. Built-in components give one each (`Agent`,
-`Command`, `Human`, or `Inbox`); library and document specifications may add
+`Command`, `Human`, `Inbox`, or `External`); library and document specifications may add
 more, which accumulate along `extends` chains. Types never choose behavior;
 the implementation does. A new run's schema declares every type any component
 in its catalog can give, placed or not, so later edits can place any of them;
-an edit that needs an undeclared type fails with `unknown_node_type`. Every
-node shares one result contract, edge rule, and authority tag, and connections
-require no endpoint type. A node keeps its types, join, and entry status for
-life: an edit that changes any of them replaces the node. Runs created before
-node types keep one shared `WorkflowNode` type on every node, which their
-connections require at both ends; the app reads this from the run's schema.
-Reusable documents live under `definitions/workflows/<revision>.json`,
-separately from legacy graph drafts.
+an edit that needs an undeclared type fails with `unknown_node_type`. Nodes
+and connections take the document's contracts and authority, or the defaults:
+contract `payload` (object type `Payload`, validator `text`) and tag
+`workflow`. The run's schema declares every contract, object type, and tag the
+document uses; they are fixed for the run. Connections require no endpoint
+type. A node keeps its core definition for life: an edit that changes its
+types, join, result contract, root, or transitions replaces the node, and one
+that changes a connection's contract or authority replaces the connection. A
+new run's core identities are the document's names; replacements take fresh
+UUIDs. Reusable documents live under `definitions/workflows/<revision>.json`.
 
 A workflow edit is one explicit core `GraphEdit`: it adds the target's nodes
 and connections that core lacks and removes those the target lacks. Workflow
 runs admit edits under the policy in [`edit.rs`](../src/workflow/edit.rs):
-only principal `workflow`, the app's editor, may edit, and only into a
-workflow. Added nodes produce workflow payloads, added edges are
-`WorkflowConnection`s carrying workflow payloads under the `workflow`
-authority tag, no edit changes authority, and the graph keeps exactly one
-entry, with workflow authority. Other principals are denied. Runs created
-before node types are edited the same way.
+only principal `workflow`, the app's editor, may edit, and it changes the graph
+only to match a document the compiler has checked. Other principals are
+denied.
 
 The app persists its document, identity map, and edit intentions alongside
 core storage. It never reads or modifies core's private SQLite representation.
@@ -104,25 +102,18 @@ Unused raw tool wrappers are deleted: package, invocation, context, project,
 network, fixed-fact export/restore/verification, and live vocabulary extension.
 Content keeps only read/metadata operations and shared helpers. Graph import,
 rewrite list/inspect, and unused workspace operations are removed. Internal
-workspace import/restore remain available to `flow.workspace` without public
-registrations.
+workspace restore remains available to `flow.workspace` without a public
+registration.
 
-The backend retains graph declaration, run lifecycle, rewrite
-prepare/commit/discard, workflow/inspection, hosted execution, and six workspace
-operations (open, checkout, capture, checkpoint, release, list). They serve
-existing infrastructure and tests. Raw mutations reject document-owned runs,
-so they cannot bypass a saved edit or publish outside the workflow harness.
-
-A graph or application declaration sets which edits its run accepts:
-`"edits": "fixed"`, the default, keeps the graph as declared, and `"any"`
-accepts any edit core admits. `rewrite.prepare` takes an explicit edit as
-`request`: `remove_nodes`, `remove_edges`, and an `add` fragment of `nodes`,
-`edges`, `roots`, and `authority_transitions`. Removing a node requires
-removing its edges; added nodes and edges take identities never used in the
-run, and only they may carry definitions, roots, or transitions. The edit is
-made as principal `operator`; one the policy refuses reports `edit_denied`. New
-declarations with rewrite productions are rejected; declarations saved with
-them keep their fingerprints and still open, but their graphs are fixed.
+Raw declarations, graph drafts, operator rewrites, native application runs,
+and the executable registry are removed: every run starts from a document and
+changes only through its editor. The backend retains run lifecycle
+(`run.list`, `run.inspect`, `run.resume`, `run.suspend`, `run.close`), core
+moves and inspection (`workflow.*`, `inspect.*`), observation of hosted
+executions, and seven workspace operations (import, open, checkout, capture,
+checkpoint, release, list). Core moves act only for `external` nodes, so they
+cannot publish for a node a program or person owns. `workspace.import` returns
+the dependencies a submission that sends the workspace declares.
 
 Package resolution/retention, workspace checkout/capture, invocation context,
 and execution supervision remain necessary capabilities. Checkout/capture is

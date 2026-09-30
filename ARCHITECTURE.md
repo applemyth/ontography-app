@@ -69,40 +69,46 @@ The manager writes it. The compiler checks it and returns errors in these terms.
 }
 ```
 
-Fields: `name`, `entry`, optional `components`, `nodes` (`id`, `component`,
-`config`, `join`), and directed `edges` (`from`, `to`). Join belongs to the
-receiving node: `any` (the default) takes one available input; `all` waits for
-one from every incoming edge. There is one entry. Cycles and self loops are
-supported; duplicate connections are rejected. See
-[WORKFLOWS.md](docs/WORKFLOWS.md) for components, the library, and a working
-example.
+Fields: `name`, `entry`, optional `components` and `contracts`, `nodes` (`id`,
+`component`, `config`, `join`, and optionally `result`, `root`, and
+`transitions`), and directed `edges` (`from`, `to`, and optionally `name`,
+`contract`, `authority`, and `match`). Join belongs to the receiving node:
+`any` (the default) takes one available input; `all` waits for one from every
+incoming edge. There is one entry, which always starts work; other nodes start
+work only with a declared root. Cycles, self loops, and named parallel
+connections are supported. Typing is optional: unstated parts default to the
+`payload` contract and the `workflow` authority tag. The document is the only
+way to start a run. See [WORKFLOWS.md](docs/WORKFLOWS.md) for typing,
+components, external nodes, the library, and a working example.
 
 ## Library
 
 The app supplies the initial vocabulary and defaults.
 
 - Components, following core's project model: `agent` (with `codex` and
-  `claude` presets, in a terminal or headless), `command`, `human`, and
-  `inbox`. The user's `library.json` and a document's own `components` add
-  components that extend these with defaults, and MCP servers by name.
+  `claude` presets, in a terminal or headless), `command`, `human`, `inbox`,
+  and `external`, for which an outside client acts with core moves. The user's
+  `library.json` and a document's own `components` add components that extend
+  these with defaults, and MCP servers by name.
 - Node types: each built-in component gives one (`Agent`, `Command`, `Human`,
-  or `Inbox`); library and document components can add more, such as
-  `Reviewer`.
-- Package types: `workspace` (item 2), `message` (item 3), `union` (item 4).
-- One edge rule accepting `union` (item 5).
-- One implicit authority tag on every edge and root.
-- One edit policy on every document run: only the app's workflow editor may
-  edit it, and only into a workflow. An edit adds and removes nodes and
-  connections, including self loops, in one transition. Replacement uses
-  removal and addition (item 9).
+  `Inbox`, or `External`); library and document components can add more, such
+  as `Reviewer`.
+- Contracts: the default `payload` (object type `Payload`, validator `text`:
+  a message or a workspace, items 2–4), and any a document names with a
+  trusted validator: `text`, `bytes`, or `workspace`.
+- Authority: the default `workflow` tag on connections and the entry's root;
+  documents may name other tags, roots, and transitions (item 5).
+- One edit policy on every run: only the app's workflow editor may edit it. An
+  edit adds and removes nodes and connections, including self loops, in one
+  transition. Replacement uses removal and addition (item 9).
 
-Node types label what a node is; its implementation decides what runs. Every
-node shares the result contract, edge rule, and tag. A component binds a node
-to a trusted implementation and exact configuration, which become its execution
-binding. A new run declares every type its components can give, so later edits
-can place any of them. A node keeps its types, join (`any`/`all`), and entry
-status for life; changing any of them replaces the node. Runs created before
-node types keep one shared `WorkflowNode` type.
+Node types label what a node is; its implementation decides what runs. Nodes
+and connections take the document's typing, or its defaults. A component binds
+a node to a trusted implementation and exact configuration. A new run declares
+every type its components can give, so later edits can place any of them, and
+every contract, object type, and tag its document uses, which stay fixed. A
+node keeps its core definition (types, join, result contract, root, and
+transitions) for life; changing any of it replaces the node.
 
 Command config changes take effect on the next task. A change to an agent's
 binding stops and replaces the running session process, preserving its recorded
@@ -139,15 +145,15 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **3. Message package definition**
 
-   A message is `{"message":"text"}`. The contract validates it; the command task harness supplies its text on stdin and records delivery receipts. The Codex runtime begins a graph attempt and delivers its message text, sender, and input handles into the continuing conversation. Busy agents queue new messages.
+   A message is its UTF-8 text, which the default `text` validator accepts; the command task harness supplies its text on stdin and records delivery receipts. The Codex runtime begins a graph attempt and delivers its message text, sender, and input handles into the continuing conversation. Busy agents queue new messages.
 
 - [x] **4. Union package definition**
 
-   One core `Contract` and object type accept either `Message` or core's native `WorkspaceEnvelope`. Each delivery carries one of these forms. There is no combined message/workspace payload form; a joining node may receive separate messages and one workspace.
+   Payloads are what core reads: ordinary bytes, or an explicit package envelope naming a workspace. The default contract and object type accept a message or a workspace; documents may name contracts that accept only text, any bytes, or only a workspace. There is no combined message/workspace payload form; a joining node may receive separate messages and one workspace.
 
 - [x] **5. Edge definitions**
 
-   One shared directed edge rule accepts the union contract with the fixed authority tag. A successful task broadcasts its result through every outgoing connection. Replies require a reverse connection. Node types introduce no additional routing or authority rules.
+   Each connection carries a contract, its source's result contract by default, and admits authority tags, `workflow` by default, matched any-of or all-of. A command's result or a human decision goes through every outgoing connection; agents route per connection, and apply the node's authority transitions, with node tools. Replies require a reverse connection. Node types introduce no additional routing or authority rules.
 
 - [x] **6. Node harness**
 
@@ -187,9 +193,9 @@ Checkboxes indicate implementation, not completion of final release gates.
 
 - [x] **9. Vocabulary and compiler**
 
-   Expands the document into the existing `GraphDeclaration` with app-owned `ExecutionBinding` settings; the run declares every node type its components can give. It does not add another graph representation or depend on native `ApplicationDeclaration` factories. The workflow harness owns initial input, workspace setup, and process reconciliation. Existing non-document runs retain their original declarations; those saved with rewrite productions still open, but their graphs are fixed.
+   Compiles the document into core's `GraphDeclaration`: the contracts and every type, object type, and tag it uses, nodes with their result contracts, roots, and transitions, and typed connections. It is the only way to start a run; declarations are never written by hand. Component bindings stay in the app's workflow state. The workflow harness owns initial input, workspace setup, and process reconciliation.
 
-   The editor compares documents and previews one core graph edit without changing core: it adds the target's nodes and connections that core lacks and removes those the target lacks. It saves the target document, allocated identities, and the exact approved retirements before changing core. Stable names map to persisted core identities; removed identities are never reused. The last completed document and any pending target are explicit app metadata; core's actual graph records whether the edit committed.
+   The editor compares documents and previews one core graph edit without changing core: it adds the target's nodes and connections that core lacks and removes those the target lacks. It saves the target document, allocated identities, and the exact approved retirements before changing core. Stable names map to persisted core identities: a new run's are its names, and replacements take fresh UUIDs; removed identities are never reused. The last completed document and any pending target are explicit app metadata; core's actual graph records whether the edit committed.
 
    Each edit is one atomic transition. Workers continue during it; if their work makes the prepared edit stale, the editor prepares it again. Recovery computes the edit again from the actual graph and finds either the whole edit or nothing left to do. It stops if the edit would retire work absent from the preview. The manager must review that same target again before continuing; recovery never rolls back a committed edit or silently approves additional retirements. Process reconciliation follows successful completion.
 
@@ -201,13 +207,13 @@ Checkboxes indicate implementation, not completion of final release gates.
 
    Pi exposes `flow.define`, `flow.start`, `flow.status`, `flow.output`, `flow.edit`, `flow.commit`, `flow.resume`, `flow.decide`, `flow.retry`, `flow.discard`, `flow.workspace`, `flow.promote`, and `flow.export`, plus `session.context`, `session.inspect`, and `operation.get`. There is no capability-group activation tool. The session handshake also advertises session/terminal lifecycle and system controls for CLI/extension use.
 
-   Unused raw package, invocation, context, project, network, and fact tool wrappers are deleted, along with content mutation/export tools and unused rewrite/workspace operations. Remaining declaration, lifecycle, inspection, execution, and workspace adapters serve existing infrastructure and tests. Raw mutations reject document-owned runs, including through unscoped calls. The manager uses document names, task IDs, and workspace handles rather than core incarnations or content roots. Core package/context APIs and the app's workspace store still provide necessary internal plumbing; deletion of their tool wrappers does not mean deletion of those capabilities. No total code-size reduction is claimed here.
+   Unused raw package, invocation, context, project, network, and fact tool wrappers are deleted, along with content mutation/export tools and unused rewrite/workspace operations. Raw declarations, operator rewrites, native application runs, and the executable registry are removed. Remaining lifecycle, core move, inspection, execution observation, and workspace adapters serve external nodes, infrastructure, and tests. Core moves act only for external nodes, including through unscoped calls. The manager uses document names, task IDs, and workspace handles rather than core incarnations or content roots. Core package/context APIs and the app's workspace store still provide necessary internal plumbing; deletion of their tool wrappers does not mean deletion of those capabilities. No total code-size reduction is claimed here.
 
 - [x] **12. Node panes**
 
    Enter in the graph resolves the selected agent's current terminal through a session-scoped lookup and attaches the existing client. Ctrl-B D or G returns to the graph. Input, resize, history, single-controller ownership, and stale-identity checks use the shared terminal backend. Parent detach cancels the nested view and releases its socket. Opening or closing a pane has no graph effect and does not start or stop an execution.
 
-**Build status.** The document, fixed vocabulary, translator/editor, task
+**Build status.** The typed document, compiler/editor, task
 harness, persistent Codex runtime (1), and Pi surface are implemented. Remaining
 execution/UI work includes a live-model project acceptance run.
 Core remains an existing dependency.

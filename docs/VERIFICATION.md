@@ -1,5 +1,33 @@
 # Verification
 
+## One run type: typed documents and external nodes — 2026-09-29
+
+Passed: **292 app Rust tests**, **32 Pi tests**, all-target Clippy with
+warnings denied, formatting, and `git diff --check`. The sibling
+`ontography-stress` crate's quick preset passed: **10 games, 0 with problems**,
+over fixed seeds 1–5 in tandem and concurrent modes.
+
+- Every run starts from a document. Documents declare contracts, result
+  contracts, roots, transitions, and named parallel connections with their own
+  contracts, authority, and match; unstated parts default to `payload` under
+  `workflow`. Node-tool tests publish by connection name, apply a transition,
+  set an outbound object type, and see core refuse a wrong contract and
+  missing authority.
+- A typed end-to-end flow runs a human entry with a two-tag root and a command
+  whose result reaches an all-of connection and a `bytes` connection; core
+  records the entry's whole ceiling on the delivered package.
+- External nodes take core moves; moves for program or human nodes report
+  `not_external`. An outside client imports a directory, sends it over a
+  `workspace` connection to a command, and exports the command's edited
+  workspace from an inbox.
+- Edits keep a node or connection only while core declares it the same and
+  refuse changed contracts or new tags. Saved previews survive a server kill
+  and still commit.
+- The stress games run their worlds as documents of external nodes, while
+  core in tandem runs a declaration the game writes independently; server,
+  core, and the rules decided every move alike, across joins, transitions,
+  outbound packages, races, and crashes.
+
 ## Entering worker terminals from the graph — 2026-09-27
 
 Passed: **244 app Rust tests**, including the real CLI/PTY checks in

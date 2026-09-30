@@ -33,7 +33,7 @@ The worker relationship is node → execution → PTY → client view. Each node
 1. `ontography` connects to or starts the server for its canonical data directory, replacing an idle server of another build.
 2. Bare launch always creates a session with a reserved initial Pi conversation UUID and pending graph initialization. `new NAME` names it. `attach NAME_OR_ID` or bare `--session NAME_OR_ID` explicitly resumes an existing session. IDs take precedence; names must match exactly and uniquely. Persisted selection does not control default launch.
 3. Attachment resumes the selected graph when present and reuses its live shell terminal as-is. Creating a new terminal starts Pi with the saved active conversation. Only one controlling attachment is admitted per terminal.
-4. Pi's first scoped `run.start` or `project.start` persists a run identity and resolved initialization source before creating core storage. The resulting run is bound to the app session. Retry/recovery reuses that identity.
+4. Pi's first scoped `flow.start` persists a run identity, its compiled declaration, and its initial workflow before creating core storage. The resulting run is bound to the app session. Retry/recovery reuses that identity.
 5. `/graph` in Pi or Ctrl-B G switches the attached client's view to the bound run, or pending initialization. Returning restores the same terminal.
 6. Pi `/quit` reveals the managed shell and session panel. Shell `pi` resolves the latest saved conversation and launches Pi again; `/new` remains the explicit new-conversation operation.
 7. Ctrl-B, then D detaches the client; the shell, any managed Pi, graph resources, and terminal output handling remain server-owned.
