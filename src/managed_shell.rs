@@ -220,12 +220,12 @@ impl ManagedShell {
         });
         let weak = Arc::downgrade(&shell);
         let mut stopping = shell.stop.subscribe();
-        let mut errors = crate::listen::AcceptLog::new(&shell.socket, None);
+        let mut errors = crate::sockets::AcceptLog::new(&shell.socket, None);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _=stopping.changed()=>break,
-                    (stream,_)=crate::listen::next_connection(||listener.accept(),&mut errors)=>{
+                    (stream,_)=crate::sockets::next_connection(||listener.accept(),&mut errors)=>{
                         let weak=weak.clone();let service=service.clone();
                         tokio::spawn(async move {if let Some(shell)=weak.upgrade(){shell.serve(service,stream).await;}});
                     }
@@ -696,7 +696,7 @@ pub async fn run_pi(paths: &Paths, session_id: &str, generation: &str) -> Result
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let mut quit = signal(SignalKind::quit())?;
-    let stream = UnixStream::connect(lease_socket(paths, generation)?).await?;
+    let stream = crate::sockets::connect(lease_socket(paths, generation)?).await?;
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     send(

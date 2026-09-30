@@ -6,7 +6,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::Path, time::Duration};
 use tokio::{
-    net::UnixStream,
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
@@ -33,7 +32,7 @@ pub(super) struct Rpc {
 
 impl Rpc {
     pub async fn connect(path: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(path).await?;
+        let stream = crate::sockets::connect(path).await?;
         let (socket, _) = client_async_with_config(
             "ws://localhost/",
             stream,

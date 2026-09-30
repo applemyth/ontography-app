@@ -7,9 +7,8 @@
 //! fails with status 1, which Claude reports without blocking anything.
 
 use crate::{
-    AppError, Result,
-    listen::{AcceptLog, next_connection},
-    protocol,
+    AppError, Result, protocol,
+    sockets::{AcceptLog, next_connection},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -215,7 +214,7 @@ pub async fn run(event: &str) -> Result<()> {
 
 async fn forward(socket: &Path, token: String, event: &str, input: Value) -> Result<()> {
     let exchange = async {
-        let stream = UnixStream::connect(socket).await?;
+        let stream = crate::sockets::connect(socket).await?;
         let (reader, mut writer) = stream.into_split();
         protocol::write_frame(
             &mut writer,

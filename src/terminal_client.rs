@@ -26,7 +26,6 @@ use std::{
 };
 use tokio::{
     io::BufReader,
-    net::UnixStream,
     sync::{mpsc, watch},
 };
 
@@ -234,7 +233,7 @@ where
             "Attaching requires an interactive terminal",
         ));
     }
-    let mut stream = UnixStream::connect(socket).await?;
+    let mut stream = crate::sockets::connect(socket).await?;
     protocol::write_frame(&mut stream, &request).await?;
     let mut reader = BufReader::new(stream);
     let frame = tokio::time::timeout(Duration::from_secs(5), protocol::read_frame(&mut reader))

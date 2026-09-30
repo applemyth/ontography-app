@@ -623,7 +623,7 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
     let mut idle_since: Option<Instant> = None;
     // Running out of descriptors must not end the server: they return as
     // connections close.
-    let mut accept_errors = crate::listen::AcceptLog::new(
+    let mut accept_errors = crate::sockets::AcceptLog::new(
         &server.service.paths.socket,
         Some(&server.service.paths.root),
     );
@@ -634,7 +634,7 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
     let mut signalled = false;
     loop {
         tokio::select! {
-            (socket, _) = crate::listen::next_connection(|| listener.accept(), &mut accept_errors), if clients.len() < 256 => {
+            (socket, _) = crate::sockets::next_connection(|| listener.accept(), &mut accept_errors), if clients.len() < 256 => {
                 // A command's connections come and go between idle checks;
                 // any of them means the server is in use.
                 idle_since = None;

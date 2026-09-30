@@ -5,7 +5,7 @@
 //! Delivery acknowledgements follow stdout flush, so receipts cover the exact
 //! text returned to the MCP client, not just an internal socket write.
 
-use crate::listen::{AcceptLog, next_connection};
+use crate::sockets::{AcceptLog, next_connection};
 use crate::{
     AppError, Result,
     node_tool::{NodeToolContext, Reply},
@@ -446,7 +446,7 @@ pub async fn run_stdio() -> Result<()> {
         .ok_or_else(|| AppError::new("node_mcp", "Node MCP socket is missing"))?;
     let token = std::env::var(TOKEN_ENV)
         .map_err(|_| AppError::new("node_mcp", "Node MCP token is missing"))?;
-    let stream = UnixStream::connect(PathBuf::from(socket)).await?;
+    let stream = crate::sockets::connect(PathBuf::from(socket)).await?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     protocol::write_frame(&mut writer, &Hello { version: 1, token }).await?;
@@ -549,4 +549,3 @@ fn print(message: &Value) -> Result<()> {
     stdout.flush()?;
     Ok(())
 }
-

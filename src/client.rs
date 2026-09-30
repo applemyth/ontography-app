@@ -3,10 +3,7 @@ use crate::protocol::{MAX_FRAME_BYTES, Request, Response, VERSION, read_frame};
 use crate::{AppError, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use tokio::{
-    io::{AsyncWriteExt, BufReader},
-    net::UnixStream,
-};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 /// A stable client identity; each request may reconnect without replaying work.
 #[derive(Clone, Debug)]
@@ -174,7 +171,7 @@ impl Client {
             ));
         }
         frame.push(b'\n');
-        let mut stream = UnixStream::connect(&self.socket).await?;
+        let mut stream = crate::sockets::connect(&self.socket).await?;
         let uncertain = |cause: AppError| {
             if operation == "system.hello" {
                 return cause;

@@ -1,10 +1,29 @@
-//! Accepting connections on the app's local sockets. An accept error, such
-//! as running out of file descriptors, never closes a socket: it is logged
-//! unless it repeats the last one, and accepting resumes after a pause, so it
-//! cannot spin.
+//! The app's local sockets. An accept error, such as running out of file
+//! descriptors, never closes a socket: it is logged unless it repeats the
+//! last one, and accepting resumes after a pause, so it cannot spin. A client
+//! connects only to a socket served by its own user: the directories under
+//! /tmp that hold them go away while nothing serves them, so another user
+//! could make one in the meantime.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::net::UnixStream;
+
+/// Connects to the socket at `path` if a process of this user serves it.
+pub async fn connect(path: impl AsRef<Path>) -> std::io::Result<UnixStream> {
+    let stream = UnixStream::connect(path.as_ref()).await?;
+    let owner = stream.peer_cred()?.uid();
+    if owner != nix::unistd::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is served by another user ({owner})",
+                path.as_ref().display()
+            ),
+        ));
+    }
+    Ok(stream)
+}
 
 /// How long a socket waits after an accept error to accept again.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
@@ -67,6 +86,16 @@ mod tests {
     use nix::errno::Errno;
     use std::collections::VecDeque;
     use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn connects_to_a_socket_its_own_user_serves() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (connected, accepted) = tokio::join!(connect(&path), listener.accept());
+        connected.unwrap();
+        accepted.unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn accept_errors_pause_and_are_logged_unless_repeated() {
