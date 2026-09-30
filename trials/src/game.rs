@@ -286,12 +286,13 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, settings: &Settings) ->
     outcome
         .problems
         .extend(after_stop(&tracker, &data, &server, &run).await);
-    outcome.problems.extend(
-        audit::store(&data, &run, &before)
-            .await
-            .into_iter()
-            .map(|p| format!("store: {p}")),
-    );
+    let (stored, verified) = audit::store(&data, &run, &before).await;
+    outcome
+        .problems
+        .extend(stored.into_iter().map(|p| format!("store: {p}")));
+    outcome
+        .counts
+        .insert("verified replays", usize::from(verified));
     let mut server = Server::start(binary, &data).await?;
     tracker.root(server.incarnations[0]);
     record_servers(dir, &server)?;

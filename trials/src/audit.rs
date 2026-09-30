@@ -11,10 +11,15 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-pub async fn store(data: &Path, run: &str, export: &Value) -> Vec<String> {
+/// Problems the store shows, and whether core also replayed and verified
+/// its history from scratch.
+pub async fn store(data: &Path, run: &str, export: &Value) -> (Vec<String>, bool) {
     match check(data, run, export).await {
-        Ok(problems) => problems,
-        Err(error) => vec![format!("could not reopen the store: {error:#}")],
+        Ok(checked) => checked,
+        Err(error) => (
+            vec![format!("could not reopen the store: {error:#}")],
+            false,
+        ),
     }
 }
 
@@ -32,7 +37,7 @@ fn ids(export: &Value, field: &str, key: &[&str]) -> BTreeSet<String> {
         .collect()
 }
 
-async fn check(data: &Path, run: &str, export: &Value) -> Result<Vec<String>> {
+async fn check(data: &Path, run: &str, export: &Value) -> Result<(Vec<String>, bool)> {
     let directory = data.join("runs").join(run);
     let manifest: Value = serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
     let declaration = parse_json::<GraphDeclaration>(&manifest["declaration"].to_string())?;
@@ -78,8 +83,9 @@ async fn check(data: &Path, run: &str, export: &Value) -> Result<Vec<String>> {
     }
     // Core replays from scratch only a fixed graph's activations: no
     // retirements, and no edit since the run began.
+    let initial = kernel.fingerprint().to_string();
     let fixed = state.retirements().is_empty()
-        && export["current_fingerprint"] == manifest["declaration_revision"];
+        && export["current_fingerprint"].as_str() == Some(initial.as_str());
     runtime.shutdown().await;
     drop(session);
     // Core can check a history of activations alone from its first record.
@@ -95,5 +101,5 @@ async fn check(data: &Path, run: &str, export: &Value) -> Result<Vec<String>> {
             )),
         }
     }
-    Ok(problems)
+    Ok((problems, fixed))
 }
