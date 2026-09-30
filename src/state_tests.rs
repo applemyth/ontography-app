@@ -4,7 +4,11 @@ use crate::persistence::{Paths, read_json};
 use crate::state::{RunManifest, Service};
 use crate::tools;
 use serde_json::{Value, json};
-use std::{os::unix::fs::MetadataExt, path::PathBuf};
+use std::{
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 /// An outside client feeds a command worker, the run's one execution.
 fn document() -> Value {
@@ -159,5 +163,69 @@ async fn opening_a_closed_run_leaves_its_manifest_closed() {
         .await
         .unwrap();
     assert_eq!(listed["runs"][0]["status"], "closed");
+    service.shutdown().await.unwrap();
+}
+
+/// Starts the document as the run reserved as `id`, as a retried start does.
+async fn start_reserved(service: &Service, project: &Path, id: &str) -> crate::Result<Value> {
+    let args = json!({"document":document(),"project":project});
+    let (declaration, workflow) = crate::workflow::tools::prepare_start(service, &args, id)?;
+    service
+        .start_reserved(
+            id,
+            declaration,
+            project.into(),
+            workflow,
+            service.environment(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn concurrent_starts_with_one_id_share_one_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths::initialize(directory.path().join("data")).unwrap();
+    let service = Service::new(paths.clone()).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    // Both starts wait for the run map, then look for the id in turn.
+    let held = service.runs.lock().await;
+    let (first, second, ()) = tokio::join!(
+        start_reserved(&service, directory.path(), &id),
+        start_reserved(&service, directory.path(), &id),
+        async move {
+            tokio::task::yield_now().await;
+            drop(held);
+        }
+    );
+    // A retry of an unanswered start recovers the same run.
+    assert_eq!(first.unwrap()["run_id"], id);
+    assert_eq!(second.unwrap()["run_id"], id);
+    assert_eq!(service.runs.lock().await.len(), 1);
+    let stores = std::fs::read_dir(paths.root.join("runs")).unwrap().count();
+    assert_eq!(stores, 1);
+    assert!(paths.run(&id).unwrap().join("core").is_dir());
+    assert_eq!(executions(&service, &id).await.len(), 1);
+    service.shutdown().await.unwrap();
+    assert!(!service.has_live_runs());
+}
+
+#[tokio::test]
+async fn a_start_retry_waits_for_its_run_without_holding_the_others() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    start_reserved(&service, directory.path(), &id)
+        .await
+        .unwrap();
+    // Another operation holds the run when a retry of its start arrives.
+    let run = service.run(&id).await.unwrap();
+    let busy = run.lock().await;
+    let (retried, lookup) = tokio::join!(start_reserved(&service, directory.path(), &id), async {
+        let lookup = tokio::time::timeout(Duration::from_secs(1), service.run(&id)).await;
+        drop(busy);
+        lookup
+    });
+    assert!(lookup.is_ok(), "the waiting retry kept the run map locked");
+    assert_eq!(retried.unwrap()["run_id"], id);
     service.shutdown().await.unwrap();
 }

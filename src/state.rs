@@ -511,7 +511,11 @@ impl Service {
         if !project.is_dir() {
             return Err(AppError::invalid("project must be a directory"));
         }
-        if let Some(run) = self.runs.lock().await.get(id).cloned() {
+        let directory = self.paths.run(id)?;
+        let mut runs = self.runs.lock().await;
+        if let Some(run) = runs.get(id).cloned() {
+            // Other runs stay reachable while this one is reconciled.
+            drop(runs);
             let mut run = run.lock().await;
             if run.manifest.declaration_revision != declaration_revision
                 || run.manifest.project != project
@@ -545,7 +549,8 @@ impl Service {
             }
             return run.inspect(100).await;
         }
-        let directory = self.paths.run(id)?;
+        // Reserve the id before releasing the map: a concurrent start with it
+        // then waits for this run and reconciles it as a retry.
         create_reserved_directory(&directory)?;
         let manifest = RunManifest {
             version: 1,
@@ -572,8 +577,10 @@ impl Service {
             recovery_checkouts: BTreeMap::new(),
             environment,
         }));
-        self.runs.lock().await.insert(id.into(), run.clone());
+        runs.insert(id.into(), run.clone());
+        // Nothing else can reach the run before the map is released.
         let mut run = run.lock().await;
+        drop(runs);
         let runtime = runtime(kernel);
         let session = runtime
             .create_persistent(run.directory.join("core"))
