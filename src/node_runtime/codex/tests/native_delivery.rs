@@ -149,7 +149,9 @@ approval_mode = {approval:?}
     let plan =
         Plan::with_home(&scope.node.id, config, dir.path(), &cwd, dir.path(), &home).unwrap();
     let overrides = mcp.codex_overrides().unwrap();
-    let mut env = mcp.environment();
+    // A terminal inherits nothing, so the test supplies what a session would.
+    let mut env = crate::environment::Environment::current().vars().clone();
+    env.extend(mcp.environment());
     env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
     let mut lifetime = Lifetime::new(dir.path()).unwrap();
     let spec = plan.launch(Path::new("codex"), &overrides, env);

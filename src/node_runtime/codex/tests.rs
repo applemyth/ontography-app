@@ -180,7 +180,9 @@ async fn native_codex_server_and_pane_share_a_thread() {
         "model_providers.fixture={name=\"Fixture\",base_url=\"http://127.0.0.1:1/v1\",wire_api=\"responses\",requires_openai_auth=false,request_max_retries=0,stream_max_retries=0}".into(),
         format!("projects.{}.trust_level=\"trusted\"",serde_json::to_string(&std::fs::canonicalize(&cwd).unwrap()).unwrap()),
     ];
-    let env = BTreeMap::from([("CODEX_HOME".into(), home.to_string_lossy().into_owned())]);
+    // A terminal inherits nothing, so the test supplies what a session would.
+    let mut env = crate::environment::Environment::current().vars().clone();
+    env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
     let mut lifetime = Lifetime::new(dir.path()).unwrap();
     let spec = plan.launch(Path::new("codex"), &overrides, env.clone());
     let attach = crate::terminal::AttachRequest {

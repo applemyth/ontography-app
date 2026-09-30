@@ -46,7 +46,9 @@ impl Native {
             {"hooks": [{"type": "command", "command": "exit 2"}]},
         ]}});
         std::fs::write(home.join("settings.json"), blocked.to_string()).unwrap();
-        let env = BTreeMap::from([
+        // A terminal inherits nothing, so the test supplies what a session would.
+        let mut env = crate::environment::Environment::current().vars().clone();
+        env.extend([
             (
                 "CLAUDE_CONFIG_DIR".into(),
                 home.to_string_lossy().into_owned(),
