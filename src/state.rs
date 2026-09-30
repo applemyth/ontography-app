@@ -616,11 +616,33 @@ impl Service {
         run.inspect(100).await
     }
 
+    /// Suspend every run. A run that fails does not keep the others live;
+    /// the error names each run that failed.
     pub async fn shutdown(&self) -> Result<()> {
         let runs = self.runs.lock().await.values().cloned().collect::<Vec<_>>();
+        let count = runs.len();
+        let mut failed = BTreeMap::new();
         for run in runs {
-            run.lock().await.suspend(false).await?;
+            let mut run = run.lock().await;
+            if let Err(error) = run.suspend(false).await {
+                failed.insert(run.manifest.run_id.clone(), error);
+            }
         }
-        Ok(())
+        if failed.is_empty() {
+            return Ok(());
+        }
+        let named = failed
+            .iter()
+            .map(|(id, error)| format!("{id} ({error})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(AppError::new(
+            "shutdown_incomplete",
+            format!(
+                "{} of {count} runs could not be suspended: {named}",
+                failed.len()
+            ),
+        )
+        .details(json!({"runs":failed})))
     }
 }

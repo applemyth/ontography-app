@@ -261,3 +261,37 @@ async fn a_start_retry_clears_the_temporary_of_its_interrupted_manifest() {
     assert!(errors(status).is_empty());
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn shutdown_suspends_every_run_it_can_and_names_the_rest() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
+    let mut ids = [
+        start(&service, directory.path()).await,
+        start(&service, directory.path()).await,
+    ];
+    ids.sort();
+    let [failing, other] = &ids;
+    // The first run shutdown reaches cannot replace its manifest.
+    let manifest = service.paths.run(failing).unwrap().join("manifest.json");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let error = service.shutdown().await.unwrap_err();
+    {
+        let run = service.run(other).await.unwrap();
+        let run = run.lock().await;
+        assert!(run.live.is_none());
+        assert_eq!(run.manifest.status, "suspended");
+    }
+    assert_eq!(error.code, "shutdown_incomplete");
+    assert!(error.message.contains(failing.as_str()), "{error}");
+    let failed = error.details.unwrap()["runs"].clone();
+    assert_eq!(failed.as_object().unwrap().len(), 1);
+    assert_eq!(failed[failing]["code"], "io_error");
+
+    // Once repaired, shutting down again finishes.
+    std::fs::remove_dir(&manifest).unwrap();
+    service.shutdown().await.unwrap();
+    assert!(!service.has_live_runs());
+}
