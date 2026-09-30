@@ -363,7 +363,7 @@ async fn a_signalled_server_exits_even_when_a_run_cannot_suspend() {
     let error = Client::stop_server(&fixture.paths.socket)
         .await
         .unwrap_err();
-    assert_eq!(error.code, "io_error", "{error}");
+    assert_eq!(error.code, "shutdown_incomplete", "{error}");
     client
         .call("flow.define", json!({"document":document()}))
         .await

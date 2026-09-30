@@ -34,7 +34,17 @@ pub(crate) async fn next_connection<T, F: Future<Output = std::io::Result<T>>>(
 ) -> T {
     loop {
         match accept().await {
-            Ok(connection) => return connection,
+            Ok(connection) => {
+                if let Some(error) = log.last.take()
+                    && let Some(root) = &log.root
+                {
+                    // Recording the failure may itself have needed a descriptor.
+                    let socket = log.socket.display();
+                    let message = format!("{socket} is accepting connections again after: {error}");
+                    crate::logging::record(root, &message);
+                }
+                return connection;
+            }
             Err(error) => {
                 let error = error.to_string();
                 if log.last.as_ref() != Some(&error) {
@@ -79,11 +89,16 @@ mod tests {
         assert_eq!(next_connection(&mut accept, &mut log).await, 2);
         let logged = std::fs::read_to_string(root.path().join("logs/server.log")).unwrap();
         let logged: Vec<_> = logged.lines().collect();
-        assert_eq!(logged.len(), 2, "{logged:?}");
+        // Each distinct failure once, and each recovery.
+        assert_eq!(logged.len(), 5, "{logged:?}");
         assert!(logged[0].contains(&format!(
             "mcp.sock could not accept a connection: {}",
             std::io::Error::from(Errno::EMFILE)
         )));
-        assert!(logged[1].contains(&std::io::Error::from(Errno::ECONNABORTED).to_string()));
+        let aborted = std::io::Error::from(Errno::ECONNABORTED).to_string();
+        assert!(logged[1].contains(&aborted));
+        assert!(logged[2].contains("mcp.sock is accepting connections again"));
+        assert!(logged[3].contains(&aborted));
+        assert!(logged[4].contains("mcp.sock is accepting connections again"));
     }
 }

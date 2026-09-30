@@ -621,8 +621,12 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
             limit.min(Duration::from_secs(1))
         }));
     let mut idle_since: Option<Instant> = None;
-    // Why accepting last failed, while it still fails.
-    let mut accept_error: Option<String> = None;
+    // Running out of descriptors must not end the server: they return as
+    // connections close.
+    let mut accept_errors = crate::listen::AcceptLog::new(
+        &server.service.paths.socket,
+        Some(&server.service.paths.root),
+    );
     // A stop begun here runs beside the loop, which keeps accepting, so new
     // requests learn the server is stopping rather than wait for it to exit.
     let mut stop: Option<JoinHandle<Result<Value>>> = None;
@@ -630,28 +634,12 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
     let mut signalled = false;
     loop {
         tokio::select! {
-            accepted = listener.accept(), if clients.len() < 256 => match accepted {
-                Ok((socket, _)) => {
-                    if let Some(error) = accept_error.take() {
-                        // Recording the failure may have needed a descriptor too.
-                        crate::logging::record(&server.service.paths.root, &format!("accepting connections again after: {error}"));
-                    }
-                    // A command's connections come and go between idle checks;
-                    // any of them means the server is in use.
-                    idle_since = None;
-                    let server = server.clone();
-                    clients.spawn(async move { let _ = connection(server,socket).await; });
-                }
-                // Running out of descriptors must not end the server: they
-                // return as connections close. Pause rather than spin.
-                Err(error) => {
-                    let error = error.to_string();
-                    if accept_error.as_ref() != Some(&error) {
-                        crate::logging::record(&server.service.paths.root, &format!("cannot accept connections: {error}"));
-                        accept_error = Some(error);
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+            (socket, _) = crate::listen::next_connection(|| listener.accept(), &mut accept_errors), if clients.len() < 256 => {
+                // A command's connections come and go between idle checks;
+                // any of them means the server is in use.
+                idle_since = None;
+                let server = server.clone();
+                clients.spawn(async move { let _ = connection(server,socket).await; });
             },
             _ = server.stopped.notified() => break,
             _ = terminate.recv() => { signalled = true; stop.get_or_insert_with(|| stop_beside(&server, false)); },
