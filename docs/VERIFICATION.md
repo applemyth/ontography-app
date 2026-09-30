@@ -1,5 +1,42 @@
 # Verification
 
+## Worker recovery, blocked work, and whole-app trials — 2026-09-30
+
+Passed: **359 app Rust tests**, the [trials](../trials/README.md) crate's
+included, against core `fcb37a9`; all-target workspace Clippy with warnings
+denied, formatting, and `git diff --check`. Six opt-in native tests remain
+ignored. The trials on this tree: the quick preset, **8 trials, 0 with
+problems**; the sessions trial at seed 1 and with 5 sessions, 3 rounds and 2
+crashes; a crashpoints sample of **200 points, 0 with problems**, and every
+one of the export script's **160 points**. A copy of ontography-stress
+`5778e30` replayed software seed 2, which kills a program and resumes 300 ms
+later, **15 times without a problem**; before the fix it lost the node in
+about one game in five.
+
+- [Worker recovery tests](../tests/worker_recovery.rs): a node whose previous
+  worker is still exiting shows `waiting` with `worker_still_exiting`, then
+  starts without a resume. A resume 100 ms after a program dies mid-checkout
+  waits for the node's cleanup, then starts it again. The lease tests
+  force-stop a frozen worker whose supervisor still proves itself, with its
+  session's jobs, and never signal a group recovery cannot prove it owns;
+  stopping the run ends the wait. Each fails on the tree before its fix.
+- [Blocked work tests](../tests/blocked_work.rs): a human task no decision can
+  satisfy is discarded, and the task behind it becomes ready. Status lists 100
+  of 105 parked tasks with `failures_total`, as a discard's reply does. Both
+  fail before the fix.
+- A definition change whose ledger cannot be written commits with a
+  `warning` ([retry tests](../tests/workflow_retry.rs)). A change whose status
+  is too large to include replies `applied` with its `run_id`
+  ([server robustness](../tests/server_robustness.rs)). The crash point where
+  `flow.discard` retired its input but could not forget its task now succeeds.
+- `inspect.export` stages its temporary in the run's directory, so no export
+  crash point leaves one behind.
+- Two migration tests now wait for a dropped lock to be released: a process
+  another test forks holds it until it execs, which failed them under load.
+- Not fixed: `flow.export`'s staging container beside the destination
+  survives a crash; edits can starve under load, since a topology preview goes
+  stale on any work and recovery retries a stale edit without pause.
+
 ## Stdout envelope refusals park at once — 2026-09-30
 
 Passed: **320 app Rust tests** against core `fcb37a9`, **221 core Rust
