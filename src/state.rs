@@ -324,7 +324,13 @@ impl ManagedRun {
             );
         }
         self.manifest.checkpoints = checkpoints;
-        self.manifest.status = "suspending".into();
+        // A closed run is never recoverable, even while it is suspended.
+        self.manifest.status = if live.session.status() == SessionStatus::Closed {
+            "closed"
+        } else {
+            "suspending"
+        }
+        .into();
         write_json(&self.directory.join("manifest.json"), &self.manifest)?;
         if close {
             live.session.close().await;
