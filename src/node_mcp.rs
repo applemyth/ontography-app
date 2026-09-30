@@ -487,7 +487,7 @@ async fn connection(stream: UnixStream, token: &str, context: Arc<NodeToolContex
 /// Invoked by Codex as a stdio MCP server. No storage or management connection
 /// is opened here, and a lost connection is never automatically replayed.
 pub async fn run_stdio() -> Result<()> {
-    use std::io::{BufRead, Read, Write};
+    use std::io::{BufRead, Read};
     let socket = std::env::var_os(SOCKET_ENV)
         .ok_or_else(|| AppError::new("node_mcp", "Node MCP socket is missing"))?;
     let token = std::env::var(TOKEN_ENV)
@@ -513,6 +513,7 @@ pub async fn run_stdio() -> Result<()> {
     let mut frames = Frames::new(reader);
     // A dedicated OS thread keeps a blocked stdin read out of Tokio's blocking
     // pool: server loss must let this process exit even while stdin stays open.
+    // A line too long for a frame arrives as `None`, the rest of it skipped.
     let (input, mut incoming) = tokio::sync::mpsc::channel(8);
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
@@ -521,55 +522,78 @@ pub async fn run_stdio() -> Result<()> {
             let result = (&mut stdin)
                 .take(protocol::MAX_FRAME_BYTES as u64 + 1)
                 .read_until(b'\n', &mut bytes);
-            match result {
+            let line = match result {
                 Ok(0) => break,
-                Ok(_) if bytes.len() <= protocol::MAX_FRAME_BYTES && bytes.ends_with(b"\n") => {
-                    if input.blocking_send(Ok(bytes)).is_err() {
-                        break;
+                Ok(_) if bytes.len() > protocol::MAX_FRAME_BYTES => {
+                    if bytes.ends_with(b"\n") {
+                        Ok(None)
+                    } else {
+                        stdin
+                            .skip_until(b'\n')
+                            .map(|_| None)
+                            .map_err(AppError::from)
                     }
                 }
-                _ => {
-                    let _ = input.blocking_send(Err(AppError::new(
-                        "node_mcp",
-                        "Invalid or oversized MCP input frame",
-                    )));
-                    break;
-                }
+                Ok(_) if bytes.ends_with(b"\n") => Ok(Some(bytes)),
+                _ => Err(AppError::new("node_mcp", "Invalid MCP input frame")),
+            };
+            let failed = line.is_err();
+            if input.blocking_send(line).is_err() || failed {
+                break;
             }
         }
     });
+    let too_large = format!(
+        "An MCP request can be at most {} bytes",
+        protocol::MAX_FRAME_BYTES
+    );
     loop {
         tokio::select! {
             input = incoming.recv() => {
-                let Some(bytes) = input else { return Ok(()); };
-                let bytes = bytes?;
+                let Some(line) = input else { return Ok(()); };
+                let Some(bytes) = line? else {
+                    print(&rpc_error(Value::Null, -32600, &too_large))?;
+                    continue;
+                };
                 let message: Value = match serde_json::from_slice(&bytes) {
                     Ok(value) => value,
                     Err(_) => {
-                        let mut stdout = std::io::stdout().lock();
-                        serde_json::to_writer(&mut stdout, &rpc_error(Value::Null, -32700, "Parse error"))?;
-                        stdout.write_all(b"\n")?;
-                        stdout.flush()?;
+                        print(&rpc_error(Value::Null, -32700, "Parse error"))?;
                         continue;
                     }
                 };
-                protocol::write_frame(&mut writer, &Inbound::Message { message }).await?;
+                let id = message.get("id").cloned();
+                match protocol::write_frame(&mut writer, &Inbound::Message { message }).await {
+                    // Wrapped for the node, the request outgrew one frame;
+                    // nothing was sent.
+                    Err(error) if error.code == "result_too_large" => {
+                        if let Some(id) = id {
+                            print(&rpc_error(id, -32600, &too_large))?;
+                        }
+                    }
+                    sent => sent?,
+                }
             }
             output = frames.receiver.recv() => {
                 let bytes = output.ok_or_else(|| AppError::new("node_mcp", "Node execution disconnected"))??;
                 let response: Outbound = serde_json::from_slice(&bytes)?;
-                {
-                    let mut stdout = std::io::stdout().lock();
-                    serde_json::to_writer(&mut stdout, &response.message)?;
-                    stdout.write_all(b"\n")?;
-                    stdout.flush()?;
-                }
+                print(&response.message)?;
                 if let Some(delivered) = response.delivery {
                     protocol::write_frame(&mut writer, &Inbound::Delivered { delivered }).await?;
                 }
             }
         }
     }
+}
+
+/// Writes one message to the MCP client, and flushes it.
+fn print(message: &Value) -> Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, message)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]

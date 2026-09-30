@@ -13,6 +13,11 @@ use serde_json::{Value, json};
 const MAX_READ: u64 = 256 * 1024;
 /// Largest collection one listing returns; open larger ones as a workspace.
 const MAX_LISTED: usize = 1000;
+/// Most text of member paths and link targets one listing returns. Core's
+/// listing names each path twice, and JSON escaping at most doubles text,
+/// both in the listing and in the MCP result carrying it: with its other
+/// fields, a listing within this fits one 4 MiB MCP frame.
+const MAX_LISTED_TEXT: usize = 256 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +63,7 @@ pub(super) struct ListPackage;
 
 impl Tool for ListPackage {
     const NAME: &'static str = "list_package";
-    const DESCRIPTION: &'static str = "List the immediate members of a collection among this attempt's inputs. Collections of more than 1000 entries are refused; open them as a workspace.";
+    const DESCRIPTION: &'static str = "List the immediate members of a collection among this attempt's inputs. Collections of more than 1000 entries, or whose paths total more than 262144 bytes, are refused; open them as a workspace.";
     const MUTATING: bool = false;
     type Input = Target;
 
@@ -66,12 +71,29 @@ impl Tool for ListPackage {
         context
             .with_attempt(&target.attempt_id, async |attempt, state| {
                 if let Some(children) = state.children(attempt, &target.handle).await? {
-                    let children = children.len();
-                    if children > MAX_LISTED {
+                    let count = children.len();
+                    if count > MAX_LISTED {
                         return Err(AppError::new(
                             "too_many_members",
                             format!(
-                                "This collection has {children} entries; open it as a workspace instead"
+                                "This collection has {count} entries; open it as a workspace instead"
+                            ),
+                        ));
+                    }
+                    // Checked before core records the listing, which must
+                    // then fit one frame to reach the worker.
+                    let text: usize = children
+                        .iter()
+                        .map(|child| match &child.kind {
+                            ResolvedEntryKind::Symlink { target } => child.path.len() + target.len(),
+                            _ => child.path.len(),
+                        })
+                        .sum();
+                    if text > MAX_LISTED_TEXT {
+                        return Err(AppError::new(
+                            "too_large",
+                            format!(
+                                "This collection's paths total {text} bytes; open it as a workspace instead"
                             ),
                         ));
                     }

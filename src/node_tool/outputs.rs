@@ -13,14 +13,16 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-/// Largest text one import stores; larger files belong in a checkout.
-const MAX_IMPORT: usize = 8 * 1024 * 1024;
+/// Largest text one import stores; larger files belong in a checkout. JSON
+/// escapes a byte of text to at most six, so a request with this much text
+/// still fits one 4 MiB MCP frame.
+pub(super) const MAX_IMPORT: usize = 512 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Import {
     attempt_id: String,
-    /// The file's contents, at most 8 MiB.
+    /// The file's contents, at most 512 KiB.
     text: String,
     /// Whether the file is meant to be executable.
     #[serde(default)]

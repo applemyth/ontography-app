@@ -1,8 +1,18 @@
 use super::{Fixture, document};
-use crate::{node_mcp::NodeMcp, node_tool::context::context_error, protocol};
-use ontography::{ContentDigest, InvocationId, ReceiptState};
+use crate::{
+    node_mcp::NodeMcp,
+    node_tool::{context::context_error, outputs::MAX_IMPORT},
+    protocol,
+    workflow::WorkflowPayload,
+};
+use ontography::{
+    ContentDigest, InvocationId, PackageDocument, PackageEnvelope, PackageStore, ReceiptState,
+};
 use serde_json::{Value, json};
-use std::{os::unix::fs::PermissionsExt, process::Stdio, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap, os::unix::fs::PermissionsExt, process::Stdio, str::FromStr,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -367,6 +377,117 @@ async fn an_unknown_acknowledgement_changes_nothing() {
         .await;
     assert_eq!(client.read().await["message"]["id"], 1);
     drop(client);
+    drop(server);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn requests_fit_one_frame_at_the_import_limit_and_larger_ones_are_refused() {
+    let (fixture, _directory, server) = hosted(json!({})).await;
+    fixture.deliver("work item").await;
+    let mut client = Client::new(&server).await;
+    let next = tool_value(&client.call(1, "next_trigger", json!({})).await);
+    let begun = tool_value(
+        &client
+            .call(2, "begin_invocation", json!({"task_id":next["task_id"]}))
+            .await,
+    );
+    let import = |id: u32, text: String| {
+        let mut line = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"import_content","arguments":{"attempt_id":begun["attempt_id"],"text":text}}})).unwrap();
+        line.push(b'\n');
+        line
+    };
+    // JSON escapes a control character to six bytes, the most of any text.
+    let limit = import(3, "\u{1}".repeat(MAX_IMPORT));
+    client.input.write_all(&limit).await.unwrap();
+    assert_eq!(tool_value(&client.read().await)["bytes"], MAX_IMPORT);
+    // A request longer than a frame is refused, as is one whose frame to the
+    // node would be, and the proxy serves on.
+    let oversized = import(4, "x".repeat(protocol::MAX_FRAME_BYTES));
+    client.input.write_all(&oversized).await.unwrap();
+    assert_eq!(client.read().await["error"]["code"], -32600);
+    let filled = protocol::MAX_FRAME_BYTES - import(5, String::new()).len();
+    client
+        .input
+        .write_all(&import(5, "x".repeat(filled)))
+        .await
+        .unwrap();
+    let refused = client.read().await;
+    assert_eq!(
+        (&refused["id"], &refused["error"]["code"]),
+        (&json!(5), &json!(-32600))
+    );
+    assert_eq!(
+        tool_value(&client.call(6, "inspect_node", json!({})).await)["node"],
+        "worker"
+    );
+    client.close().await;
+    drop(server);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn listings_fit_one_frame_or_are_refused_before_core_records_them() {
+    let (fixture, _directory, server) = hosted(json!({})).await;
+    // A thousand files named mostly with quotes, which JSON escapes, and
+    // escapes again as MCP text. Listed in `fits`, their paths just fit the
+    // limit; three directories deeper, in `long`, they exceed it.
+    let content = fixture.session.content_store().await.unwrap();
+    let store = PackageStore::new(content.clone());
+    let text = content.import_bytes(b"x".to_vec()).await.unwrap();
+    let file = PackageDocument::File {
+        content: text,
+        executable: false,
+    };
+    let file = store.put(&file).await.unwrap();
+    let names = (0..1000).map(|i| (format!("{i:03}{}", "\"".repeat(252)), file));
+    let files = PackageDocument::Collection {
+        entries: names.collect(),
+    };
+    let files = store.put(&files).await.unwrap();
+    let quotes = "\"".repeat(255);
+    let mut long = files;
+    for _ in 0..3 {
+        let entries = BTreeMap::from([(quotes.clone(), long)]);
+        long = store
+            .put(&PackageDocument::Collection { entries })
+            .await
+            .unwrap();
+    }
+    let entries = BTreeMap::from([("fits".into(), files), ("long".into(), long)]);
+    let root = store
+        .put(&PackageDocument::Collection { entries })
+        .await
+        .unwrap();
+    let payload = WorkflowPayload::Workspace(PackageEnvelope::new(root))
+        .encode()
+        .unwrap();
+    fixture
+        .send(payload, store.dependencies(root).await.unwrap())
+        .await;
+    let mut client = Client::new(&server).await;
+    let next = tool_value(&client.call(1, "next_trigger", json!({})).await);
+    let begun = tool_value(
+        &client
+            .call(2, "begin_invocation", json!({"task_id":next["task_id"]}))
+            .await,
+    );
+    let owner = begun["inputs"][0]["handle"].as_str().unwrap();
+    let list =
+        |path: &str| json!({"attempt_id":begun["attempt_id"],"handle":format!("{owner}/{path}")});
+    let fits = tool_value(&client.call(3, "list_package", list("fits")).await);
+    assert_eq!(fits["members"].as_array().unwrap().len(), 1000);
+    let long = format!("long/{quotes}/{quotes}/{quotes}");
+    let refused = client.call(4, "list_package", list(&long)).await;
+    assert_eq!(refused["result"]["isError"], true);
+    let error: Value =
+        serde_json::from_str(refused["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(error["code"], "too_large", "{error}");
+    assert_eq!(
+        tool_value(&client.call(5, "inspect_node", json!({})).await)["node"],
+        "worker"
+    );
+    client.close().await;
     drop(server);
     fixture.stop().await;
 }
