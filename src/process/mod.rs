@@ -5,7 +5,9 @@
 //! supervisor's lifetime pipe. When that pipe closes, even because the owner
 //! died without running destructors, the supervisor stops its whole group.
 //! Before starting a replacement, the next owner calls [`recover_process`],
-//! which verifies what the lease names before signalling it.
+//! which verifies what the lease names before signalling it, or
+//! [`recover_patiently`], which also waits while a previous worker that no
+//! signal may reach is still exiting.
 //!
 //! A directory holds one lease, so it hosts one supervised process at a time.
 //! The piped supervisor here serves command tasks and headless agents.
@@ -16,7 +18,7 @@ mod lease;
 mod piped;
 
 pub(crate) use lease::lease_process;
-pub use lease::recover_process;
+pub use lease::{recover_patiently, recover_process};
 pub use piped::{Stdin, SupervisedProcess, spawn_supervised};
 
 use crate::AppError;

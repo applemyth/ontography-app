@@ -535,13 +535,9 @@ mod tests {
         let original = lease.identity.clone();
         lease.identity = "different process".into();
         write_json(&lease_path(directory.path()), &lease).unwrap();
-        assert!(
-            recover_process(directory.path())
-                .await
-                .unwrap_err()
-                .message
-                .contains("identity changed")
-        );
+        let refused = recover_process(directory.path()).await.unwrap_err();
+        assert_eq!(refused.code, super::super::lease::STILL_EXITING);
+        assert!(refused.message.contains("nothing is signalled"));
         assert!(
             process.child().try_wait().unwrap().is_none(),
             "mismatch must not signal the process"

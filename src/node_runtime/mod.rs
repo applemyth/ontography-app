@@ -14,7 +14,7 @@ use crate::{
     node_hooks::NodeHooks,
     node_mcp::NodeMcp,
     node_tool::{NodeScope, NodeToolContext},
-    process::{Stdin, recover_process},
+    process::{Stdin, recover_patiently, recover_process},
     terminal::{LaunchSpec, Terminal, TerminalStatus},
     workflow::{
         Implementation,
@@ -170,8 +170,23 @@ impl NodeRuntime {
         }
         private_directory(&self.directory)?;
         // Reclaim any previous task/terminal supervisor before lending out this
-        // identity or cleaning its abandoned attempt workspaces.
-        recover_process(&self.directory).await?;
+        // identity or cleaning its abandoned attempt workspaces. One worker
+        // runs per node: while the previous one is still exiting, wait.
+        let reclaimed = recover_patiently(
+            &self.directory,
+            |error| {
+                let mut state = lock(&self.state);
+                state.status.state = "waiting";
+                state.status.error = Some(error.clone());
+            },
+            stop.requested(),
+        )
+        .await?;
+        if !reclaimed {
+            lock(&self.state).status.state = "stopped";
+            return Ok(());
+        }
+        lock(&self.state).status.error = None;
         let cwd = self.directory.join("workspace");
         private_directory(&cwd)?;
         let tools = Arc::new(

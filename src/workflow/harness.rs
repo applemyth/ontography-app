@@ -8,7 +8,7 @@ use super::{
 };
 use crate::environment::Environment;
 use crate::persistence::write_json;
-use crate::process::{Stdin, recover_process, spawn_supervised};
+use crate::process::{Stdin, recover_patiently, spawn_supervised};
 use crate::workspace::{AttemptCheckout, WorkspaceStore};
 use ontography::{
     ContentId, ContextError, ContextPolicy, Emission, ExecutionContext, ExecutionFailure,
@@ -63,7 +63,12 @@ pub async fn run(
     tokio::fs::create_dir_all(directory)
         .await
         .map_err(failure)?;
-    recover_process(directory).await?;
+    // One worker runs per node: while the previous one is still exiting,
+    // wait, unless this one is stopped first.
+    let mut stop = context.stop();
+    if !recover_patiently(directory, |_| {}, stop.requested()).await? {
+        return Ok(());
+    }
     let workspaces = WorkspaceStore::new(
         context.content_store().await.map_err(failure)?,
         directory.join("workspaces"),
