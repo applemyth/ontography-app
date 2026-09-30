@@ -204,11 +204,14 @@ impl Driver {
             }
             self.revive().await;
         }
-        // A faulted run serves nothing until it is reopened.
-        if let Reply::Failed(_, message) = &reply
-            && message.contains("faulted")
-            && self.started
-        {
+        // A faulted run serves nothing until it is reopened. A change that
+        // faulted it, or met it faulted, has an unknown outcome.
+        let faulted = match &reply {
+            Reply::Failed(_, message) => message.contains("faulted"),
+            Reply::Uncertain(message) => message.contains("storage failed while this change"),
+            _ => false,
+        };
+        if faulted && self.started {
             let what = format!("{operation} found the run's core session faulted");
             self.recover(&what, "run.resume").await;
         }
