@@ -93,6 +93,15 @@ impl Host {
         }
     }
 
+    /// The process ID of the supervisor this server started for the session.
+    pub(super) fn supervisor(&self) -> Option<i32> {
+        let pid = match self {
+            Self::Terminal { terminal, .. } => terminal.status().pid,
+            Self::Headless { process, .. } => process.as_ref().and_then(|process| process.pid()),
+        };
+        pid.and_then(|pid| i32::try_from(pid).ok())
+    }
+
     /// The program's exit code once it has ended. A terminal fault is an error.
     pub(super) async fn ended(&mut self) -> Result<Option<u32>> {
         match self {

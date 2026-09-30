@@ -201,8 +201,30 @@ impl Mcp {
     }
 }
 
+/// Whether the OS lists `pid` as dead: a zombie not yet reaped, or gone.
+fn dead(pid: i32) -> bool {
+    let listed = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&listed.stdout);
+    state.trim().is_empty() || state.trim().starts_with('Z')
+}
+
 #[tokio::test]
 async fn a_resume_while_a_killed_programs_work_settles_starts_it_again() {
+    resume_after_a_kill_during_a_checkout(Some(Duration::from_millis(100))).await;
+}
+
+#[tokio::test]
+async fn a_resume_before_the_server_notices_a_death_starts_it_again() {
+    resume_after_a_kill_during_a_checkout(None).await;
+}
+
+/// Kills a node's program while a checkout it began is under way, then
+/// resumes the run `delay` later, or as soon as the supervisor is dead,
+/// before the server has reaped it.
+async fn resume_after_a_kill_during_a_checkout(delay: Option<Duration>) {
     let temporary = tempfile::tempdir().unwrap();
     // A workspace large enough that checking it out takes a while.
     let workspace = temporary.path().join("workspace");
@@ -272,10 +294,16 @@ async fn a_resume_while_a_killed_programs_work_settles_starts_it_again() {
             );
         }
     }
-    mcp.child.kill().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // The checkout still settles, so the node has not yet stopped; the
-    // resume must not pass it over.
+    match delay {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => {
+            while !dead(supervisor) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+    // The checkout still settles, so the node has not yet stopped, and the
+    // server may not even have noticed; the resume must not pass it over.
     call(&service, "flow.resume", json!({"run_id":run})).await;
     let resumed = session(&service, &run, |session| {
         session["state"] == "running"
@@ -284,5 +312,6 @@ async fn a_resume_while_a_killed_programs_work_settles_starts_it_again() {
     })
     .await;
     assert!(resumed["error"].is_null(), "{resumed}");
+    mcp.child.kill().await.unwrap();
     service.shutdown().await.unwrap();
 }

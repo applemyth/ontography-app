@@ -140,6 +140,11 @@ impl SupervisedProcess {
         self.child.as_mut().expect("owned supervisor")
     }
 
+    /// The supervisor's process ID, until it is reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(tokio::process::Child::id)
+    }
+
     /// Lets the supervisor start the program. Permit only once: the supervisor
     /// treats anything more on its lifetime pipe like the pipe closing.
     pub async fn permit(&mut self) -> Result<()> {

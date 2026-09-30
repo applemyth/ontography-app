@@ -61,6 +61,8 @@ struct State {
     started: bool,
     /// The session has ended and only its cleanup remains.
     ending: bool,
+    /// The supervisor of the session's program, once started.
+    supervisor: Option<i32>,
 }
 
 /// Delivers graph work to a started session until the session fails.
@@ -107,6 +109,7 @@ impl NodeRuntime {
                 tools: Weak::new(),
                 started: false,
                 ending: false,
+                supervisor: None,
             }),
             project,
             directory,
@@ -137,15 +140,11 @@ impl NodeRuntime {
 
     /// Whether the session has ended, stopped or failed, and its execution
     /// only cleans up before it ends too: its sockets, attempts, and process
-    /// group, which can take seconds. A terminal whose process has exited
-    /// counts at once, before the session notices.
+    /// group, which can take seconds. A session whose supervisor has exited
+    /// counts at once, before its terminal or the session notices.
     pub fn ending(&self) -> bool {
         let state = lock(&self.state);
-        state.ending
-            || state
-                .terminal
-                .upgrade()
-                .is_some_and(|terminal| !terminal.status().running)
+        state.ending || state.supervisor.is_some_and(crate::process::exited)
     }
 
     pub async fn run(
@@ -466,6 +465,7 @@ impl NodeRuntime {
             state.terminal = Arc::downgrade(terminal);
             state.status.terminal = Some(terminal.status());
         }
+        state.supervisor = host.supervisor();
         resources.host = Some(host);
     }
 

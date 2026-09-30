@@ -23,6 +23,23 @@ pub use piped::{Stdin, SupervisedProcess, spawn_supervised};
 
 use crate::AppError;
 
+/// Whether this server's child `pid` has exited, reaped or not. It waits
+/// without reaping, so the ID stays reserved for whoever reaps it; a child
+/// already reaped is no longer ours to wait for. A stopped child still runs.
+pub(crate) fn exited(pid: i32) -> bool {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let Some(pid) = Pid::from_raw(pid) else {
+        return false;
+    };
+    match waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    ) {
+        Ok(status) => status.is_some(),
+        Err(error) => error == rustix::io::Errno::CHILD,
+    }
+}
+
 /// Supervision failures keep the class command workers have always reported
 /// them under.
 fn failure(error: impl std::fmt::Display) -> AppError {
