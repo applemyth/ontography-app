@@ -502,6 +502,16 @@ impl Service {
         })
     }
 
+    /// Why the run directory `run_id` could not be loaded at startup, while
+    /// no start has created its run since.
+    pub fn recovery_error(&self, run_id: &str) -> Option<AppError> {
+        self.recovery_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(run_id)
+            .cloned()
+    }
+
     /// The environment work no session owns starts with.
     pub fn environment(&self) -> Environment {
         self.unowned

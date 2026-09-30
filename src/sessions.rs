@@ -811,9 +811,9 @@ pub async fn dispatch_scoped(
     if let Some(error) = args
         .get("run_id")
         .and_then(Value::as_str)
-        .and_then(|id| service.recovery_errors.get(id))
+        .and_then(|id| service.recovery_error(id))
     {
-        return Err(error.clone());
+        return Err(error);
     }
     let session_id = record.session_id.clone();
     drop(record);
@@ -903,11 +903,7 @@ fn unavailable_graph(run_id: &str, error: AppError) -> Value {
 }
 
 fn recovery_error(service: &Service, run_id: &str, error: AppError) -> AppError {
-    service
-        .recovery_errors
-        .get(run_id)
-        .cloned()
-        .unwrap_or(error)
+    service.recovery_error(run_id).unwrap_or(error)
 }
 
 /// A session's graph as it stands, or why it cannot run. A failure to start

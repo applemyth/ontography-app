@@ -186,7 +186,7 @@ async fn unavailable_graphs_do_not_hide_pi_or_create_replacement_runs() {
             if binding != "pending" && storage != "absent" {
                 assert_eq!(
                     context["graph"]["error"],
-                    serde_json::to_value(&service.recovery_errors[&run_id]).unwrap()
+                    serde_json::to_value(service.recovery_error(&run_id).unwrap()).unwrap()
                 );
             }
             let resumed = tools::dispatch_scoped(
@@ -639,7 +639,7 @@ async fn graph_operations_report_why_a_graph_is_unavailable() {
     .await;
 
     let service = Service::new(paths.clone()).unwrap();
-    let recovery = service.recovery_errors[&run_id].clone();
+    let recovery = service.recovery_error(&run_id).unwrap();
     for session in [&adopted.session_id, &legacy.session_id] {
         scoped(&service, session, "session.resume", json!({}))
             .await

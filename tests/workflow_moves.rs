@@ -14,11 +14,9 @@ async fn call(service: &Service, operation: &str, args: Value) -> Value {
         .unwrap_or_else(|error| panic!("{operation}: {error}"))
 }
 
-/// No server runs here, so the endpoint directory `Paths::initialize` makes
-/// under /tmp is removed at once instead of outliving the test.
+/// A service that never listens.
 fn service(directory: &tempfile::TempDir) -> Service {
     let paths = Paths::initialize(directory.path().join("data")).unwrap();
-    std::fs::remove_dir(paths.socket.parent().unwrap()).unwrap();
     Service::new(paths).unwrap()
 }
 

@@ -16,11 +16,9 @@ async fn call(service: &Service, operation: &str, args: Value) -> Value {
         .unwrap_or_else(|error| panic!("{operation}: {error}; {:?}", error.details))
 }
 
-/// A service whose files all stay under `project`. It never listens, so the
-/// endpoint directory `Paths` makes in /tmp goes at once.
+/// A service whose files all stay under `project`. It never listens.
 fn service(project: &Path) -> Service {
     let mut paths = Paths::initialize(project.join("data")).unwrap();
-    std::fs::remove_dir(paths.socket.parent().unwrap()).unwrap();
     paths.socket = project.join("server.sock");
     Service::new(paths).unwrap()
 }
