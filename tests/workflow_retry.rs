@@ -211,11 +211,14 @@ async fn failed_attempts_park_a_task_and_retry_grants_a_fresh_set() {
         let run = service.run(&run_id).await.unwrap();
         let run = run.lock().await;
         let snapshot = run.live().unwrap().session.try_snapshot().await.unwrap();
+        // A new run's identities are its names; any other identity is internal.
         runtime::load(&run)
             .unwrap()
             .identities
             .nodes
-            .into_values()
+            .into_iter()
+            .filter(|(name, id)| name != id)
+            .map(|(_, id)| id)
             .chain(snapshot.state().packages().keys().map(ToString::to_string))
             .collect()
     };

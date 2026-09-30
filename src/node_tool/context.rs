@@ -1,7 +1,7 @@
 //! One execution's node tools: what they can see, and the attempts they own.
 
 use crate::workflow::{
-    Binding, BoundNode, DocumentNode, Grant,
+    Binding, BoundNode, Document, DocumentNode, Grant,
     components::definition_digest,
     edit::{self, WorkflowState},
     runtime,
@@ -68,19 +68,44 @@ impl NodeScope {
         }
     }
 
-    /// Workflow names of the core nodes, as `kernel` shows them.
+    /// The workflow this node belongs to.
+    pub(super) fn document(&self) -> &Document {
+        &self.workflow.current
+    }
+
+    /// Workflow names of the core nodes and connections, as `kernel` shows them.
     pub(super) fn names(&self, kernel: &Kernel) -> Names {
-        Names(self.workflow.node_names(kernel))
+        Names {
+            nodes: self.workflow.node_names(kernel),
+            edges: self.workflow.edge_names(),
+        }
     }
 }
 
-/// Workflow names of core nodes, by core identity.
-pub(super) struct Names(BTreeMap<String, String>);
+/// Workflow names of core nodes and connections, by core identity.
+pub(super) struct Names {
+    nodes: BTreeMap<String, String>,
+    edges: BTreeMap<String, String>,
+}
 
 impl Names {
     pub(super) fn label(&self, core_id: &str) -> String {
-        edit::label(&self.0, core_id)
+        edit::label(&self.nodes, core_id)
     }
+
+    pub(super) fn connection(&self, core_id: &str) -> String {
+        edit::edge_label(&self.edges, core_id)
+    }
+}
+
+/// One of this node's outgoing connections in the current graph.
+pub(super) struct Successor {
+    /// The core edge.
+    pub edge: String,
+    /// The connection's workflow name.
+    pub connection: String,
+    /// The name of the node it leads to.
+    pub to: String,
 }
 
 /// Everything one execution's node tools share: its core handles, workflow
@@ -657,14 +682,18 @@ impl NodeToolContext {
         .await;
     }
 
-    /// This node's outgoing edges in the current graph, by target name.
-    pub(super) fn successors(&self, kernel: &Kernel, names: &Names) -> Vec<(String, String)> {
+    /// This node's outgoing connections in the current graph.
+    pub(super) fn successors(&self, kernel: &Kernel, names: &Names) -> Vec<Successor> {
         kernel
             .graph()
             .edges()
             .iter()
             .filter(|edge| edge.source() == self.node_id())
-            .map(|edge| (edge.id().to_owned(), names.label(edge.target())))
+            .map(|edge| Successor {
+                edge: edge.id().to_owned(),
+                connection: names.connection(edge.id()),
+                to: names.label(edge.target()),
+            })
             .collect()
     }
 
@@ -700,19 +729,32 @@ pub(super) fn warn<T>(outcome: &mut Value, result: Result<T>) -> Option<T> {
     }
 }
 
-/// The edge to the successor named `to`.
-pub(super) fn successor_edge<'a>(successors: &'a [(String, String)], to: &str) -> Result<&'a str> {
-    let mut edges = successors.iter().filter(|(_, name)| name == to);
-    match (edges.next(), edges.next()) {
-        (Some((edge, _)), None) => Ok(edge),
-        (None, _) => Err(AppError::invalid(format!(
-            "{to:?} is not a successor of this node; successors: {:?}",
-            successors.iter().map(|(_, name)| name).collect::<Vec<_>>()
+/// The edge that `to` names: a connection of this node by its name, or the
+/// one connection to the successor of that name.
+pub(super) fn successor_edge<'a>(successors: &'a [Successor], to: &str) -> Result<&'a str> {
+    let named: Vec<_> = successors.iter().filter(|s| s.connection == to).collect();
+    let matches = if named.is_empty() {
+        successors.iter().filter(|s| s.to == to).collect()
+    } else {
+        named
+    };
+    let connections = || {
+        successors
+            .iter()
+            .map(|s| format!("{} (to {})", s.connection, s.to))
+            .collect::<Vec<_>>()
+    };
+    match matches.as_slice() {
+        [one] => Ok(&one.edge),
+        [] => Err(AppError::invalid(format!(
+            "{to:?} is neither a successor nor a connection of this node; connections: {:?}",
+            connections()
         ))),
-        (Some(_), Some(_)) => Err(AppError::new(
+        _ => Err(AppError::new(
             "ambiguous_successor",
             format!(
-                "{to:?} names more than one connection during an edit; retry after it completes"
+                "{to:?} names more than one connection; name one of {:?}, or retry after an edit completes",
+                connections()
             ),
         )),
     }

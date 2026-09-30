@@ -237,7 +237,7 @@ impl From<IngressDeclaration> for IngressMode {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeDeclaration {
     pub id: String,
@@ -248,13 +248,29 @@ pub struct NodeDeclaration {
 }
 
 #[derive(
-    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityMatchDeclaration {
     #[default]
     AnyOf,
     AllOf,
+}
+
+impl AuthorityMatchDeclaration {
+    pub(crate) const fn is_any_of(&self) -> bool {
+        matches!(self, Self::AnyOf)
+    }
 }
 
 impl From<AuthorityMatchDeclaration> for AuthorityMatch {
@@ -266,7 +282,7 @@ impl From<AuthorityMatchDeclaration> for AuthorityMatch {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeDeclaration {
     pub id: String,
@@ -283,14 +299,14 @@ pub struct EdgeDeclaration {
     pub authority_match: AuthorityMatchDeclaration,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RootDeclaration {
     pub node_id: String,
     pub ceiling: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityTransitionDeclaration {
     pub node_id: String,

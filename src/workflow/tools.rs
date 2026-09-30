@@ -207,7 +207,7 @@ pub fn prepare_start(
     }
     let catalog = components(service)?;
     let bindings = catalog.bind(&document)?;
-    let identities = IdentityMap::fresh(&document);
+    let identities = IdentityMap::initial(&document);
     let declaration = expand(
         &document,
         &bindings,
@@ -789,9 +789,10 @@ pub async fn status(run: &ManagedRun) -> Result<Value> {
     if let Some(view) = counts {
         let names = state.node_names(view.kernel());
         let name = |id: &str| edit::label(&names, id);
+        let connections = state.edge_names();
         result["revision"] = json!(view.revision().to_string());
         result["graph"] = json!({"nodes":view.kernel().graph().nodes().iter().map(|node|json!({"id":name(node.id())})).collect::<Vec<_>>(),
-            "edges":view.kernel().graph().edges().iter().map(|edge|json!({"id":super::edge_key(&name(edge.source()),&name(edge.target())),"source":name(edge.source()),"target":name(edge.target())})).collect::<Vec<_>>()});
+            "edges":view.kernel().graph().edges().iter().map(|edge|json!({"id":edit::edge_label(&connections,edge.id()),"source":name(edge.source()),"target":name(edge.target())})).collect::<Vec<_>>()});
         result["frontier"] = json!({"counts":view.counts().iter().map(|(id,count)|(name(id),json!({"received":count.received(),"outbound":count.outbound()}))).collect::<serde_json::Map<_,_>>()});
     }
     Ok(result)
@@ -865,9 +866,13 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
     } else {
         vec![]
     };
+    let kernel = session.kernel().await.map_err(AppError::core)?;
     let trigger = match input {
         Some(input) => InvocationTrigger::Root {
-            authority: views::authority(&[super::document::AUTHORITY.into()])?,
+            authority: kernel
+                .root_ceiling(core_node)
+                .cloned()
+                .ok_or_else(|| AppError::new("not_a_root", "This node no longer starts work"))?,
             input,
         },
         None => InvocationTrigger::Packages(task.task.ids()),
@@ -882,7 +887,6 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
         .await
         .map_err(AppError::core)?;
     let payload = result.encode()?;
-    let kernel = session.kernel().await.map_err(AppError::core)?;
     let emissions = kernel
         .graph()
         .edges()

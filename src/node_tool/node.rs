@@ -2,7 +2,7 @@
 //! so they return metadata only, never payload bytes. Each reply carries a
 //! `version`; wait_for_change returns at once when it no longer matches.
 
-use super::context::Names;
+use super::context::{Names, Successor};
 use super::{NodeToolContext, Reply, Tool};
 use crate::workflow::tasks::{self, Held, Standing, Task, TaskKey, work_id};
 use crate::{AppError, Result};
@@ -23,7 +23,7 @@ pub(super) struct InspectNode;
 
 impl Tool for InspectNode {
     const NAME: &'static str = "inspect_node";
-    const DESCRIPTION: &'static str = "Read this node's name, types, component, settings, join, grants, retry policy, neighbors, and open attempts.";
+    const DESCRIPTION: &'static str = "Read this node's name, types, component, settings, join, grants, retry policy, result contract, root and authority transitions, neighbors, outgoing connections with the contract and authority each accepts, and open attempts.";
     const MUTATING: bool = false;
     type Input = Nothing;
 
@@ -32,6 +32,7 @@ impl Tool for InspectNode {
         let (kernel, names) = context.graph().await?;
         let scope = context.scope();
         let node = &scope.node;
+        let successors = context.successors(&kernel, &names);
         Reply::plain(&json!({
             "node": node.id,
             "types": scope.binding.types,
@@ -41,18 +42,40 @@ impl Tool for InspectNode {
             "grants": node.grants,
             "tools": context.catalog().iter().map(|tool| tool.name).collect::<Vec<_>>(),
             "retry": node.retry_policy(),
-            "entry": kernel.root_ceiling(context.node_id()).is_some(),
+            "entry": scope.document().entry == node.id,
+            "result": scope.document().result_contract(node),
+            "root": kernel.root_ceiling(context.node_id()).map(tags),
+            "transitions": node.transitions,
             "incoming": context.predecessors(&kernel, &names),
-            "outgoing": context
-                .successors(&kernel, &names)
-                .into_iter()
-                .map(|(_, name)| name)
-                .collect::<Vec<_>>(),
+            "outgoing": successors.iter().map(|successor| &successor.to).collect::<Vec<_>>(),
+            "connections": successors.iter().map(|successor| connection(&kernel, successor)).collect::<Vec<_>>(),
             "open_attempts": context.open_attempts(),
             "initial_pending": context.initial()?.is_some(),
             "version": version,
         }))
     }
+}
+
+fn tags(authority: &ontography::Authority) -> Vec<&str> {
+    authority.tags().map(ontography::AuthorityTag::id).collect()
+}
+
+/// What an outgoing connection accepts: its contract and object type, and the
+/// authority tags it admits, any or all of them.
+fn connection(kernel: &ontography::Kernel, successor: &Successor) -> Value {
+    let definition = kernel.edge_definition(&successor.edge);
+    let contract = definition.map(|edge| edge.package_contract());
+    json!({
+        "name": successor.connection,
+        "to": successor.to,
+        "contract": contract,
+        "object_type": contract.and_then(|id| kernel.contract(id)).map(|contract| contract.object_type()),
+        "authority": definition.map(|edge| edge.authority_tags().iter().map(ontography::AuthorityTag::id).collect::<Vec<_>>()),
+        "match": definition.map(|edge| match edge.authority_match() {
+            ontography::AuthorityMatch::AnyOf => "any_of",
+            ontography::AuthorityMatch::AllOf => "all_of",
+        }),
+    })
 }
 
 pub(super) struct InspectGraph;
@@ -71,6 +94,7 @@ impl Tool for InspectGraph {
         Reply::plain(&json!({
             "nodes": graph.nodes().iter().map(|node| names.label(node.id())).collect::<Vec<_>>(),
             "edges": graph.edges().iter().map(|edge| json!({
+                "name": names.connection(edge.id()),
                 "from": names.label(edge.source()),
                 "to": names.label(edge.target()),
             })).collect::<Vec<_>>(),

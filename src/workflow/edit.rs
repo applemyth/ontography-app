@@ -6,15 +6,12 @@
 //! again and finds either the whole edit or nothing left to do.
 
 use super::components::{Binding, Bindings, BoundNode, Catalog};
-use super::document::{
-    AUTHORITY, CONTRACT, Document, EDGE_TYPE, IdentityMap, Typing, edge_key, root,
-};
-use crate::declarations::GraphFragmentDeclaration;
+use super::document::{CoreNode, Document, IdentityMap};
+use crate::declarations::{EdgeDeclaration, GraphFragmentDeclaration};
 use crate::{AppError, Result, persistence};
 use ontography::{
-    AuthorityMatch, AuthorityTag, EdgeDefinition, EditContext, EditPolicy, GraphEdit, IngressMode,
-    Kernel, PolicyDenial, Principal, RetirementReason, RewriteError, RewriteRequest, RootRule,
-    SessionHandle,
+    EditContext, EditPolicy, GraphEdit, Kernel, PolicyDenial, Principal, RetirementReason,
+    RewriteError, RewriteRequest, SessionHandle,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,49 +25,18 @@ const MAX_STALE_RETRIES: usize = 8;
 /// The principal the workflow editor edits a run's graph as.
 const EDITOR: &str = "workflow";
 
-/// Which edits a workflow run accepts: only its editor's, and only ones that
-/// keep it a workflow, with workflow nodes and connections, one entry, and no
-/// authority changes.
+/// Which edits a run accepts: only its editor's. The editor changes the
+/// graph only to match the run's document, which the document compiler checks.
 pub fn policy() -> Arc<dyn EditPolicy> {
-    Arc::new(workflow_edit)
-}
-
-fn workflow_edit(context: &EditContext<'_>) -> std::result::Result<(), PolicyDenial> {
-    let deny = |reason: &str| Err(PolicyDenial::new(reason));
-    if context.principal.name() != EDITOR {
-        return deny("change this run through its workflow document");
-    }
-    let add = context.edit.add();
-    if !add.authority_transitions().is_empty() {
-        return deny("workflow edits cannot change authority");
-    }
-    if add
-        .node_definitions()
-        .iter()
-        .any(|node| node.result_contract() != CONTRACT)
-    {
-        return deny("workflow nodes produce workflow payloads");
-    }
-    if !add.edge_definitions().iter().all(is_connection) {
-        return deny("workflow connections carry workflow payloads under workflow authority");
-    }
-    let workflow_authority =
-        |root: &RootRule| root.ceiling().tags().map(AuthorityTag::id).eq([AUTHORITY]);
-    if !add.roots().iter().all(workflow_authority) || context.after.roots().len() != 1 {
-        return deny("a workflow has exactly one entry, with workflow authority");
-    }
-    Ok(())
-}
-
-fn is_connection(edge: &EdgeDefinition) -> bool {
-    edge.types().iter().map(AsRef::as_ref).eq([EDGE_TYPE])
-        && edge.package_contract() == CONTRACT
-        && edge
-            .authority_tags()
-            .iter()
-            .map(AuthorityTag::id)
-            .eq([AUTHORITY])
-        && edge.authority_match() == AuthorityMatch::AnyOf
+    Arc::new(|context: &EditContext<'_>| {
+        if context.principal.name() == EDITOR {
+            Ok(())
+        } else {
+            Err(PolicyDenial::new(
+                "change this run through its workflow document",
+            ))
+        }
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,6 +126,25 @@ impl WorkflowState {
         }
         names
     }
+
+    /// Workflow names of core connections, by core identity, including those
+    /// a pending edit has already added.
+    pub fn edge_names(&self) -> BTreeMap<String, String> {
+        self.pending
+            .iter()
+            .flat_map(|plan| &plan.identities.edges)
+            .chain(&self.identities.edges)
+            .map(|(name, id)| (id.clone(), name.clone()))
+            .collect()
+    }
+}
+
+/// A core connection's workflow name from `WorkflowState::edge_names`.
+pub fn edge_label(names: &BTreeMap<String, String>, core_id: &str) -> String {
+    names
+        .get(core_id)
+        .cloned()
+        .unwrap_or_else(|| "unknown connection".into())
 }
 
 /// A core node's workflow name from `WorkflowState::node_names`.
@@ -225,6 +210,12 @@ pub async fn preview(
     bindings: Bindings,
 ) -> Result<Plan> {
     let document = next.canonicalized()?;
+    if document.contracts != state.current.contracts {
+        return Err(AppError::new(
+            "contracts_fixed",
+            "A run keeps the contracts it started with; start a new run to change them",
+        ));
+    }
     let kernel = session.kernel().await.map_err(AppError::core)?;
     let (bindings, identities) = if let Some(pending) = &state.pending {
         if pending.document != document {
@@ -238,7 +229,7 @@ pub async fn preview(
                 "Core's graph differs from the saved workflow",
             ));
         }
-        let identities = target_identities(state, &document, &bindings, Typing::of(&kernel));
+        let identities = target_identities(state, &document, &bindings);
         (bindings, identities)
     };
     let (base_core_revision, retirements, changes) =
@@ -444,35 +435,35 @@ fn retirement_report(
         .collect()
 }
 
-/// Keep a node's core identity unless core must replace it: its join, entry
-/// status, or core node types changed. A connection keeps its identity while
-/// both of its nodes keep theirs.
+/// Keep a node's core identity while core declares it the same: its types,
+/// join, result contract, root, and transitions. A connection keeps its
+/// identity while both of its nodes keep theirs and core declares it the same.
 fn target_identities(
     state: &WorkflowState,
     document: &Document,
     bindings: &Bindings,
-    typing: Typing,
 ) -> IdentityMap {
-    let node_types = |bindings: &Bindings, name: &str| {
-        bindings.get(name).map(|binding| typing.node_types(binding))
-    };
+    let old = &state.current;
     let mut identities = IdentityMap::fresh(document);
     for node in &document.nodes {
-        if state.current.nodes.iter().any(|old| {
-            old.id == node.id
-                && old.join == node.join
-                && (old.id == state.current.entry) == (node.id == document.entry)
-                && node_types(&state.bindings, &old.id) == node_types(bindings, &node.id)
-        }) && let Some(id) = state.identities.nodes.get(&node.id)
+        if let Some(previous) = old.nodes.iter().find(|previous| previous.id == node.id)
+            && let Some(id) = state.identities.nodes.get(&node.id)
+            && let (Some(was), Some(binding)) =
+                (state.bindings.get(&node.id), bindings.get(&node.id))
+            && old.core_node(previous, was, id) == document.core_node(node, binding, id)
         {
             identities.nodes.insert(node.id.clone(), id.clone());
         }
     }
     for edge in &document.edges {
-        let key = edge_key(&edge.from, &edge.to);
-        if identities.nodes.get(&edge.from) == state.identities.nodes.get(&edge.from)
-            && identities.nodes.get(&edge.to) == state.identities.nodes.get(&edge.to)
+        let key = edge.key();
+        let (source, target) = (&identities.nodes[&edge.from], &identities.nodes[&edge.to]);
+        if let Some(previous) = old.edges.iter().find(|previous| previous.key() == key)
             && let Some(id) = state.identities.edges.get(&key)
+            && state.identities.nodes.get(&previous.from) == Some(source)
+            && state.identities.nodes.get(&previous.to) == Some(target)
+            && old.core_edge(previous, id, source, target)
+                == document.core_edge(edge, id, source, target)
         {
             identities.edges.insert(key, id.clone());
         }
@@ -490,7 +481,6 @@ fn graph_edit(
     ids: &IdentityMap,
 ) -> Result<Option<GraphEdit>> {
     let drift = |message: &str| AppError::new("workflow_drift", message);
-    let typing = Typing::of(kernel);
     let mut add = GraphFragmentDeclaration::default();
     for node in &document.nodes {
         let id = ids
@@ -500,50 +490,33 @@ fn graph_edit(
         let binding = bindings
             .get(&node.id)
             .ok_or_else(|| AppError::invalid("Incomplete workflow node bindings"))?;
-        let wanted = typing.node(id, binding, node.join);
-        let entry = node.id == document.entry;
-        let Some(actual) = kernel.node_definition(id) else {
-            if let Some(unknown) = wanted
-                .types
-                .iter()
-                .find(|name| !kernel.schema().node_types().any(|known| known == *name))
-            {
-                return Err(AppError::new(
-                    "unknown_node_type",
-                    format!(
-                        "Node {:?} has type {unknown:?}, which this run does not declare; start a new run to use it",
-                        node.id
-                    ),
-                ));
-            }
-            add.nodes.push(wanted);
-            if entry {
-                add.roots.push(root(id));
-            }
-            continue;
-        };
-        if !actual
-            .types()
-            .iter()
-            .map(AsRef::as_ref)
-            .eq(wanted.types.iter().map(String::as_str))
-            || actual.ingress_mode() != IngressMode::from(wanted.ingress_mode)
-            || kernel.root_ceiling(id).is_some() != entry
-        {
+        let wanted = document.core_node(node, binding, id);
+        if kernel.node_definition(id).is_none() {
+            check_vocabulary(kernel, &node.id, &wanted)?;
+            add.nodes.push(wanted.node);
+            add.roots.extend(wanted.root);
+            add.authority_transitions.extend(wanted.transitions);
+        } else if !declares_node(kernel, &wanted)? {
             return Err(drift("A retained node has different core properties"));
         }
     }
     for edge in &document.edges {
         let id = ids
             .edges
-            .get(&edge_key(&edge.from, &edge.to))
+            .get(&edge.key())
             .ok_or_else(|| AppError::invalid("Incomplete workflow edge identities"))?;
-        let source = &ids.nodes[&edge.from];
-        let target = &ids.nodes[&edge.to];
+        let wanted = document.core_edge(edge, id, &ids.nodes[&edge.from], &ids.nodes[&edge.to]);
         match kernel.graph().edge(id) {
-            None => add.edges.push(typing.edge(id, source, target)),
-            Some(actual) if actual.source() != source || actual.target() != target => {
-                return Err(drift("A retained connection has different endpoints"));
+            None => {
+                check_tags(kernel, &edge.key(), &wanted.authority_tags)?;
+                add.edges.push(wanted);
+            }
+            Some(actual)
+                if actual.source() != wanted.source
+                    || actual.target() != wanted.target
+                    || !declares_edge(kernel, &wanted)? =>
+            {
+                return Err(drift("A retained connection has different core properties"));
             }
             Some(_) => {}
         }
@@ -579,6 +552,92 @@ fn graph_edit(
     )))
 }
 
+/// Whether `kernel` declares the node exactly as `wanted` does.
+fn declares_node(kernel: &Kernel, wanted: &CoreNode) -> Result<bool> {
+    let id = wanted.node.id.as_str();
+    let fragment = GraphFragmentDeclaration {
+        nodes: vec![wanted.node.clone()],
+        roots: wanted.root.iter().cloned().collect(),
+        authority_transitions: wanted.transitions.clone(),
+        ..Default::default()
+    }
+    .compile()
+    .map_err(AppError::core)?;
+    let roots: BTreeSet<_> = kernel
+        .roots()
+        .iter()
+        .filter(|root| root.node_id() == id)
+        .collect();
+    let transitions: BTreeSet<_> = kernel
+        .authority_transitions()
+        .iter()
+        .filter(|rule| rule.node_id() == id)
+        .collect();
+    Ok(
+        kernel.node_definition(id) == fragment.node_definitions().first()
+            && roots == fragment.roots().iter().collect()
+            && transitions == fragment.authority_transitions().iter().collect(),
+    )
+}
+
+/// Whether `kernel` declares the connection exactly as `wanted` does.
+fn declares_edge(kernel: &Kernel, wanted: &EdgeDeclaration) -> Result<bool> {
+    let fragment = GraphFragmentDeclaration {
+        edges: vec![wanted.clone()],
+        ..Default::default()
+    }
+    .compile()
+    .map_err(AppError::core)?;
+    Ok(kernel.edge_definition(&wanted.id) == fragment.edge_definitions().first())
+}
+
+/// A run's vocabulary is fixed when it starts: an added node may use only the
+/// node types, contracts, and authority tags the run declares.
+fn check_vocabulary(kernel: &Kernel, name: &str, wanted: &CoreNode) -> Result<()> {
+    if let Some(unknown) = wanted
+        .node
+        .types
+        .iter()
+        .find(|name| !kernel.schema().node_types().any(|known| known == *name))
+    {
+        return Err(AppError::new(
+            "unknown_node_type",
+            format!(
+                "Node {name:?} has type {unknown:?}, which this run does not declare; start a new run to use it"
+            ),
+        ));
+    }
+    let tags = wanted.root.iter().flat_map(|root| &root.ceiling).chain(
+        wanted
+            .transitions
+            .iter()
+            .flat_map(|rule| rule.from.iter().chain(&rule.to)),
+    );
+    check_tags(kernel, name, tags)
+}
+
+fn check_tags<'a>(
+    kernel: &Kernel,
+    name: &str,
+    tags: impl IntoIterator<Item = &'a String>,
+) -> Result<()> {
+    for tag in tags {
+        if !kernel
+            .schema()
+            .authority_tags()
+            .any(|known| known.id() == tag)
+        {
+            return Err(AppError::new(
+                "unknown_authority_tag",
+                format!(
+                    "{name:?} uses authority tag {tag:?}, which this run does not declare; start a new run to use it"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn request(edit: GraphEdit) -> RewriteRequest {
     RewriteRequest::new(Principal::new(EDITOR), edit)
 }
@@ -587,7 +646,7 @@ fn request(edit: GraphEdit) -> RewriteRequest {
 mod tests {
     use super::*;
     use crate::declarations::{GraphEditDeclaration, IngressDeclaration};
-    use crate::workflow::document::{SHARED_NODE_TYPE, expand_builtin as expand};
+    use crate::workflow::{document::expand_builtin as expand, edge_key};
     use ontography::{
         ActivationProposal, Emission, OutputAuthority, ProposalDecision, ProposalRuntime,
     };
@@ -639,26 +698,15 @@ mod tests {
     );
 
     fn fixture() -> Fixture {
-        fixture_with(document(), Typing::Component)
+        fixture_with(document())
     }
 
-    /// A run of `doc` created with `typing`. Runs created before node types
-    /// have one shared type.
-    fn fixture_with(doc: Document, typing: Typing) -> Fixture {
+    /// A new run of `doc`.
+    fn fixture_with(doc: Document) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let doc = doc.canonicalized().unwrap();
-        let ids = IdentityMap::fresh(&doc);
-        let mut declaration = expand(&doc, "edit-test", &ids).unwrap();
-        if typing == Typing::Shared {
-            declaration.schema.node_types = vec![SHARED_NODE_TYPE.into()];
-            for node in &mut declaration.nodes {
-                node.types = vec![SHARED_NODE_TYPE.into()];
-            }
-            for edge in &mut declaration.edges {
-                edge.source_requirements = vec![SHARED_NODE_TYPE.into()];
-                edge.target_requirements = vec![SHARED_NODE_TYPE.into()];
-            }
-        }
+        let ids = IdentityMap::initial(&doc);
+        let declaration = expand(&doc, "edit-test", &ids).unwrap();
         let compiled = declaration.compile().unwrap();
         let runtime = ProposalRuntime::with_policy(compiled.kernel, policy());
         let session = runtime
@@ -733,40 +781,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_created_before_node_types_keep_one_shared_type() {
-        let (directory, _runtime, session, mut state) = fixture_with(document(), Typing::Shared);
-        let path = directory.path().join("workflow.json");
-        let original = state.identities.clone();
-        let mut next = state.current.clone();
-        // Core never recorded roles here, so a new role replaces nothing.
-        next.nodes
-            .iter_mut()
-            .find(|node| node.id == "review")
-            .unwrap()
-            .component = "human".into();
-        next.nodes
-            .push(serde_json::from_value(json!({"id":"archive","component":"inbox"})).unwrap());
-        next.edges
-            .push(serde_json::from_value(json!({"from":"review","to":"archive"})).unwrap());
-        let plan = preview(&session, &state, next).await.unwrap();
-        assert_eq!(plan.identities.nodes["review"], original.nodes["review"]);
-        assert_eq!(plan.changes, 2);
-        commit(&session, &mut state, &path, plan).await.unwrap();
-        let kernel = session.kernel().await.unwrap();
-        let archive = kernel
-            .node_definition(&state.identities.nodes["archive"])
-            .unwrap();
-        assert_eq!(
-            archive
-                .types()
-                .iter()
-                .map(AsRef::as_ref)
-                .collect::<Vec<&str>>(),
-            [SHARED_NODE_TYPE]
-        );
-    }
-
-    #[tokio::test]
     async fn edits_place_nodes_of_any_type_the_run_declares() {
         let node_types = |kernel: &Kernel, id: &str| -> Vec<String> {
             let node = kernel.node_definition(id).unwrap();
@@ -779,7 +793,7 @@ mod tests {
             "archive".into(),
             json!({"extends":"inbox","types":["Archive"]}),
         );
-        let (directory, _runtime, session, mut state) = fixture_with(doc, Typing::Component);
+        let (directory, _runtime, session, mut state) = fixture_with(doc);
         let path = directory.path().join("workflow.json");
         let mut next = state.current.clone();
         next.nodes
@@ -814,43 +828,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_editor_may_edit_and_only_into_a_workflow() {
+    async fn only_the_editor_may_edit() {
         let (_directory, _runtime, session, state) = fixture();
-        let writer = &state.identities.nodes["writer"];
         let review = &state.identities.nodes["review"];
         let connection = &state.identities.edges[&edge_key("writer", "review")];
-        let denied = |principal: &str, edit: serde_json::Value| {
-            let edit = serde_json::from_value::<GraphEditDeclaration>(edit)
-                .unwrap()
-                .compile()
-                .unwrap();
+        let edit = |principal: &str| {
+            let edit = serde_json::from_value::<GraphEditDeclaration>(
+                json!({"remove_nodes":[review],"remove_edges":[connection]}),
+            )
+            .unwrap()
+            .compile()
+            .unwrap();
             RewriteRequest::new(Principal::new(principal), edit)
         };
-        let remove_review = json!({"remove_nodes":[review],"remove_edges":[connection]});
-        let foreign_connection = json!({"add":{"edges":[{
-            "id":"other","source":writer,"target":review,"types":["Other"],
-            "package_contract":CONTRACT,"authority_tags":[AUTHORITY]}]}});
-        let no_entry = json!({"remove_nodes":[writer],"remove_edges":[connection]});
-        for (principal, edit, reason) in [
-            ("operator", remove_review.clone(), "workflow document"),
-            (EDITOR, foreign_connection, "connections"),
-            (EDITOR, no_entry, "one entry"),
-        ] {
-            let error = session
-                .prepare_rewrite(&denied(principal, edit))
-                .await
-                .unwrap()
-                .unwrap_err();
-            let RewriteError::Denied(message) = error else {
-                panic!("{error}");
-            };
-            assert!(message.contains(reason), "{message}");
-        }
+        let error = session
+            .prepare_rewrite(&edit("operator"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        let RewriteError::Denied(message) = error else {
+            panic!("{error}");
+        };
+        assert!(message.contains("workflow document"), "{message}");
         session
-            .prepare_rewrite(&denied(EDITOR, remove_review))
+            .prepare_rewrite(&edit(EDITOR))
             .await
             .unwrap()
             .unwrap();
+    }
+
+    fn typed() -> Document {
+        serde_json::from_value(json!({
+            "name":"typed", "entry":"writer",
+            "contracts":{"draft":{"object_type":"Draft","validator":"text"}},
+            "nodes":[
+                {"id":"writer","component":"agent","config":{"prompt":"write"},"result":"draft",
+                 "root":["red","blue"],"transitions":[{"from":["red"],"to":["blue"]}]},
+                {"id":"review","component":"inbox"}
+            ],
+            "edges":[
+                {"from":"writer","to":"review","authority":["red"]},
+                {"from":"writer","to":"review","name":"urgent","authority":["red","blue"],"match":"all_of"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn typed_parts_keep_their_identity_until_core_declares_them_differently() {
+        let (directory, _runtime, session, mut state) = fixture_with(typed());
+        let path = directory.path().join("workflow.json");
+        let kernel = session.kernel().await.unwrap();
+        // Names are a new run's identities; the unnamed connection infers the
+        // writer's result contract.
+        assert_eq!(state.identities.nodes["writer"], "writer");
+        assert_eq!(
+            kernel
+                .edge_definition("writer:review")
+                .unwrap()
+                .package_contract(),
+            "draft"
+        );
+        assert!(kernel.edge_definition("urgent").is_some());
+        // A connection's authority is part of its core definition.
+        let original = state.identities.clone();
+        let mut next = state.current.clone();
+        next.edges
+            .iter_mut()
+            .find(|edge| edge.name.as_deref() == Some("urgent"))
+            .unwrap()
+            .matching = crate::declarations::AuthorityMatchDeclaration::AnyOf;
+        let plan = preview(&session, &state, next).await.unwrap();
+        assert_eq!(plan.identities.nodes, original.nodes);
+        assert_eq!(
+            plan.identities.edges["writer:review"],
+            original.edges["writer:review"]
+        );
+        assert_ne!(plan.identities.edges["urgent"], original.edges["urgent"]);
+        assert_eq!(plan.changes, 2);
+        commit(&session, &mut state, &path, plan).await.unwrap();
+        // So are a node's transitions; replacing it replaces its connections.
+        let mut next = state.current.clone();
+        next.nodes
+            .iter_mut()
+            .find(|node| node.id == "review")
+            .unwrap()
+            .transitions
+            .push(serde_json::from_value(json!({"from":["blue"],"to":["red"]})).unwrap());
+        let plan = preview(&session, &state, next).await.unwrap();
+        assert_eq!(plan.identities.nodes["writer"], original.nodes["writer"]);
+        assert_ne!(plan.identities.nodes["review"], original.nodes["review"]);
+        assert_eq!(plan.changes, 6);
+        commit(&session, &mut state, &path, plan).await.unwrap();
+        let kernel = session.kernel().await.unwrap();
+        let review = &state.identities.nodes["review"];
+        assert_eq!(
+            kernel
+                .authority_transitions()
+                .iter()
+                .filter(|rule| rule.node_id() == review)
+                .count(),
+            1
+        );
+        // Contracts and authority tags are the run's vocabulary.
+        let mut changed = state.current.clone();
+        changed.contracts.get_mut("draft").unwrap().validator =
+            crate::declarations::ValidatorKind::Bytes;
+        let error = preview(&session, &state, changed).await.unwrap_err();
+        assert_eq!(error.code, "contracts_fixed");
+        let mut tagged = state.current.clone();
+        tagged.edges[0].authority = Some(BTreeSet::from(["gold".to_owned()]));
+        let error = preview(&session, &state, tagged).await.unwrap_err();
+        assert_eq!(error.code, "unknown_authority_tag");
     }
 
     #[test]
@@ -1026,8 +1115,7 @@ mod tests {
                 serde_json::from_value(json!({"id":"unexpected","component":"inbox"})).unwrap(),
             );
             let bindings = Catalog::builtin().bind(&changed).unwrap();
-            let kernel = session.kernel().await.unwrap();
-            let ids = target_identities(&state, &changed, &bindings, Typing::of(&kernel));
+            let ids = target_identities(&state, &changed, &bindings);
             apply(&session, &changed, &ids).await;
             let revision = session.frontier().revision();
             let error = commit(&session, &mut state, &path, plan).await.unwrap_err();

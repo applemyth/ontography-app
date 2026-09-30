@@ -254,3 +254,69 @@ async fn promoted_documents_start_again_and_resume_does_not_repeat_initial_work(
     assert_eq!(restarted["document"], original["document"]);
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn typed_documents_run_programs_under_their_contracts_and_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
+    // The gate starts red-and-blue work; the counter's result reaches the
+    // archive under all of red, and the raw inbox as bytes under blue.
+    let document = json!({
+        "name":"typed-flow", "entry":"gate",
+        "contracts":{"report":{"object_type":"Report","validator":"text"},
+            "blob":{"object_type":"Blob","validator":"bytes"}},
+        "nodes":[
+            {"id":"gate","component":"human","root":["red","blue"],"result":"report"},
+            {"id":"count","component":"command","config":{"argv":["/bin/sh","-c","wc -c | tr -d ' '"]},"result":"report"},
+            {"id":"archive","component":"inbox"},
+            {"id":"raw","component":"inbox"}
+        ],
+        "edges":[
+            {"from":"gate","to":"count","authority":["red"]},
+            {"from":"count","to":"archive","authority":["red"],"match":"all_of"},
+            {"from":"count","to":"raw","name":"bytes","contract":"blob","authority":["blue"]}
+        ]
+    });
+    let started = call(
+        &service,
+        "flow.start",
+        json!({"document":document,"project":directory.path(),"message":"approve?"}),
+    )
+    .await;
+    let run_id = started["run_id"].as_str().unwrap();
+    let edges = started["graph"]["edges"].as_array().unwrap();
+    assert!(edges.contains(&json!({"id":"bytes","source":"count","target":"raw"})));
+    assert!(edges.contains(&json!({"id":"count:archive","source":"count","target":"archive"})));
+    let gate = task_for(&started, "gate").unwrap().clone();
+    call(
+        &service,
+        "flow.decide",
+        json!({"run_id":run_id,"node":"gate","task_id":gate["task_id"],"message":"approved"}),
+    )
+    .await;
+    let status = wait_status(&service, run_id, |status| {
+        ["archive", "raw"]
+            .iter()
+            .all(|node| task_for(status, node).is_some())
+    })
+    .await;
+    assert_eq!(
+        task_for(&status, "raw").unwrap()["input"],
+        json!({"message":"8\n"})
+    );
+    // Work carries the entry's whole ceiling, as core recorded it.
+    let run = service.run(run_id).await.unwrap();
+    let session = run.lock().await.live().unwrap().session.clone();
+    let pending = session.pending_at("raw").await.unwrap();
+    let (_, record) = &pending.packages()[0];
+    assert_eq!(record.object_type(), "Blob");
+    assert_eq!(
+        record
+            .authority()
+            .tags()
+            .map(|tag| tag.id())
+            .collect::<Vec<_>>(),
+        ["blue", "red"]
+    );
+    service.shutdown().await.unwrap();
+}

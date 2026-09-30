@@ -275,12 +275,14 @@ async fn manager_status_output_and_preview_use_document_names_and_opaque_work_ha
         let state = runtime::load(&run).unwrap();
         let session = &run.live().unwrap().session;
         let snapshot = session.try_snapshot().await.unwrap();
+        // A new run's identities are its names; any other identity is internal.
         let mut ids: Vec<String> = state
             .identities
             .nodes
-            .values()
-            .chain(state.identities.edges.values())
-            .cloned()
+            .iter()
+            .chain(&state.identities.edges)
+            .filter(|(name, id)| name != id)
+            .map(|(_, id)| id.clone())
             .collect();
         ids.extend(snapshot.state().packages().keys().map(ToString::to_string));
         ids.extend(

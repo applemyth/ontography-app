@@ -483,7 +483,7 @@ async fn nothing_outside_an_attempt_reveals_a_payload() {
         graph["edges"]
             .as_array()
             .unwrap()
-            .contains(&json!({"from":"worker","to":"sink"}))
+            .contains(&json!({"name":"worker:sink","from":"worker","to":"sink"}))
     );
     let inputs = fixture.ok("list_inputs", json!({})).await;
     assert_eq!(inputs["inputs"][0]["from"], "source");
@@ -898,6 +898,107 @@ async fn a_discarded_initial_input_is_not_offered_and_gates_originating_until_do
         .ok("begin_invocation", json!({"originate": "side work"}))
         .await;
     assert!(originated["task_id"].is_null());
+    fixture.stop().await;
+}
+
+/// `worker` starts red work and may turn it blue. It connects to `sink` twice,
+/// once under a workspace contract, and to `vault` under blue authority.
+fn typed_document() -> Document {
+    serde_json::from_value(json!({
+        "name": "typed", "entry": "worker",
+        "contracts": {"ore": {"object_type": "Ore", "validator": "text"},
+            "crate": {"object_type": "Crate", "validator": "workspace"}},
+        "nodes": [
+            {"id": "worker", "component": "agent", "config": {"prompt": "Start"},
+                "grants": ["originate", "send_later"], "result": "ore", "root": ["red"],
+                "transitions": [{"from": ["red"], "to": ["blue"]}]},
+            {"id": "sink", "component": "inbox"},
+            {"id": "vault", "component": "inbox"}],
+        "edges": [
+            {"from": "worker", "to": "sink", "authority": ["red"]},
+            {"from": "worker", "to": "sink", "name": "sealed", "contract": "crate", "authority": ["red"]},
+            {"from": "worker", "to": "vault", "authority": ["blue"]}],
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn programs_publish_into_typed_connections_by_name_and_transition() {
+    let fixture = Fixture::new(typed_document(), "worker", None).await;
+    let node = fixture.ok("inspect_node", json!({})).await;
+    assert_eq!(node["result"], "ore");
+    assert_eq!(node["root"], json!(["red"]));
+    let sealed = node["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|connection| connection["name"] == "sealed")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        sealed,
+        json!({"name": "sealed", "to": "sink", "contract": "crate", "object_type": "Crate",
+            "authority": ["red"], "match": "any_of"})
+    );
+    let submit = |attempt: &Value, outputs: Value| json!({"attempt_id": attempt["attempt_id"], "result": {"message": "done"}, "outputs": outputs});
+    let first = fixture
+        .ok("begin_invocation", json!({"originate": "go"}))
+        .await;
+    // Two connections lead to sink; a node name no longer picks one.
+    let ambiguous = fixture
+        .error(
+            "submit_invocation",
+            submit(&first, json!([{"message": "a", "to": "sink"}])),
+        )
+        .await;
+    assert_eq!(ambiguous.code, "ambiguous_successor");
+    let accepted = fixture
+        .ok(
+            "submit_invocation",
+            submit(
+                &first,
+                json!([{"message": "a", "to": "worker:sink"},
+                    {"message": "b", "to": "vault", "authority": ["blue"]},
+                    {"message": "c", "outbound": true}]),
+            ),
+        )
+        .await;
+    assert_eq!(accepted["status"], "accepted");
+    assert_eq!(fixture.pending("sink").await, ["a"]);
+    assert_eq!(fixture.pending("vault").await, ["b"]);
+    let vault = fixture
+        .session
+        .pending_at(fixture.identities.nodes["vault"].as_str())
+        .await
+        .unwrap();
+    let (_, record) = &vault.packages()[0];
+    assert_eq!(
+        record
+            .authority()
+            .tags()
+            .map(|tag| tag.id())
+            .collect::<Vec<_>>(),
+        ["blue"]
+    );
+    let outbound = fixture
+        .session
+        .outbound_page(Some(&fixture.identities.nodes["worker"]), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(outbound.packages()[0].1.object_type(), "Ore");
+    // Core checks each connection's contract and authority.
+    for outputs in [
+        json!([{"message": "x", "to": "sealed"}]),
+        json!([{"message": "y", "to": "vault"}]),
+    ] {
+        let attempt = fixture
+            .ok("begin_invocation", json!({"originate": "again"}))
+            .await;
+        let outcome = fixture
+            .ok("submit_invocation", submit(&attempt, outputs.clone()))
+            .await;
+        assert_eq!(outcome["status"], "rejected", "{outputs}");
+    }
     fixture.stop().await;
 }
 

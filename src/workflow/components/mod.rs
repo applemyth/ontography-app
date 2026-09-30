@@ -22,7 +22,7 @@ pub use config::{
 };
 pub use library::{LIBRARY_FILE, Library, PROVIDER};
 
-use super::{Document, DocumentNode, document::SHARED_NODE_TYPE};
+use super::{Document, DocumentNode, document::is_name};
 use crate::{AppError, Result};
 use ontography::{
     IngressMode,
@@ -169,15 +169,11 @@ fn component_types(name: &str, description: &ComponentDescription) -> Result<BTr
 }
 
 /// A node type's name must suit core's schema and other programs' labels.
-/// The one type of runs created before node types is reserved.
 fn check_type(name: &str) -> std::result::Result<(), String> {
     if !is_name(name) {
         return Err(format!(
             "node type {name:?} must use letters, digits, '-' or '_'"
         ));
-    }
-    if name == SHARED_NODE_TYPE {
-        return Err(format!("node type {name:?} is reserved"));
     }
     Ok(())
 }
@@ -188,7 +184,7 @@ fn placement(document: &Document, node: &DocumentNode, ingress: IngressMode) -> 
     let mut inputs = BTreeMap::<String, Vec<String>>::new();
     let mut outputs = BTreeMap::<String, Vec<String>>::new();
     for edge in &document.edges {
-        let key = super::edge_key(&edge.from, &edge.to);
+        let key = edge.key();
         if edge.to == node.id {
             inputs
                 .entry(edge.from.clone())
@@ -228,6 +224,7 @@ impl BoundNode {
             name: "test".into(),
             entry: node.id.clone(),
             components: BTreeMap::new(),
+            contracts: BTreeMap::new(),
             nodes: vec![node.clone()],
             edges: vec![],
         };
@@ -248,13 +245,6 @@ pub fn definition_digest(node: &DocumentNode, binding: &Binding) -> String {
 }
 
 /// Names shared with other programs' configuration keys.
-fn is_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,10 +456,6 @@ mod tests {
             (
                 json!({"components":{"a":{"extends":"agent","types":["Code Reviewer"]}}}),
                 "letters",
-            ),
-            (
-                json!({"components":{"a":{"extends":"agent","types":["WorkflowNode"]}}}),
-                "reserved",
             ),
         ] {
             let library: Library = serde_json::from_value(value.clone()).unwrap();

@@ -2,11 +2,12 @@
 //! at work the node originates; it ends when core decides its submission, or
 //! when it fails.
 
-use super::context::{Attempt, AttemptState, Names, context_error, successor_edge, warn};
+use super::context::{
+    Attempt, AttemptState, Names, Successor, context_error, successor_edge, warn,
+};
 use super::node::seconds_until;
 use super::outputs::{Source, resolve};
 use super::{NodeToolContext, Reply, Tool};
-use crate::workflow::document::OBJECT_TYPE;
 use crate::workflow::tasks::{Standing, Task, TaskKey};
 use crate::workflow::{BoundNode, Grant, WorkflowPayload};
 use crate::{AppError, Result, persistence, views};
@@ -217,13 +218,22 @@ pub(super) struct Output {
     message: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
-    /// Deliver to this successor. Omitted, the output goes to every successor.
+    /// Deliver along this connection, named by the connection or by the one
+    /// successor it leads to. Omitted, the output goes to every successor.
     #[serde(default)]
     to: Option<String>,
     /// Keep the package here to send later with transfer_package. Needs the
     /// send_later grant.
     #[serde(default)]
     outbound: bool,
+    /// Send it carrying exactly these authority tags instead of the task's;
+    /// one of the node's transitions must allow the change.
+    #[serde(default)]
+    authority: Option<Vec<String>>,
+    /// The object type of a package kept to send later; the node's result
+    /// object type when omitted.
+    #[serde(default)]
+    object_type: Option<String>,
 }
 
 pub(super) struct SubmitInvocation;
@@ -264,7 +274,7 @@ async fn submit_attempt(
     let successors = context.successors(&kernel, &names);
     let mut emissions = Vec::new();
     match outputs {
-        None => emissions.extend(route(&successors, None, &result)?),
+        None => emissions.extend(route(&successors, None, &result, &OutputAuthority::Carry)?),
         Some(outputs) => {
             for output in outputs {
                 if output.outbound {
@@ -274,7 +284,15 @@ async fn submit_attempt(
                             "An outbound output stays here; it has no destination",
                         ));
                     }
+                } else if output.object_type.is_some() {
+                    return Err(AppError::invalid(
+                        "Only an outbound output names its object type; a delivered one takes its connection's",
+                    ));
                 }
+                let authority = match &output.authority {
+                    Some(tags) => OutputAuthority::Transition(views::authority(tags)?),
+                    None => OutputAuthority::Carry,
+                };
                 let payload = encode(
                     attempt,
                     state,
@@ -284,13 +302,18 @@ async fn submit_attempt(
                 )
                 .await?;
                 if output.outbound {
-                    emissions.push(Emission::outbound(
-                        OBJECT_TYPE,
-                        OutputAuthority::Carry,
-                        payload,
-                    ));
+                    let object_type = match output.object_type {
+                        Some(object_type) => object_type,
+                        None => result_object_type(&kernel, context.node_id())?,
+                    };
+                    emissions.push(Emission::outbound(object_type, authority, payload));
                 } else {
-                    emissions.extend(route(&successors, output.to.as_deref(), &payload)?);
+                    emissions.extend(route(
+                        &successors,
+                        output.to.as_deref(),
+                        &payload,
+                        &authority,
+                    )?);
                 }
             }
         }
@@ -357,17 +380,30 @@ async fn submit_attempt(
     Ok(context.finish(attempt, state, outcome).await)
 }
 
-/// Emissions carrying `payload` to the named successor, or to every successor.
+/// Emissions carrying `payload` along the named connection, or to every successor.
 fn route(
-    successors: &[(String, String)],
+    successors: &[Successor],
     to: Option<&str>,
     payload: &Payload,
+    authority: &OutputAuthority,
 ) -> Result<Vec<Emission>> {
-    let emission = |edge: &str| Emission::new(edge, OutputAuthority::Carry, payload.clone());
+    let emission = |edge: &str| Emission::new(edge, authority.clone(), payload.clone());
     Ok(match to {
         Some(to) => vec![emission(successor_edge(successors, to)?)],
-        None => successors.iter().map(|(edge, _)| emission(edge)).collect(),
+        None => successors
+            .iter()
+            .map(|successor| emission(&successor.edge))
+            .collect(),
     })
+}
+
+/// The object type of the node's results.
+fn result_object_type(kernel: &ontography::Kernel, node: &str) -> Result<String> {
+    kernel
+        .node_definition(node)
+        .and_then(|definition| kernel.contract(definition.result_contract()))
+        .map(|contract| contract.object_type().to_owned())
+        .ok_or_else(|| AppError::new("stale_task", "This node is no longer in the graph"))
 }
 
 #[derive(Deserialize, JsonSchema)]
