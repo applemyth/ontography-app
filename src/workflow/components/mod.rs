@@ -137,6 +137,13 @@ impl Catalog {
             .bind(node.config.clone(), &placement(document, node, ingress))
             .map_err(error)?;
         let implementation = Implementation::from_bound(bound)?;
+        // Refused before any task runs: its command's output could never be admitted.
+        if let Some(tags) = implementation
+            .command()
+            .and_then(|command| command.authority.as_deref())
+        {
+            document.check_output_authority(node, tags).map_err(error)?;
+        }
         if !implementation.runs_tasks()
             && (node.retry.is_some() || !node.grants.is_empty() || node.tools.is_some())
         {

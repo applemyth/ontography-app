@@ -206,6 +206,7 @@ pub async fn preview(
         }
         (pending.bindings.clone(), pending.identities.clone())
     } else {
+        document.check_connection_names(Some(&state.current))?;
         if graph_edit(&kernel, &state.current, &state.bindings, &state.identities)?.is_some() {
             return Err(AppError::new(
                 "workflow_drift",
@@ -922,6 +923,30 @@ mod tests {
         tagged.edges[0].authority = Some(BTreeSet::from(["gold".to_owned()]));
         let error = preview(&session, &state, tagged).await.unwrap_err();
         assert_eq!(error.code, "unknown_authority_tag");
+    }
+
+    #[tokio::test]
+    async fn runs_from_before_the_connection_name_rule_stay_editable() {
+        // Documents could once name a connection like a node.
+        let mut legacy = document();
+        legacy.edges[0].name = Some("review".into());
+        let (directory, _runtime, session, mut state) = fixture_with(legacy);
+        let mut next = state.current.clone();
+        next.nodes
+            .iter_mut()
+            .find(|node| node.id == "writer")
+            .unwrap()
+            .config = json!({"prompt":"after"});
+        // An accepted edit that keeps the name can be previewed again.
+        state.pending = Some(preview(&session, &state, next.clone()).await.unwrap());
+        let plan = preview(&session, &state, next).await.unwrap();
+        let path = directory.path().join("workflow.json");
+        commit(&session, &mut state, &path, plan).await.unwrap();
+        // Only a name the edit introduces is refused.
+        let mut shadowing = state.current.clone();
+        shadowing.edges[0].name = Some("writer".into());
+        let error = preview(&session, &state, shadowing).await.unwrap_err();
+        assert_eq!(error.code, "invalid_workflow_document");
     }
 
     #[tokio::test]

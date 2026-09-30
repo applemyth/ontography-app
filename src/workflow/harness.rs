@@ -13,8 +13,8 @@ use crate::workspace::{AttemptCheckout, WorkspaceStore};
 use ontography::{
     ContentId, ContextError, ContextPolicy, Emission, ExecutionContext, ExecutionFailure,
     ExecutionSignal, InvocationHandle, InvocationTrigger, OutputAuthority, PackageDocument,
-    PackageEnvelope, PackageError, PackageStore, Payload, ProposalDecision, ResolvedEntryKind,
-    SessionHandle,
+    PackageEnvelope, PackageError, PackageStore, Payload, ProposalDecision, Reject,
+    ResolvedEntryKind, SessionHandle,
 };
 use serde_json::json;
 use std::{
@@ -29,6 +29,9 @@ use tokio::{
 };
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
+/// The class of a failure retrying cannot help: core refused the output for
+/// its contract, and the same command would print output of the same form.
+const REFUSED: &str = "workflow_refused";
 type WorkerResult<T> = std::result::Result<T, ExecutionFailure>;
 
 fn failure(error: impl std::fmt::Display) -> ExecutionFailure {
@@ -169,8 +172,9 @@ pub async fn run(
             Err(error) => {
                 // Count the attempt before its failure is visible, so that a
                 // crash in between cannot grant an uncounted retry.
+                let retryable = error.class() != REFUSED;
                 let recorded =
-                    ledger.record_failure(&task, error.message(), true, &policy, &definition);
+                    ledger.record_failure(&task, error.message(), retryable, &policy, &definition);
                 let _ = invocation.fail(error.message()).await;
                 report_failure(directory, &invocation, &node.node, &error);
                 recorded.map_err(failure)?;
@@ -377,6 +381,11 @@ async fn perform(
         .implementation
         .command()
         .ok_or_else(|| failure("Only command nodes run tasks"))?;
+    // Binding checked these tags; core checks each task's transition.
+    let authority = match &command.authority {
+        Some(tags) => OutputAuthority::Transition(crate::views::authority(tags).map_err(failure)?),
+        None => OutputAuthority::Carry,
+    };
     // Preparation records the exact source exposure, including resolved package views.
     invocation.prepare_context().await.map_err(failure)?;
     let mut parts = Vec::new();
@@ -445,10 +454,6 @@ async fn perform(
     write_json(&directory.join("output.json"), &report).map_err(failure)?;
     // Fetch routes after execution; the admitted result always follows the current graph.
     let kernel = context.kernel().await.map_err(failure)?;
-    let authority = match &command.authority {
-        Some(tags) => OutputAuthority::Transition(crate::views::authority(tags).map_err(failure)?),
-        None => OutputAuthority::Carry,
-    };
     let emissions = kernel
         .graph()
         .edges()
@@ -466,10 +471,16 @@ async fn perform(
             report["activation_id"] = json!(id.to_string());
         }
         ProposalDecision::Rejected(error) => {
-            return Err(failure(format!(
+            let message = format!(
                 "Core rejected worker output: {}",
                 crate::views::rejection(&error)
-            )));
+            );
+            return Err(match error {
+                Reject::ResultContract { .. } | Reject::PayloadContract { .. } => {
+                    ExecutionFailure::new(REFUSED, message)
+                }
+                _ => failure(message),
+            });
         }
     }
     if let Some((checkout, _)) = workspace

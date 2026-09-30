@@ -145,11 +145,23 @@ function notify(ctx: Pick<ExtensionContext, "hasUI" | "ui">, error: unknown): vo
   if (ctx.hasUI) ctx.ui.notify(`Ontography session unavailable: ${String(error)}. Management tools remain disabled until reconnection succeeds.`, "error");
 }
 
+/** Why the session's graph cannot run, if the server reports it unavailable. */
+function unavailableReason(graph: unknown): string | null {
+  if (typeof graph !== "object" || graph === null || (graph as { status?: unknown }).status !== "unavailable") return null;
+  const message = (graph as { error?: { message?: unknown } }).error?.message;
+  return typeof message === "string" ? message : "no reason recorded";
+}
+
 function graphContext(context: SessionContext): string {
   const graph = JSON.stringify(context.graph);
   const preview = graph.length <= 12_000 ? graph : `${graph.slice(0, 12_000)}\n[Graph preview truncated; use bounded inspection tools.]`;
+  const reason = unavailableReason(context.graph);
+  const bound = context.session.run_id === null ? "" : `Bound graph run: ${context.session.run_id}. `;
+  const state = reason !== null
+    ? `${bound}The graph is unavailable: ${reason}. Graph tools report this until it is repaired.`
+    : context.session.run_id === null ? "Graph initialization is pending. Starting a run binds it to this session." : `Bound graph run: ${context.session.run_id}.`;
   return `\n\nCurrent Ontography session: ${context.session.session_id}. ` +
-    (context.session.run_id === null ? "Graph initialization is pending. Starting a run binds it to this session." : `Bound graph run: ${context.session.run_id}.`) +
+    state +
     " Pi /new, /resume, /fork, /clone, and /tree change conversation context within this same app session. They do not create, copy, or rewind the graph. " +
     "Graph tools default to the bound run; explicit targets must match it. Current server state supersedes older conversation descriptions. " +
     `Do not replay past mutations when resuming.\nCurrent graph inspection: ${preview}`;

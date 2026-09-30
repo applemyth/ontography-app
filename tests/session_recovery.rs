@@ -371,3 +371,326 @@ async fn compatibility_keeps_current_intent_shape_and_rejects_malformed_records(
     service.shutdown().await.unwrap();
     let _ = std::fs::remove_dir(paths.socket.parent().unwrap());
 }
+
+/// Paths under `directory`, without the server endpoint directory that
+/// `Paths::initialize` creates in the system temp directory: no server runs here.
+fn paths(directory: &std::path::Path) -> Paths {
+    let paths = Paths::initialize(directory.join("data")).unwrap();
+    let _ = std::fs::remove_dir(paths.socket.parent().unwrap());
+    paths
+}
+
+async fn create(service: &Service, project: &std::path::Path) -> String {
+    tools::dispatch(service, "session.create", &json!({"project":project}))
+        .await
+        .unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn scoped(
+    service: &Service,
+    session: &str,
+    operation: &str,
+    args: Value,
+) -> ontography_app::Result<Value> {
+    tools::dispatch_scoped(service, Some(session), operation, &args).await
+}
+
+/// A suspended session bound to a run that loads but cannot open: its
+/// manifest names another core build, as after rebuilding core.
+async fn incompatible_run(directory: &std::path::Path) -> (Paths, String, String) {
+    let paths = paths(directory);
+    let service = Service::new(paths.clone()).unwrap();
+    let session = create(&service, directory).await;
+    let run = scoped(
+        &service,
+        &session,
+        "flow.start",
+        json!({"document":document()}),
+    )
+    .await
+    .unwrap();
+    let run_id = run["run_id"].as_str().unwrap().to_owned();
+    scoped(&service, &session, "session.suspend", json!({}))
+        .await
+        .unwrap();
+    service.shutdown().await.unwrap();
+    let manifest = paths.run(&run_id).unwrap().join("manifest.json");
+    let mut saved: Value = persistence::read_json(&manifest).unwrap();
+    saved["core_build"] = json!("another-build");
+    persistence::write_json(&manifest, &saved).unwrap();
+    (paths, session, run_id)
+}
+
+#[tokio::test]
+async fn a_graph_that_cannot_resume_stays_reported() {
+    let directory = tempfile::tempdir().unwrap();
+    let (paths, session, _) = incompatible_run(directory.path()).await;
+    let service = Service::new(paths.clone()).unwrap();
+    let resumed = scoped(&service, &session, "session.resume", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(resumed["status"], "active");
+    assert_eq!(resumed["graph"]["error"]["code"], "incompatible_run");
+    // Later views keep the reason instead of showing an idle graph.
+    for _ in 0..2 {
+        let context = scoped(&service, &session, "session.context", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(context["graph"]["status"], "unavailable");
+        assert_eq!(context["graph"]["error"]["code"], "incompatible_run");
+    }
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn closing_around_a_run_that_cannot_open_completes() {
+    let directory = tempfile::tempdir().unwrap();
+    let (paths, session, run_id) = incompatible_run(directory.path()).await;
+    let service = Service::new(paths.clone()).unwrap();
+    scoped(&service, &session, "session.resume", json!({}))
+        .await
+        .unwrap();
+    let closed = scoped(&service, &session, "session.close", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(closed["status"], "closed");
+    // The run is left exactly as it was.
+    let manifest: Value =
+        persistence::read_json(&paths.run(&run_id).unwrap().join("manifest.json")).unwrap();
+    assert_eq!(manifest["core_build"], "another-build");
+    assert_eq!(manifest["status"], "suspended");
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn current_sessions_keep_runs_over_legacy_reservations() {
+    // Load order follows random identities; the current session wins every time.
+    for _ in 0..6 {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = paths(directory.path());
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let service = Service::new(paths.clone()).unwrap();
+        let current = create(&service, directory.path()).await;
+        scoped(
+            &service,
+            &current,
+            "flow.start",
+            json!({"document":document(),"start_id":run_id}),
+        )
+        .await
+        .unwrap();
+        service.shutdown().await.unwrap();
+        // The legacy record was unreadable when the current session bound the run.
+        let legacy = saved_session(&paths, Some(legacy_intent(&run_id, "flow.start")), false).await;
+
+        let service = Service::new(paths.clone()).unwrap();
+        assert!(service.sessions.recovery_errors.is_empty());
+        assert_eq!(
+            service.sessions.owner(&run_id).await.as_deref(),
+            Some(current.as_str())
+        );
+        let context = scoped(&service, &legacy.session_id, "session.context", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(context["graph"]["error"]["code"], "graph_unavailable");
+        // Closing the legacy session leaves the current session's run running.
+        scoped(&service, &current, "session.resume", json!({}))
+            .await
+            .unwrap();
+        scoped(&service, &legacy.session_id, "session.close", json!({}))
+            .await
+            .unwrap();
+        let run = service.run(&run_id).await.unwrap();
+        assert!(run.lock().await.live.is_some());
+        service.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn reservations_hold_for_starts_outside_sessions() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = paths(directory.path());
+    let run_id = uuid::Uuid::new_v4().to_string();
+    saved_session(&paths, Some(legacy_intent(&run_id, "flow.start")), false).await;
+    let service = Service::new(paths.clone()).unwrap();
+    let error = tools::dispatch(
+        &service,
+        "flow.start",
+        &json!({"document":document(),"project":directory.path(),"start_id":run_id}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "run_already_owned");
+    assert!(!paths.run(&run_id).unwrap().exists());
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_start_that_cannot_finish_leaves_the_session_resumable() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = paths(directory.path());
+    let project = directory.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let service = Service::new(paths.clone()).unwrap();
+    let session = create(&service, &project).await;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let args = json!({"document":document(),"start_id":run_id});
+    let (definition, workflow) =
+        ontography_app::workflow::tools::prepare_start(&service, &args, &run_id).unwrap();
+    {
+        // A current start saved before its run could be created.
+        let handle = service.sessions.get(&session).await.unwrap();
+        let mut record = handle.lock().await;
+        record.status = SessionStatus::Suspended;
+        record.graph_initialization = Some(
+            GraphInitialization {
+                run_id: run_id.clone(),
+                args,
+                definition,
+                workflow,
+            }
+            .into(),
+        );
+        service.sessions.save(&record).unwrap();
+    }
+    std::fs::remove_dir(&project).unwrap();
+
+    let resumed = scoped(&service, &session, "session.resume", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(resumed["status"], "active");
+    assert_eq!(resumed["graph"]["status"], "unavailable");
+    let reason = resumed["graph"]["error"].clone();
+    assert!(reason["code"].is_string());
+    let context = scoped(&service, &session, "session.context", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(context["graph"]["error"], reason);
+    // Graph operations report the same reason.
+    let error = scoped(&service, &session, "run.inspect", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(json!(error.code), reason["code"]);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_activation_starts_no_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = paths(directory.path());
+    let service = Service::new(paths.clone()).unwrap();
+    let session = create(&service, directory.path()).await;
+    let run = scoped(
+        &service,
+        &session,
+        "flow.start",
+        json!({"document":document()}),
+    )
+    .await
+    .unwrap();
+    let run_id = run["run_id"].as_str().unwrap().to_owned();
+    scoped(&service, &session, "session.suspend", json!({}))
+        .await
+        .unwrap();
+    // Force publication to fail inside this disposable fixture.
+    let manifest = paths
+        .root
+        .join("sessions")
+        .join(&session)
+        .join("session.json");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+    let error = scoped(&service, &session, "session.resume", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "io_error");
+    let record = service.sessions.get(&session).await.unwrap();
+    assert_eq!(record.lock().await.status, SessionStatus::Suspended);
+    let run = service.run(&run_id).await.unwrap();
+    assert!(run.lock().await.live.is_none(), "no work starts");
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn graph_operations_report_why_a_graph_is_unavailable() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = paths(directory.path());
+    // An adopted run that fails to load, and a legacy start that never ran.
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let mut adopted = saved_session(&paths, None, false).await;
+    adopted.run_id = Some(run_id.clone());
+    Sessions::open(&paths).unwrap().save(&adopted).unwrap();
+    let run_dir = paths.run(&run_id).unwrap();
+    std::fs::create_dir(&run_dir).unwrap();
+    persistence::write_json(
+        &run_dir.join("manifest.json"),
+        &json!({"version":1,"run_id":run_id}),
+    )
+    .unwrap();
+    let legacy_run = uuid::Uuid::new_v4().to_string();
+    let legacy = saved_session(
+        &paths,
+        Some(legacy_intent(&legacy_run, "flow.start")),
+        false,
+    )
+    .await;
+
+    let service = Service::new(paths.clone()).unwrap();
+    let recovery = service.recovery_errors[&run_id].clone();
+    for session in [&adopted.session_id, &legacy.session_id] {
+        scoped(&service, session, "session.resume", json!({}))
+            .await
+            .unwrap();
+    }
+    let error = scoped(&service, &adopted.session_id, "run.inspect", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.code.as_str(), error.message.as_str()),
+        (recovery.code.as_str(), recovery.message.as_str())
+    );
+    let listing = scoped(&service, &adopted.session_id, "run.list", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        listing["recovery_errors"][&run_id]["code"],
+        json!(recovery.code)
+    );
+    let error = scoped(&service, &legacy.session_id, "run.inspect", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "graph_unavailable");
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_saved_starts_report_their_own_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = paths(directory.path());
+    let service = Service::new(paths.clone()).unwrap();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let args = json!({"document":document(),"project":paths.root});
+    let (definition, workflow) =
+        ontography_app::workflow::tools::prepare_start(&service, &args, &run_id).unwrap();
+    let mut current = serde_json::to_value(GraphInitialization {
+        run_id: run_id.clone(),
+        args,
+        definition,
+        workflow,
+    })
+    .unwrap();
+    current["workflow"] = json!("not a workflow");
+    let mut legacy = legacy_intent(&run_id, "flow.start");
+    legacy["operation"] = json!("unknown.start");
+    for (intent, cause) in [(current, "invalid type"), (legacy, "unknown variant")] {
+        let error = serde_json::from_value::<SavedGraphInitialization>(intent)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(cause), "{error}");
+        assert!(!error.contains("untagged"), "{error}");
+    }
+    service.shutdown().await.unwrap();
+}

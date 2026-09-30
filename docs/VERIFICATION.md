@@ -1,31 +1,46 @@
 # Verification
 
-## Typed workflow and session recovery fixes — 2026-09-29
+## Typed workflow and session recovery fixes — 2026-09-30
 
-Passed: **306 app Rust tests**, **32 Pi tests**, TypeScript checking,
+Passed: **319 app Rust tests**, **33 Pi tests**, TypeScript checking,
 all-target Clippy with warnings denied, formatting, and `git diff --check`.
-Six opt-in native Rust tests remain ignored in the ordinary suite. The sibling
-`ontography-stress` quick preset passed **10 games, 0 with problems**, using
-fixed seeds 1–5 in tandem and concurrent modes and isolated temporary stores.
+Six opt-in native Rust tests remain ignored in the ordinary suite. Each test
+added for a behavior fix fails on the tree before it. The sibling
+`ontography-stress` quick preset passed **15 games, 0 with problems**: typed
+games in tandem and concurrent modes and software games, on fixed seeds 1–5.
+At a load average near 56, `concurrent_startups_detach_and_reconnect_to_one_live_server`
+twice missed its 5-second endpoint-release deadline. Server shutdown and run
+suspension are unchanged here, and it passed 10 of 10 runs alternating with
+the tree before these fixes, which also passed 10 of 10.
 
 - [Typed execution tests](../tests/typed_execution.rs) run the smelting document,
   script, and submit request extracted directly from `WORKFLOWS.md`. Command
   settings and human decisions request declared authority transitions; core
-  rejects unauthorized changes and connections that refuse the output.
-  Binary command input, output, and export preserve every byte. Stdout package
-  envelopes pass core's granted-view check, which supplies their dependencies;
-  malformed envelopes and unrelated imported workspaces are refused without
-  consuming the input. Granted workspace captures still publish and export.
+  rejects unauthorized changes and connections that refuse the output. A
+  command authority no transition or connection allows is refused before any
+  task runs, and a refused decision names its rule and leaves the task ready.
+  Binary command input, output, and export preserve every byte. Stdout
+  envelopes are refused, the malformed ones recorded by core, without consuming
+  the input. Workspace captures still publish and export. Output refused for
+  its contract parks after one attempt. Connection names that shadow nodes are
+  refused only where a document adds them.
 - [Workflow move tests](../tests/workflow_moves.rs) exercise submit, transfer,
   retire, and filtered inspections after nodes and connections are added or
   replaced. They cover pending ownership changes, missing bindings, and
-  collisions between document names and live core identities. Joined moves
-  reuse one workflow and kernel read.
+  collisions between document names and live core identities. One move
+  consumes a joined trigger observed by name after replacement. Collisions are
+  refused before and after an edit applies, and inspections resolve exact
+  identities without the workflow file.
 - [Session recovery tests](../tests/session_recovery.rs) preserve legacy
   initialization records, conversation files, selection, and exclusive run
   claims. Sessions can activate their manager with an unavailable graph;
   recovery does not replay or replace incompatible old runs. Current-format
-  validation and failed session-save behavior remain covered.
+  validation and failed session-save behavior remain covered. A graph that
+  cannot start or resume stays reported, in the session and by graph
+  operations, until it works; a failed activation starts no work; closing
+  completes around a run that cannot open. Legacy reservations hold against
+  starts outside sessions but yield to a current session owning the run, and
+  malformed saved starts report their own error. Pi shows the reason too.
 - Startup binds the document once. Validators avoid copying payloads that
   cannot be envelopes. Obsolete workflow-state fallbacks and the plan `steps`
   alias are removed; the document `kind` alias remains usable.

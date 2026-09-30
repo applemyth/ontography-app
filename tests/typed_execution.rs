@@ -1,7 +1,12 @@
-//! Typed command and human execution preserves core authority and payload rules.
+//! Typed command and human execution preserves core authority and payload
+//! rules, and document rules refuse only new work.
 
 use ontography::{Payload, SessionHandle};
-use ontography_app::{persistence::Paths, state::Service, tools};
+use ontography_app::{
+    persistence::{self, Paths},
+    state::Service,
+    tools,
+};
 use serde_json::{Value, json};
 use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
@@ -11,8 +16,13 @@ async fn call(service: &Service, operation: &str, args: Value) -> Value {
         .unwrap_or_else(|error| panic!("{operation}: {error}; {:?}", error.details))
 }
 
+/// A service whose files all stay under `project`. It never listens, so the
+/// endpoint directory `Paths` makes in /tmp goes at once.
 fn service(project: &Path) -> Service {
-    Service::new(Paths::initialize(project.join("data")).unwrap()).unwrap()
+    let mut paths = Paths::initialize(project.join("data")).unwrap();
+    std::fs::remove_dir(paths.socket.parent().unwrap()).unwrap();
+    paths.socket = project.join("server.sock");
+    Service::new(paths).unwrap()
 }
 
 async fn start(service: &Service, project: &Path, document: Value) -> String {
@@ -118,62 +128,113 @@ async fn documented_smelting_example_runs_with_its_declared_transition() {
     service.shutdown().await.unwrap();
 }
 
-fn human_document(edge_authority: &str) -> Value {
-    json!({"name":"decision","entry":"review","nodes":[
-        {"id":"review","component":"human","root":["red"],
+/// A person reviews what a client sends carrying `red`: `red -> sealed` and
+/// `red -> []` are the only transitions, and the sink admits `sink` tags.
+fn review_document(sink: Value) -> Value {
+    json!({"name":"decision","entry":"client","nodes":[
+        {"id":"client","component":"external","root":["red"]},
+        {"id":"review","component":"human",
             "transitions":[{"from":["red"],"to":["sealed"]},{"from":["red"],"to":[]}]},
         {"id":"sink","component":"inbox"}
-    ],"edges":[{"from":"review","to":"sink","authority":[edge_authority]}]})
+    ],"edges":[{"from":"client","to":"review","authority":["red"]},
+        {"from":"review","to":"sink","authority":sink}]})
+}
+
+async fn send(service: &Service, run: &str, message: &str) {
+    call(
+        service,
+        "workflow.submit",
+        json!({"run_id":run,"trigger":{"kind":"root","node_id":"client","authority":["red"]},
+        "result":message,"emissions":[{"edge_id":"client:review","payload":message}]}),
+    )
+    .await;
 }
 
 async fn human_task(service: &Service, run: &str) -> Value {
-    call(service, "flow.status", json!({"run_id":run})).await["tasks"][0]["task_id"].clone()
+    let status = call(service, "flow.status", json!({"run_id":run})).await;
+    let tasks = status["tasks"].as_array().unwrap();
+    let task = tasks.iter().find(|task| task["node"] == "review").unwrap();
+    task["task_id"].clone()
+}
+
+async fn sink_tags(service: &Service, run: &str) -> Vec<Vec<String>> {
+    let session = session(service, run).await;
+    let page = session.pending_page_at("sink", None, 10).await.unwrap();
+    page.packages()
+        .iter()
+        .map(|(_, package)| {
+            package
+                .authority()
+                .tags()
+                .map(|tag| tag.id().into())
+                .collect()
+        })
+        .collect()
 }
 
 #[tokio::test]
 async fn human_decisions_apply_only_declared_authority_transitions() {
     let directory = tempfile::tempdir().unwrap();
     let service = service(directory.path());
-    let mut document = human_document("sealed");
-    // Declare this tag in the vocabulary without permitting red -> other.
-    document["nodes"][0]["transitions"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"from":["other"],"to":["sealed"]}));
-    let run = start(&service, directory.path(), document).await;
-    let task = human_task(&service, &run).await;
-    let decision = |authority: Value| json!({"run_id":run,"node":"review","task_id":task,"message":"Approved","authority":authority});
-    let refused = tools::dispatch(&service, "flow.decide", &decision(json!(["other"])))
-        .await
-        .unwrap_err();
-    assert!(refused.message.contains("authority"), "{refused}");
-    assert_eq!(human_task(&service, &run).await, task);
-    assert_eq!(
-        session(&service, &run)
-            .await
-            .pending_page_at("sink", None, 10)
-            .await
-            .unwrap()
-            .packages()
-            .len(),
-        0
+    // The sink admits `other`, so only the undeclared `red -> other` can refuse it.
+    let run = start(
+        &service,
+        directory.path(),
+        review_document(json!(["sealed", "other"])),
+    )
+    .await;
+    send(&service, &run, "first").await;
+    send(&service, &run, "second").await;
+    let decision = |task: &Value, message: &str, authority: Value| json!({"run_id":run,"node":"review","task_id":task,"message":message,"authority":authority});
+    let first = human_task(&service, &run).await;
+    call(
+        &service,
+        "flow.decide",
+        decision(&first, "Approved", json!(["sealed"])),
+    )
+    .await;
+    let second = human_task(&service, &run).await;
+    assert_ne!(first, second);
+    let refused = tools::dispatch(
+        &service,
+        "flow.decide",
+        &decision(&second, "Overreach", json!(["other"])),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, "rejected", "{refused}");
+    assert!(
+        refused
+            .message
+            .contains(r#"no declared transition changes authority ["red"] to ["other"]"#),
+        "{refused}"
     );
-    call(&service, "flow.decide", decision(json!(["sealed"]))).await;
-    assert_eq!(&*sink_payload(&service, &run, "sink").await, b"Approved");
-    let page = session(&service, &run)
-        .await
-        .pending_page_at("sink", None, 10)
-        .await
-        .unwrap();
-    assert_eq!(
-        page.packages()[0]
-            .1
-            .authority()
-            .tags()
-            .map(|tag| tag.id())
-            .collect::<Vec<_>>(),
-        ["sealed"]
-    );
+    // The task stays ready, and the refusal leaves the node's last result.
+    assert_eq!(human_task(&service, &run).await, second);
+    assert_eq!(sink_tags(&service, &run).await, [["sealed"]]);
+    let output = call(
+        &service,
+        "flow.output",
+        json!({"run_id":run,"node":"review","source":"output"}),
+    )
+    .await;
+    assert_eq!(output["result"]["message"], "Approved");
+    assert_eq!(output["publication_status"], "committed");
+    let exported = directory.path().join("decision.txt");
+    call(
+        &service,
+        "flow.export",
+        json!({"run_id":run,"node":"review","source":"output","path":exported}),
+    )
+    .await;
+    assert_eq!(std::fs::read(exported).unwrap(), b"Approved");
+    call(
+        &service,
+        "flow.decide",
+        decision(&second, "Sealed", json!(["sealed"])),
+    )
+    .await;
+    assert_eq!(sink_tags(&service, &run).await, [["sealed"], ["sealed"]]);
     service.shutdown().await.unwrap();
 }
 
@@ -181,12 +242,19 @@ async fn human_decisions_apply_only_declared_authority_transitions() {
 async fn empty_human_output_authority_is_distinct_from_carry() {
     let directory = tempfile::tempdir().unwrap();
     let service = service(directory.path());
-    let run = start(&service, directory.path(), human_document("red")).await;
+    let run = start(&service, directory.path(), review_document(json!(["red"]))).await;
+    send(&service, &run, "work").await;
     let mut decision = json!({"run_id":run,"node":"review","task_id":human_task(&service, &run).await,"message":"Approved","authority":[]});
+    // `red -> []` is declared, but no connection admits empty authority.
     let refused = tools::dispatch(&service, "flow.decide", &decision)
         .await
         .unwrap_err();
-    assert!(refused.message.contains("authority"), "{refused}");
+    assert!(
+        refused
+            .message
+            .contains(r#"connection "review:sink" does not admit authority []"#),
+        "{refused}"
+    );
     decision.as_object_mut().unwrap().remove("authority");
     call(&service, "flow.decide", decision).await;
     assert_eq!(&*sink_payload(&service, &run, "sink").await, b"Approved");
@@ -194,40 +262,61 @@ async fn empty_human_output_authority_is_distinct_from_carry() {
 }
 
 #[tokio::test]
-async fn command_authority_settings_cannot_bypass_transition_or_edge_checks() {
+async fn invalid_command_authority_is_refused_before_the_command_runs() {
     let directory = tempfile::tempdir().unwrap();
     let service = service(directory.path());
-    for (authority, transitions) in [
-        (json!(["sealed"]), json!([])),
-        (json!([]), json!([{"from":["red"],"to":[]}])),
-    ] {
-        let document = json!({"name":"refused-command","entry":"worker","nodes":[
+    let ran = directory.path().join("ran");
+    let document = |authority: &Value| {
+        json!({"name":"deploy","entry":"worker","nodes":[
             {"id":"worker","component":"command","root":["red"],
-                "config":{"argv":["/bin/cat"],"authority":authority},"transitions":transitions,
-                "retry":{"max_attempts":1}},
-            {"id":"sink","component":"inbox","root":["sealed"]}
-        ],"edges":[{"from":"worker","to":"sink","authority":["red"]}]});
-        let run = start(&service, directory.path(), document).await;
-        let status = wait_status(&service, &run, |status| {
-            !status["failures"].as_array().unwrap().is_empty()
-        })
-        .await;
-        assert!(
-            session(&service, &run)
-                .await
-                .pending_page_at("sink", None, 10)
-                .await
-                .unwrap()
-                .packages()
-                .is_empty()
-        );
-        assert!(
-            status["failures"][0]["error"]
-                .as_str()
-                .unwrap()
-                .contains("authority")
-        );
+                "config":{"argv":["/usr/bin/touch",ran],"authority":authority},
+                "transitions":[{"from":["red"],"to":["sealed"]},{"from":["red"],"to":[]}]},
+            {"id":"sink","component":"inbox"}
+        ],"edges":[{"from":"worker","to":"sink","authority":["sealed"]}]})
+    };
+    // Core could admit none of these outputs: a typo, a tag no transition
+    // reaches, a malformed tag, and authority no connection admits.
+    let invalid = [
+        (json!(["seald"]), "needs a declared transition"),
+        (json!(["red"]), "needs a declared transition"),
+        (json!([""]), "must use only letters"),
+        (json!([]), r#"connection "worker:sink" does not admit"#),
+    ];
+    for (authority, message) in &invalid {
+        for operation in ["flow.define", "flow.start"] {
+            let error = tools::dispatch(
+                &service,
+                operation,
+                &json!({"document":document(authority),"project":directory.path()}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_workflow_document", "{error}");
+            assert!(error.message.contains(message), "{authority}: {error}");
+        }
     }
+    assert!(!ran.exists(), "a refused command must never run");
+    // A settings-only edit is refused the same way; a valid one is not.
+    let run = start(&service, directory.path(), document(&json!(["sealed"]))).await;
+    for (authority, message) in &invalid {
+        let error = tools::dispatch(
+            &service,
+            "flow.edit",
+            &json!({"run_id":run,"document":document(authority)}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains(message), "{authority}: {error}");
+    }
+    let mut edited = document(&json!(["sealed"]));
+    edited["nodes"][0]["config"]["timeout_secs"] = json!(60);
+    let plan = call(
+        &service,
+        "flow.edit",
+        json!({"run_id":run,"document":edited}),
+    )
+    .await;
+    assert_eq!(plan["changes"], 0);
     service.shutdown().await.unwrap();
 }
 
@@ -384,9 +473,28 @@ async fn malformed_command_stdout_envelopes_are_refused_even_by_bytes_contracts(
             .unwrap()
             .contains("invalid type")
     );
+    // Core's check of worker output refused it, and recorded why.
+    let session = session(&service, &run).await;
+    let invocations = session
+        .invocations_page(Some("worker"), None, 10)
+        .await
+        .unwrap();
+    let [invocation] = &invocations[..] else {
+        panic!("expected one attempt, got {invocations:?}");
+    };
+    let events = session
+        .invocation_events(invocation.id, 0, 100)
+        .await
+        .unwrap();
     assert!(
-        session(&service, &run)
-            .await
+        events
+            .iter()
+            .any(|event| event.operation == "context_denied"
+                && event.source["operation"] == "worker_output"),
+        "{events:?}"
+    );
+    assert!(
+        session
             .try_snapshot()
             .await
             .unwrap()
@@ -394,5 +502,92 @@ async fn malformed_command_stdout_envelopes_are_refused_even_by_bytes_contracts(
             .activations()
             .is_empty()
     );
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn command_output_refused_for_its_contract_parks_at_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(directory.path());
+    // Bytes that are not UTF-8, under the default text contract and retries.
+    let document = json!({"name":"binary-text","entry":"worker","nodes":[
+        {"id":"worker","component":"command","config":{"argv":["/usr/bin/printf","\\377"]}},
+        {"id":"sink","component":"inbox"}
+    ],"edges":[{"from":"worker","to":"sink"}]});
+    let run = start(&service, directory.path(), document).await;
+    let status = wait_status(&service, &run, |status| {
+        !status["failures"].as_array().unwrap().is_empty()
+    })
+    .await;
+    let failure = &status["failures"][0];
+    assert_eq!(failure["state"], "parked", "{failure}");
+    assert_eq!(failure["attempts"], 1);
+    assert!(
+        failure["error"]
+            .as_str()
+            .unwrap()
+            .contains("the result was refused: invalid UTF-8"),
+        "{failure}"
+    );
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn connection_names_shadowing_nodes_are_refused_only_in_new_documents() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(directory.path());
+    // Documents could once name a connection like a node.
+    let legacy = json!({"name":"legacy","entry":"a","nodes":[
+        {"id":"a","component":"inbox"},{"id":"b","component":"inbox"}
+    ],"edges":[{"from":"a","to":"b","name":"b"}]});
+    for operation in ["flow.define", "flow.start"] {
+        let error = tools::dispatch(
+            &service,
+            operation,
+            &json!({"document":legacy,"project":directory.path()}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("already a node's name"), "{error}");
+    }
+    // A revision saved before the rule still starts, retries by start_id, and promotes.
+    let revision = "0".repeat(64);
+    let saved = service.paths.workflow_definition(&revision).unwrap();
+    persistence::write_json(&saved, &legacy).unwrap();
+    let start = |source: Value| {
+        let mut args = source;
+        args["start_id"] = json!("6f1d0c2e-9a1b-4c3d-8e5f-0a1b2c3d4e5f");
+        args["project"] = json!(directory.path());
+        call(&service, "flow.start", args)
+    };
+    let run = start(json!({"revision":revision})).await["run_id"].clone();
+    for retry in [json!({"revision":revision}), json!({"document":legacy})] {
+        assert_eq!(start(retry).await["run_id"], run);
+    }
+    call(&service, "flow.promote", json!({"run_id":run})).await;
+    // An edit keeps the name; only a name an edit introduces is refused.
+    let mut edited = legacy.clone();
+    edited["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"c","component":"inbox"}));
+    call(
+        &service,
+        "flow.edit",
+        json!({"run_id":run,"document":edited}),
+    )
+    .await;
+    edited["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"from":"a","to":"c","name":"c"}));
+    let error = tools::dispatch(
+        &service,
+        "flow.edit",
+        &json!({"run_id":run,"document":edited}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.message.contains("already a node's name"), "{error}");
     service.shutdown().await.unwrap();
 }

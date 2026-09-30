@@ -258,6 +258,55 @@ pub async fn dispatch_wait(service: &Service, args: &Value) -> Result<Value> {
     )
 }
 
+/// What a move or inspection names: a node or a connection.
+#[derive(Clone, Copy)]
+enum Part {
+    Node,
+    Edge,
+}
+
+impl Part {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+        }
+    }
+
+    /// `id`, if it is a live identity in core's graph.
+    fn live<'k>(self, kernel: &'k Kernel, id: &str) -> Option<&'k str> {
+        match self {
+            Self::Node => kernel.graph().node(id).map(|node| node.id()),
+            Self::Edge => kernel.graph().edge(id).map(|edge| edge.id()),
+        }
+    }
+
+    /// `name`'s live identity in the pending document, else the current one:
+    /// `Some(None)` until its edit applies, `None` if neither document has it.
+    fn named<'a>(
+        self,
+        state: &'a WorkflowState,
+        kernel: &Kernel,
+        name: &str,
+    ) -> Option<Option<&'a str>> {
+        let mut ids = state
+            .pending
+            .iter()
+            .map(|plan| &plan.identities)
+            .chain([&state.identities])
+            .filter_map(|ids| match self {
+                Self::Node => ids.nodes.get(name),
+                Self::Edge => ids.edges.get(name),
+            })
+            .peekable();
+        ids.peek()?;
+        Some(
+            ids.map(String::as_str)
+                .find(|id| self.live(kernel, id).is_some()),
+        )
+    }
+}
+
 /// Resolve names and ownership from one workflow/graph read per request.
 /// A pending replacement takes effect when its identity is present in core.
 struct WorkflowGraph {
@@ -273,32 +322,17 @@ impl WorkflowGraph {
         })
     }
 
-    fn node_id<'a>(&'a self, name: &str) -> Result<&'a str> {
-        let named = self
-            .state
-            .pending
-            .iter()
-            .map(|plan| &plan.identities.nodes)
-            .chain(std::iter::once(&self.state.identities.nodes))
-            .filter_map(|ids| ids.get(name))
-            .find(|id| self.kernel.graph().node(id).is_some())
-            .map(String::as_str);
-        let exact = self.kernel.graph().node(name).map(|node| node.id());
-        resolve_reference("node", name, named, exact)
+    fn node_id(&self, input: &str) -> Result<&str> {
+        self.resolve(Part::Node, input)
     }
 
-    fn edge_id<'a>(&'a self, name: &str) -> Result<&'a str> {
-        let named = self
-            .state
-            .pending
-            .iter()
-            .map(|plan| &plan.identities.edges)
-            .chain(std::iter::once(&self.state.identities.edges))
-            .filter_map(|ids| ids.get(name))
-            .find(|id| self.kernel.graph().edge(id).is_some())
-            .map(String::as_str);
-        let exact = self.kernel.graph().edge(name).map(|edge| edge.id());
-        resolve_reference("edge", name, named, exact)
+    fn edge_id(&self, input: &str) -> Result<&str> {
+        self.resolve(Part::Edge, input)
+    }
+
+    fn resolve(&self, part: Part, input: &str) -> Result<&str> {
+        let named = part.named(&self.state, &self.kernel, input);
+        resolve_reference(part, input, named, part.live(&self.kernel, input))
     }
 
     /// Never authorize a live node without the binding of that exact identity.
@@ -370,26 +404,62 @@ impl WorkflowGraph {
     }
 }
 
-/// Names and observed core identities share an input field; refuse collisions
-/// instead of silently sending work to a different node or connection.
+/// Names and observed core identities share an input field. A document name,
+/// current or pending, means only its own identity, even before its edit
+/// applies: refuse one that is also a different live identity instead of
+/// silently sending work to a different node or connection.
 fn resolve_reference<'a>(
-    kind: &str,
+    part: Part,
     input: &str,
-    named: Option<&'a str>,
+    named: Option<Option<&'a str>>,
     exact: Option<&'a str>,
 ) -> Result<&'a str> {
     match (named, exact) {
-        (Some(named), Some(exact)) if named != exact => Err(AppError::new(
+        (Some(named), Some(exact)) if named != Some(exact) => Err(AppError::new(
             "ambiguous_reference",
             format!(
-                "{kind} reference {input:?} is both a document name and a different core identity; use an unambiguous name or identity"
+                "{} reference {input:?} is both a document name and a different core identity; use an unambiguous name or identity",
+                part.noun()
             ),
         )),
-        (Some(id), _) | (_, Some(id)) => Ok(id),
+        (Some(Some(id)), _) | (_, Some(id)) => Ok(id),
         _ => Err(AppError::new(
             "rejected",
-            format!("unknown {kind}: {input}"),
+            format!("unknown {}: {input}", part.noun()),
         )),
+    }
+}
+
+/// Inspections take a live core identity as itself, as before names were
+/// accepted, so they read the workflow only to resolve a name, at most once
+/// per request. Core reports whatever neither resolves.
+struct Inspection<'r> {
+    run: &'r ManagedRun,
+    kernel: Arc<Kernel>,
+    state: Option<WorkflowState>,
+}
+
+impl<'r> Inspection<'r> {
+    async fn new(run: &'r ManagedRun) -> Result<Self> {
+        let kernel = run.live()?.session.kernel().await.map_err(AppError::core)?;
+        Ok(Self {
+            run,
+            kernel,
+            state: None,
+        })
+    }
+
+    fn id(&mut self, part: Part, input: &str) -> Result<String> {
+        if part.live(&self.kernel, input).is_none() {
+            let state = match &mut self.state {
+                Some(state) => state,
+                empty => empty.insert(crate::workflow::runtime::load(self.run)?),
+            };
+            if let Some(Some(id)) = part.named(state, &self.kernel, input) {
+                return Ok(id.to_owned());
+            }
+        }
+        Ok(input.to_owned())
     }
 }
 
@@ -478,7 +548,7 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
             check_limit(input.limit)?;
             let after = input.after.as_deref().map(views::package_id).transpose()?;
             let node = match input.node_id.as_deref() {
-                Some(name) => Some(WorkflowGraph::load(run).await?.node_id(name)?.to_owned()),
+                Some(node) => Some(Inspection::new(run).await?.id(Part::Node, node)?),
                 None => None,
             };
             let session = &run.live()?.session;
@@ -508,15 +578,15 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         }
         "inspect.trigger" => {
             let input: TriggerQuery = parse_args(run, args)?;
-            let graph = WorkflowGraph::load(run).await?;
-            let node = graph.node_id(&input.node_id)?;
+            let mut inspection = Inspection::new(run).await?;
+            let node = inspection.id(Part::Node, &input.node_id)?;
+            let edge = input
+                .edge_id
+                .map(|edge| inspection.id(Part::Edge, &edge))
+                .transpose()?;
             let session = &run.live()?.session;
-            let frontier = match input.edge_id {
-                Some(edge) => {
-                    session
-                        .next_pending_on_edge_at(node, graph.edge_id(&edge)?)
-                        .await
-                }
+            let frontier = match edge {
+                Some(edge) => session.next_pending_on_edge_at(node, edge).await,
                 None => session.next_trigger_at(node).await,
             }
             .map_err(AppError::core)?;

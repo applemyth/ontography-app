@@ -71,7 +71,7 @@ start and `run_id` afterward; a stable UUID `start_id` makes startup retryable.
 | `nodes[].root` | Optional: the authority tags work the node starts may carry. Only nodes with a root start work; the entry has `["workflow"]` unless given. |
 | `nodes[].transitions` | Optional: `[{from, to}]` authority changes the node may make to what it sends. |
 | `edges` | Directed `{from,to}` connections; defaults to `[]`. |
-| `edges[].name` | Optional; needed to connect the same two nodes twice. Otherwise a connection is named `from:to`. It cannot be a node's name, since node tools accept either in `to`. |
+| `edges[].name` | Optional; needed to connect the same two nodes twice. Otherwise a connection is named `from:to`. It cannot be a node's name, since node tools accept either in `to`. Documents saved or started before this rule keep such names; an edit may keep them but not add one. |
 | `edges[].contract` | Optional: what it carries; its source's `result` by default. |
 | `edges[].authority` | Optional: the tags it admits; `["workflow"]` by default. |
 | `edges[].match` | `any_of` by default, or `all_of`: whether work needs any or all of those tags. |
@@ -135,12 +135,18 @@ The vault receives `Refined: raw ore` carrying `sealed`. Command
 `config.authority` and human `flow.decide`'s `authority` request exactly those
 output tags; a declared transition must permit the change. Omit the setting
 to carry the task's authority. An explicit `[]` requests empty authority;
-connections still check whether they accept it.
+connections still check whether they accept it. Defining, starting, or editing
+a document refuses a command `authority` that no transition of its node
+targets, or that a connection from the node does not admit, so no task runs
+with it; core still checks each task's transition. `flow.decide` reports a
+refusal as `rejected`, naming the rule; the task stays ready and the node keeps
+its last result.
 
 Core checks every result and every package against its contract and every
 move against authority. A command's result and a human's decision go through
 every outgoing connection; if one refuses it, core rejects the whole
-submission. Commands retry under their task policy; human tasks remain ready
+submission. Commands retry under their task policy, except that output core
+refuses for its contract parks at once; human tasks remain ready
 for a corrected decision. Agents choose connections, authority transitions, and
 outbound object types with the node tools; see [Node tools](NODE_TOOLS.md).
 A run's contracts and authority tags are fixed when it starts: an edit that
@@ -410,9 +416,10 @@ Start with `"workspace":"path/to/directory"` instead of `message` to import
 an initial workspace. A command task executes in a private checkout and
 publishes its captured changes. The original directory is preserved. Without a
 workspace, the command runs in the workflow project and publishes stdout's
-exact bytes. Non-UTF-8 results require a `bytes` contract. Stdout containing a
-core package envelope must pass the task's granted-view check, which supplies
-its content dependencies; malformed or ungranted envelopes are refused.
+exact bytes. Non-UTF-8 output needs a `bytes` contract; a run keeps the
+contracts it started with, so a run without one parks such a command. Stdout
+that is a package envelope is always refused: only a workspace input grants a
+task a package view, and a task with one publishes its checkout, not stdout.
 Persistent agents use the selected node tools to open workspace packages in
 attempt checkouts, capture changes, and submit them. Their persistent session
 working directory is not automatically captured as graph output.
@@ -487,7 +494,8 @@ first attempt (1–100; 1 disables retries). The first wait is
 
 A task whose attempts run out is parked, as is one that retrying cannot help,
 such as a task that received two workspaces or a workspace that is not a
-directory, or an input core refuses to begin. A parked task stays pending, and
+directory, an input core refuses to begin, or output core refuses for its
+contract, like non-UTF-8 stdout under `text`. A parked task stays pending, and
 no attempt starts until the manager intervenes. `flow.status` lists failed
 tasks in `failures`:
 

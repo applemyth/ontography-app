@@ -166,6 +166,16 @@ impl DocumentEdge {
             .clone()
             .unwrap_or_else(|| edge_key(&self.from, &self.to))
     }
+
+    /// Whether work carrying exactly `tags` may pass, as core matches them.
+    fn admits(&self, tags: &BTreeSet<String>) -> bool {
+        let default = BTreeSet::from([AUTHORITY.to_owned()]);
+        let admitted = self.authority.as_ref().unwrap_or(&default);
+        match self.matching {
+            AuthorityMatchDeclaration::AnyOf => !admitted.is_disjoint(tags),
+            AuthorityMatchDeclaration::AllOf => admitted.is_subset(tags),
+        }
+    }
 }
 
 /// The key of the unnamed connection from `from` to `to`. Names cannot
@@ -224,13 +234,6 @@ impl Document {
             }
             if let Some(name) = &edge.name {
                 check_name("Connection", name)?;
-                // Node tools accept either name in `to`, so one must not
-                // shadow the other.
-                if names.contains(name.as_str()) {
-                    return Err(invalid(format!(
-                        "Connection name {name:?} is already a node's name"
-                    )));
-                }
             }
             if !keys.insert(edge.key()) {
                 return Err(invalid(match &edge.name {
@@ -264,6 +267,62 @@ impl Document {
         }
         document.edges.sort();
         Ok(document)
+    }
+
+    /// Node tools accept a node's or a connection's name in `to`, so a
+    /// connection named like a node would shadow it. Only a name that shadows
+    /// in `base` too is kept: documents from before this rule stay usable.
+    pub fn check_connection_names(&self, base: Option<&Document>) -> Result<()> {
+        let shadows = |document: &Document, name: &str| {
+            document.nodes.iter().any(|node| node.id == name)
+                && document
+                    .edges
+                    .iter()
+                    .any(|edge| edge.name.as_deref() == Some(name))
+        };
+        match self
+            .edges
+            .iter()
+            .filter_map(|edge| edge.name.as_deref())
+            .find(|name| shadows(self, name) && !base.is_some_and(|base| shadows(base, name)))
+        {
+            Some(name) => Err(invalid(format!(
+                "Connection name {name:?} is already a node's name"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Why core could admit nothing `node` sends with exactly `tags`: they
+    /// need a declared transition to them, and each connection from the node
+    /// must admit them.
+    pub fn check_output_authority(
+        &self,
+        node: &DocumentNode,
+        tags: &[String],
+    ) -> std::result::Result<(), String> {
+        if let Some(tag) = tags.iter().find(|tag| !is_name(tag)) {
+            return Err(format!(
+                "authority tag {tag:?} must use only letters, digits, '-' or '_'"
+            ));
+        }
+        let tags: BTreeSet<String> = tags.iter().cloned().collect();
+        if !node.transitions.iter().any(|rule| rule.to == tags) {
+            return Err(format!(
+                "authority {tags:?} needs a declared transition to it"
+            ));
+        }
+        match self
+            .edges
+            .iter()
+            .find(|edge| edge.from == node.id && !edge.admits(&tags))
+        {
+            Some(edge) => Err(format!(
+                "connection {:?} does not admit authority {tags:?}",
+                edge.key()
+            )),
+            None => Ok(()),
+        }
     }
 
     fn check_contract(&self, name: &str) -> Result<()> {
@@ -648,14 +707,18 @@ mod tests {
         bad.edges[0].to = "missing".into();
         assert!(bad.canonicalized().is_err());
         // A connection named like a node would shadow it in node tools' `to`.
+        // Only a new document is refused: one that already did still loads.
         for shadowed in ["write", "test"] {
             bad = original.clone();
             bad.edges[0].name = Some(shadowed.into());
-            let refused = bad.canonicalized().unwrap_err();
+            let refused = bad.check_connection_names(None).unwrap_err();
             assert!(
                 refused.message.contains("already a node's name"),
                 "{refused:?}"
             );
+            assert!(bad.check_connection_names(Some(&original)).is_err());
+            assert_eq!(bad.canonicalized().unwrap(), bad);
+            assert!(bad.check_connection_names(Some(&bad)).is_ok());
         }
         bad = original.clone();
         bad.nodes[0].config["typo"] = json!(true);

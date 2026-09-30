@@ -51,13 +51,19 @@ accepted. While an edit is pending, ownership checks use
 the binding for the identity present in core; a missing binding refuses the move.
 The workflow and kernel are loaded once per move, including joined submissions.
 If a pending settings edit changes ownership while retaining the core identity,
-moves at that node wait for the edit to finish. A reference that is both a
-document name and a different live core identity is refused as ambiguous.
+moves at that node are refused with `pending_edit` until the edit finishes.
+Moves refuse as ambiguous a reference that is both a document name, current or
+pending, and a different live core identity, whether or not that edit has
+applied. Inspections take a live core identity as itself without reading the
+workflow; core reports unknown nodes.
 
 Commands choose output authority with `config.authority`, and human decisions
 with `flow.decide.authority`. Omission carries input authority; an explicit list,
-including `[]`, requests a declared transition which core checks. Command stdout
-is published as exact bytes; its readable display is separate from that payload.
+including `[]`, requests a declared transition to exactly those tags, which core
+checks for each task. Defining, starting, or editing a document refuses a command
+authority that no transition of its node targets or that a connection from the
+node does not admit. Command stdout is published as exact bytes; its readable
+display is separate from that payload.
 
 A workflow edit is one explicit core `GraphEdit`: it adds the target's nodes
 and connections that core lacks and removes those the target lacks. Workflow

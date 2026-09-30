@@ -14,8 +14,24 @@ async fn call(service: &Service, operation: &str, args: Value) -> Value {
         .unwrap_or_else(|error| panic!("{operation}: {error}"))
 }
 
+/// No server runs here, so the endpoint directory `Paths::initialize` makes
+/// under /tmp is removed at once instead of outliving the test.
 fn service(directory: &tempfile::TempDir) -> Service {
-    Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap()
+    let paths = Paths::initialize(directory.path().join("data")).unwrap();
+    std::fs::remove_dir(paths.socket.parent().unwrap()).unwrap();
+    Service::new(paths).unwrap()
+}
+
+async fn revision(service: &Service, id: &str) -> u64 {
+    let handle = service.run(id).await.unwrap();
+    handle
+        .lock()
+        .await
+        .live()
+        .unwrap()
+        .session
+        .frontier()
+        .revision()
 }
 
 async fn start(service: &Service, project: &std::path::Path, document: &Value) -> String {
@@ -267,17 +283,7 @@ async fn missing_bindings_and_unknown_names_never_authorize_core_moves() {
     .await
     .unwrap_err();
     assert_eq!(error.code, "rejected");
-    assert_eq!(
-        handle
-            .lock()
-            .await
-            .live()
-            .unwrap()
-            .session
-            .frontier()
-            .revision(),
-        0
-    );
+    assert_eq!(revision(&service, &id).await, 0);
     service.shutdown().await.unwrap();
 }
 
@@ -329,20 +335,6 @@ async fn names_colliding_with_live_core_identities_cannot_redirect_moves() {
     commit(&service, &id, &replaced).await;
     let node_id = &replaced.identities.nodes["client"];
     let edge_id = &replaced.identities.edges["route"];
-    document["nodes"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"id":node_id,"component":"external","root":["workflow"]}));
-    document["edges"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"from":"client","to":node_id,"name":edge_id}));
-    let added = preview(&service, &id, &document).await;
-    commit(&service, &id, &added).await;
-    let error = tools::dispatch(&service, "workflow.submit", &root(&id, node_id, json!([])))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, "ambiguous_reference");
     call(
         &service,
         "workflow.submit",
@@ -360,14 +352,40 @@ async fn names_colliding_with_live_core_identities_cannot_redirect_moves() {
     )
     .await;
     let package = &outbound["packages"][0]["package_id"];
-    let error = tools::dispatch(
-        &service,
-        "workflow.transfer",
-        &json!({"run_id":id,"package_id":package,"edge_id":edge_id}),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code, "ambiguous_reference");
+    document["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":node_id,"component":"external","root":["workflow"]}));
+    document["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"from":"client","to":node_id,"name":edge_id}));
+    let handle = service.run(&id).await.unwrap();
+    let mut saved = runtime::load(&*handle.lock().await).unwrap();
+    let added = preview(&service, &id, &document).await;
+    // A saved edit's names count before core applies it, as when it stops
+    // for a retirement preview, and after.
+    saved.pending = Some(added.clone());
+    edit::store(&runtime::state_path(&*handle.lock().await), &saved).unwrap();
+    for applied in [false, true] {
+        if applied {
+            commit(&service, &id, &added).await;
+        }
+        let before = revision(&service, &id).await;
+        let error = tools::dispatch(&service, "workflow.submit", &root(&id, node_id, json!([])))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "ambiguous_reference", "{error}");
+        let error = tools::dispatch(
+            &service,
+            "workflow.transfer",
+            &json!({"run_id":id,"package_id":package,"edge_id":edge_id}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "ambiguous_reference", "{error}");
+        assert_eq!(revision(&service, &id).await, before);
+    }
     call(
         &service,
         "workflow.transfer",
@@ -390,5 +408,134 @@ async fn names_colliding_with_live_core_identities_cannot_redirect_moves() {
         .await["packages"],
         json!([])
     );
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inspections_resolve_exact_identities_without_the_workflow_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(&directory);
+    let mut document = json!({"name":"observed","entry":"client","nodes":[
+        {"id":"client","component":"external"},{"id":"sink","component":"external"}],
+        "edges":[{"from":"client","to":"sink","name":"route"}]});
+    let id = start(&service, directory.path(), &document).await;
+    document["nodes"][1]["join"] = json!("all");
+    let plan = preview(&service, &id, &document).await;
+    commit(&service, &id, &plan).await;
+    call(
+        &service,
+        "workflow.submit",
+        root(
+            &id,
+            "client",
+            json!([{"edge_id":"route","payload":"hello"}]),
+        ),
+    )
+    .await;
+    // Core reports a node it doesn't know, as before names were accepted.
+    for operation in ["inspect.frontier", "inspect.trigger"] {
+        let error = tools::dispatch(
+            &service,
+            operation,
+            &json!({"run_id":id,"node_id":"unknown"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "core_error", "{operation}: {error}");
+    }
+    // Only a name needs the workflow file.
+    let handle = service.run(&id).await.unwrap();
+    std::fs::write(runtime::state_path(&*handle.lock().await), "damaged").unwrap();
+    let (sink, route) = (
+        &plan.identities.nodes["sink"],
+        &plan.identities.edges["route"],
+    );
+    let received = call(
+        &service,
+        "inspect.frontier",
+        json!({"run_id":id,"node_id":sink}),
+    )
+    .await;
+    assert_eq!(received["packages"].as_array().unwrap().len(), 1);
+    let trigger = call(
+        &service,
+        "inspect.trigger",
+        json!({"run_id":id,"node_id":sink,"edge_id":route}),
+    )
+    .await;
+    assert_eq!(trigger["packages"], received["packages"]);
+    let error = tools::dispatch(
+        &service,
+        "inspect.trigger",
+        &json!({"run_id":id,"node_id":"sink"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "invalid_arguments", "{error}");
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_move_consumes_a_joined_trigger_named_after_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(&directory);
+    let mut document = json!({"name":"joined","entry":"left","nodes":[
+        {"id":"left","component":"external"},
+        {"id":"right","component":"external","root":["workflow"]},
+        {"id":"joiner","component":"external"},{"id":"sink","component":"external"}],
+        "edges":[{"from":"left","to":"joiner"},{"from":"right","to":"joiner"},
+        {"from":"joiner","to":"sink"}]});
+    let id = start(&service, directory.path(), &document).await;
+    // Joining replaces the node and all its connections.
+    document["nodes"][2]["join"] = json!("all");
+    let plan = preview(&service, &id, &document).await;
+    assert_ne!(plan.identities.nodes["joiner"], "joiner");
+    commit(&service, &id, &plan).await;
+    for source in ["left", "right"] {
+        let edge = format!("{source}:joiner");
+        call(
+            &service,
+            "workflow.submit",
+            root(&id, source, json!([{"edge_id":edge,"payload":source}])),
+        )
+        .await;
+    }
+    let trigger = call(
+        &service,
+        "inspect.trigger",
+        json!({"run_id":id,"node_id":"joiner"}),
+    )
+    .await;
+    let packages: Vec<_> = trigger["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| package["package_id"].clone())
+        .collect();
+    assert_eq!(packages.len(), 2);
+    // One move checks every input's holder and resolves its output by name.
+    let joined = call(
+        &service,
+        "workflow.submit",
+        json!({"run_id":id,"trigger":{"kind":"packages","package_ids":packages},
+        "result":"joined","emissions":[{"edge_id":"joiner:sink","payload":"joined"}]}),
+    )
+    .await;
+    for package in &packages {
+        let history = call(
+            &service,
+            "inspect.package",
+            json!({"run_id":id,"package_id":package}),
+        )
+        .await;
+        assert_eq!(history["consumer"], joined["activation_id"]);
+    }
+    let received = call(
+        &service,
+        "inspect.frontier",
+        json!({"run_id":id,"node_id":"sink"}),
+    )
+    .await;
+    assert_eq!(received["packages"][0]["producer"], joined["activation_id"]);
     service.shutdown().await.unwrap();
 }
