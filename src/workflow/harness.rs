@@ -29,13 +29,23 @@ use tokio::{
 };
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
-/// The class of a failure retrying cannot help: core refused the output for
-/// its contract, and the same command would print output of the same form.
+/// The class of a failure retrying cannot help: core refused the output itself,
+/// for its contract or as a package envelope, and the same command would print
+/// output of the same form.
 const REFUSED: &str = "workflow_refused";
 type WorkerResult<T> = std::result::Result<T, ExecutionFailure>;
 
 fn failure(error: impl std::fmt::Display) -> ExecutionFailure {
     ExecutionFailure::new("workflow_worker", error.to_string())
+}
+
+/// Core denies stdout that is a forged or malformed package envelope. Its
+/// other errors, such as storage faults, may pass on a retry.
+fn output_failure(error: ContextError) -> ExecutionFailure {
+    match error {
+        ContextError::Denied(_) => ExecutionFailure::new(REFUSED, error.to_string()),
+        error => failure(error),
+    }
 }
 
 /// Where a task worker runs: the project its commands work in by default, its
@@ -441,7 +451,7 @@ async fn perform(
         let contents = invocation
             .validate_worker_output(&payload)
             .await
-            .map_err(failure)?;
+            .map_err(output_failure)?;
         (payload, contents)
     };
     let result = WorkflowPayload::read(&encoded).map_err(failure)?;
@@ -661,6 +671,18 @@ mod tests {
             .await
             .unwrap();
         (worker, ledger)
+    }
+
+    #[test]
+    fn only_denied_stdout_skips_retries() {
+        let denied = output_failure(ContextError::Denied("forged envelope".into()));
+        assert_eq!(denied.class(), REFUSED);
+        for transient in [
+            ContextError::Storage("disk full".into()),
+            ContextError::Closed,
+        ] {
+            assert_ne!(output_failure(transient).class(), REFUSED);
+        }
     }
 
     #[tokio::test]

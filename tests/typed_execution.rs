@@ -363,8 +363,7 @@ async fn command_stdout_cannot_publish_a_package_outside_its_input_grants() {
         "contracts":{"tree":{"object_type":"Tree","validator":"workspace"}},
         "nodes":[{"id":"client","component":"external"},
             {"id":"worker","component":"command","result":"tree",
-                "config":{"argv":["/bin/cat",directory.path().join("envelope.json")]},
-                "retry":{"max_attempts":1}},
+                "config":{"argv":["/bin/cat",directory.path().join("envelope.json")]}},
             {"id":"sink","component":"inbox"}],
         "edges":[{"from":"client","to":"worker"},{"from":"worker","to":"sink"}]});
     let run = start(&service, directory.path(), document).await;
@@ -388,7 +387,9 @@ async fn command_stdout_cannot_publish_a_package_outside_its_input_grants() {
         !status["failures"].as_array().unwrap().is_empty()
     })
     .await;
+    // The same command would print the same envelope, so retries cannot help.
     assert_eq!(status["failures"][0]["state"], "parked");
+    assert_eq!(status["failures"][0]["attempts"], 1);
     assert!(
         status["failures"][0]["error"]
             .as_str()
@@ -454,19 +455,29 @@ async fn command_stdout_cannot_publish_a_package_outside_its_input_grants() {
 async fn malformed_command_stdout_envelopes_are_refused_even_by_bytes_contracts() {
     let directory = tempfile::tempdir().unwrap();
     let service = service(directory.path());
-    let document = json!({"name":"malformed","entry":"worker",
+    let document = json!({"name":"malformed","entry":"client",
         "contracts":{"raw":{"object_type":"Bytes","validator":"bytes"}},
-        "nodes":[{"id":"worker","component":"command","result":"raw",
-            "config":{"argv":["/usr/bin/printf","%s","{\"ontography_package\":7}"]},
-            "retry":{"max_attempts":1}},
+        "nodes":[{"id":"client","component":"external"},
+            {"id":"worker","component":"command","result":"raw",
+            "config":{"argv":["/usr/bin/printf","%s","{\"ontography_package\":7}"]}},
             {"id":"sink","component":"inbox"}],
-        "edges":[{"from":"worker","to":"sink"}]});
+        "edges":[{"from":"client","to":"worker"},{"from":"worker","to":"sink"}]});
     let run = start(&service, directory.path(), document).await;
+    call(
+        &service,
+        "workflow.submit",
+        json!({"run_id":run,
+        "trigger":{"kind":"root","node_id":"client","authority":["workflow"]},
+        "result":"go","emissions":[{"edge_id":"client:worker","payload":"go"}]}),
+    )
+    .await;
     let status = wait_status(&service, &run, |status| {
         !status["failures"].as_array().unwrap().is_empty()
     })
     .await;
+    // Malformed output is the command's own, so retries cannot help.
     assert_eq!(status["failures"][0]["state"], "parked");
+    assert_eq!(status["failures"][0]["attempts"], 1);
     assert!(
         status["failures"][0]["error"]
             .as_str()
@@ -493,15 +504,12 @@ async fn malformed_command_stdout_envelopes_are_refused_even_by_bytes_contracts(
                 && event.source["operation"] == "worker_output"),
         "{events:?}"
     );
-    assert!(
-        session
-            .try_snapshot()
-            .await
-            .unwrap()
-            .state()
-            .activations()
-            .is_empty()
-    );
+    // Nothing is published, and the input waits for the manager.
+    assert!(invocation.activation_id.is_none());
+    for (node, pending) in [("worker", 1), ("sink", 0)] {
+        let page = session.pending_page_at(node, None, 10).await.unwrap();
+        assert_eq!(page.packages().len(), pending, "{node}");
+    }
     service.shutdown().await.unwrap();
 }
 
