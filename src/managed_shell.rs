@@ -39,6 +39,9 @@ use tokio::{
     sync::watch,
 };
 
+/// How long Pi has to stop its own tool commands once asked to terminate.
+const PI_STOP_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PiCommand {
     program: PathBuf,
@@ -731,10 +734,26 @@ pub async fn run_pi(paths: &Paths, session_id: &str, generation: &str) -> Result
         match receive(&mut read).await? {Some(LeaseResponse::Finished)=>Ok(()),Some(LeaseResponse::Error{error})=>Err(error),_=>Err(AppError::new("launcher_disconnected","session server did not release Pi lease"))}
     }.await;
     if result.is_err() {
-        let _ = child.kill().await;
+        // Pi stops the tool commands it runs in sessions of their own when
+        // asked to terminate; SIGKILL alone would leave them running.
+        if let Some(pid) = child.id() {
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+            if tokio::time::timeout(PI_STOP_GRACE, child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+            }
+        }
         let _ = child.wait().await;
     }
     reset_terminal(saved);
+    if result.is_err() && getpgrp() == Pid::this() {
+        // The lease is lost, and a server that died cannot end this job. End
+        // the rest of Pi's process group as the server would; this launcher
+        // leads it, so it goes last.
+        let _ = killpg(Pid::this(), Signal::SIGKILL);
+    }
     result
 }
 
