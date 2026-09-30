@@ -220,14 +220,15 @@ impl ManagedShell {
         });
         let weak = Arc::downgrade(&shell);
         let mut stopping = shell.stop.subscribe();
+        let mut errors = crate::listen::AcceptLog::new(&shell.socket, None);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _=stopping.changed()=>break,
-                    accepted=listener.accept()=>match accepted {Ok((stream,_))=>{
+                    (stream,_)=crate::listen::next_connection(||listener.accept(),&mut errors)=>{
                         let weak=weak.clone();let service=service.clone();
                         tokio::spawn(async move {if let Some(shell)=weak.upgrade(){shell.serve(service,stream).await;}});
-                    },Err(_)=>break}
+                    }
                 }
             }
         });

@@ -726,15 +726,15 @@ impl Terminal {
             shutdown,
         });
         let weak = Arc::downgrade(&terminal);
+        let mut errors = crate::listen::AcceptLog::new(&terminal.socket.path, None);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
-                    accepted = listener.accept() => match accepted {
-                        Ok((stream, _)) => if let Some(terminal) = weak.upgrade() {
+                    (stream, _) = crate::listen::next_connection(|| listener.accept(), &mut errors) => {
+                        if let Some(terminal) = weak.upgrade() {
                             tokio::spawn(async move { let _ = terminal.accept(stream).await; });
-                        } else { break; },
-                        Err(_) => break,
+                        } else { break; }
                     }
                 }
             }

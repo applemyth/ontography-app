@@ -6,6 +6,7 @@ pub mod declarations;
 pub mod environment;
 pub mod error;
 pub mod launcher;
+mod listen;
 pub mod logging;
 pub mod managed_shell;
 pub mod migration;
