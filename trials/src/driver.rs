@@ -1496,7 +1496,7 @@ impl Driver {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        let history = match History::parse(&export) {
+        let history = match History::parse(&export, &Default::default()) {
             Ok(history) => history,
             Err(error) => {
                 self.problems.push(format!(
