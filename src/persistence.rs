@@ -148,7 +148,30 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         .parent()
         .ok_or_else(|| AppError::invalid("metadata path has no parent"))?;
     fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    write_via(parent, parent, path, value)
+}
+
+/// Publish JSON atomically at `path`, a file the server does not own, such as
+/// an export's destination. The temporary is written in `staging`, which the
+/// server sweeps for leftovers as it starts, so a crash leaves nothing beside
+/// `path`. It cannot be moved across filesystems, so on another one it is
+/// written beside `path`, as [`write_json`] does.
+pub fn write_json_outside(staging: &Path, path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::invalid("destination path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let directory = if fs::metadata(staging)?.dev() == fs::metadata(parent)?.dev() {
+        staging
+    } else {
+        parent
+    };
+    write_via(directory, parent, path, value)
+}
+
+/// Writes a temporary in `directory` and moves it to `path`, in `parent`.
+fn write_via(directory: &Path, parent: &Path, path: &Path, value: &impl Serialize) -> Result<()> {
+    let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -166,4 +189,34 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn temporaries(directory: &Path) -> Vec<String> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn a_file_written_outside_replaces_its_destination_and_leaves_no_temporary() {
+        let staging = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("exports/history.json");
+        for version in [1, 2] {
+            write_json_outside(staging.path(), &path, &json!({"version":version})).unwrap();
+            assert_eq!(
+                read_json::<Value>(&path).unwrap(),
+                json!({"version":version})
+            );
+        }
+        assert_eq!(temporaries(staging.path()), Vec::<String>::new());
+        assert_eq!(temporaries(path.parent().unwrap()), Vec::<String>::new());
+    }
 }

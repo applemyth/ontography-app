@@ -706,7 +706,9 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
                 .await
                 .map_err(AppError::core)?;
             let value = snapshot_view(run, &snapshot)?;
-            persistence::write_json(&path, &value)?;
+            // Staged in the run's directory, which a starting server sweeps,
+            // so a crash leaves no temporary at the caller's path.
+            persistence::write_json_outside(&run.directory, &path, &value)?;
             Ok(
                 json!({"path":path,"revision":snapshot.revision().to_string(),"kind":"workflow_snapshot","artifact_bytes_included":false,"context_records_included":false}),
             )
