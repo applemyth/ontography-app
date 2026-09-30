@@ -119,8 +119,10 @@ The judges, from docs/SESSIONS.md and docs/SESSION_DESIGN.md:
 - **Graph**: moves the server accepted are in history once after crashes and
   restarts, and the run is active, suspended or closed with its session.
 
-A trial with problems keeps `trials/runs/sessions-<seed>`, with a log of
-each session's steps (`s0.log`, …).
+A seed fixes the scripts and how far the play gets before each crash; how
+the sessions interleave is up to the machine. A trial with problems keeps
+`trials/runs/sessions-<seed>`, with a log of each session's steps (`s0.log`,
+…) and what each crash struck (`crash-1.txt`, …).
 
 ## Not yet played
 

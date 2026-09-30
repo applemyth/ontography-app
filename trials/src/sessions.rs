@@ -4,7 +4,9 @@
 //! their terminal client (attach.rs). Chaos kills the server while shells and
 //! Pi are live, and the sessions resume after the restart. One session binds
 //! a graph and plays moves at it. At the end the server stops in order with
-//! sessions still live, restarts, and stops again.
+//! sessions still live, restarts, and stops again. A seed fixes the scripts
+//! and how far the play gets before each crash; how the sessions interleave
+//! is up to the machine.
 //!
 //! Judged from docs/SESSIONS.md and docs/SESSION_DESIGN.md:
 //! - Session states and `session.list` agree with each script's model, and so
@@ -57,7 +59,7 @@ pub struct Args {
     /// Rounds of each session's script.
     #[arg(long, default_value_t = 2)]
     pub rounds: usize,
-    /// Server crashes, at moments fixed by the seed.
+    /// Server crashes, each once the play has gone as far as the seed says.
     #[arg(long, default_value_t = 1)]
     pub crashes: usize,
 }
