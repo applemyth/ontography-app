@@ -5,7 +5,8 @@
 //! - A command runs once per task with its inputs, in package order, joined
 //!   by blank lines on stdin, and its result goes to every outgoing
 //!   connection. A failed task retries up to its node's `max_attempts`, then
-//!   parks; a person's decision goes to every outgoing connection too.
+//!   parks, except that output its contract refuses parks at once; a
+//!   person's decision goes to every outgoing connection too.
 //! - An agent's submission without outputs goes to every successor; with
 //!   outputs, exactly those are sent, each along the connection it names.
 //! - External nodes do only what their players did; inboxes hold work.
@@ -132,7 +133,13 @@ struct Program {
 fn program(kind: &Kind) -> Option<Program> {
     match kind {
         Kind::Worker(worker) => Some(Program {
-            attempts: worker.attempts,
+            // Output core refuses for its contract, such as non-UTF-8 stdout
+            // under `text`, parks at once; other failures retry.
+            attempts: if worker.role == Role::Binary && !worker.bytes {
+                1
+            } else {
+                worker.attempts
+            },
             all: worker.all,
             succeeds: worker.role.succeeds(worker.bytes),
             flaky: worker.role == Role::Flaky,
