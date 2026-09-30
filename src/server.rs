@@ -21,7 +21,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -39,7 +39,8 @@ pub const IDLE_LIMIT: Duration = Duration::from_secs(30);
 /// directory, such as when a command arrives just as an idle server stops.
 const HANDOVER: Duration = Duration::from_secs(5);
 
-type Completion = Option<Arc<Result<Value>>>;
+/// An accepted operation's outcome, numbered in the order outcomes arrive.
+type Completion = Option<(u64, Arc<Result<Value>>)>;
 struct Receipt {
     operation: String,
     app_session_id: Option<String>,
@@ -51,6 +52,8 @@ pub struct Server {
     pub service: Arc<Service>,
     managers: crate::session_runtime::Managers,
     requests: Mutex<BTreeMap<(String, String), Receipt>>,
+    /// How many outcomes have arrived; numbers the next.
+    completions: AtomicU64,
     admission: RwLock<()>,
     stopping: AtomicBool,
     manager_monitor_started: AtomicBool,
@@ -65,6 +68,7 @@ impl Server {
             service: Arc::new(Service::new(paths)?),
             managers: crate::session_runtime::Managers::default(),
             requests: Mutex::new(BTreeMap::new()),
+            completions: AtomicU64::new(0),
             admission: RwLock::new(()),
             stopping: AtomicBool::new(false),
             manager_monitor_started: AtomicBool::new(false),
@@ -105,7 +109,7 @@ impl Server {
             }
             return Ok(match receipt.result.borrow().as_ref() {
                 None => json!({"state":"running","operation":receipt.operation}),
-                Some(result) => match result.as_ref() {
+                Some((_, result)) => match result.as_ref() {
                     Ok(value) => {
                         json!({"state":"completed","operation":receipt.operation,"result":value})
                     }
@@ -184,10 +188,13 @@ impl Server {
                 ));
             }
             if requests.len() >= 128 {
+                // Forget the outcome its client has had longest to read: one
+                // retrying a reply it just lost still finds its receipt.
                 let completed = requests
                     .iter()
-                    .find(|(_, r)| r.result.borrow().is_some())
-                    .map(|(key, _)| key.clone());
+                    .filter_map(|(key, r)| Some((r.result.borrow().as_ref()?.0, key)))
+                    .min_by_key(|(order, _)| *order)
+                    .map(|(_, key)| key.clone());
                 if let Some(key) = completed {
                     requests.remove(&key);
                 } else {
@@ -236,13 +243,14 @@ impl Server {
                         "operation panicked; inspect run state before further mutations",
                     ))
                 });
-                sender.send_replace(Some(Arc::new(bounded(result))));
+                let order = server.completions.fetch_add(1, Ordering::AcqRel);
+                sender.send_replace(Some((order, Arc::new(bounded(result)))));
             });
             receiver
         };
         drop(requests);
         loop {
-            if let Some(value) = result.borrow().as_ref() {
+            if let Some((_, value)) = result.borrow().as_ref() {
                 return value.as_ref().clone();
             }
             result.changed().await.map_err(|_| {
