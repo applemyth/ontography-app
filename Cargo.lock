@@ -2835,6 +2835,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ontography-trials"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix 0.29.0",
+ "ontography-app",
+ "ontography-core",
+ "rand 0.9.5",
+ "rand_chacha",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
