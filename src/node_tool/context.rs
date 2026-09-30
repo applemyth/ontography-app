@@ -12,12 +12,13 @@ use crate::{AppError, Result, views};
 use futures_util::future::join_all;
 use ontography::{
     ContentDigest, ContentId, ContentStore, ContextError, ExecutionContext, InvocationHandle,
-    Kernel, PackageGrant, PackageId, PackageMemberGrant, Payload, SessionHandle, SessionStatus,
+    Kernel, PackageGrant, PackageId, Payload, SessionHandle, SessionStatus,
     content::StagedImports,
+    package::{PackageStore, ResolvedEntry, ResolvedPackage},
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
@@ -130,8 +131,6 @@ pub(super) struct Attempt {
     /// The root input's handle and digest, when core triggered the attempt
     /// with bytes rather than packages.
     pub(super) root_input: Option<(String, ContentDigest)>,
-    /// Member grants by handle; a view can hold many thousands of members.
-    members: HashMap<String, usize>,
     /// Replies recorded for this attempt but not yet marked sent.
     pub(super) unsent: Arc<Unsent>,
     state: tokio::sync::Mutex<AttemptState>,
@@ -185,6 +184,9 @@ pub(super) struct AttemptState {
     staging: Option<StagedImports>,
     pub(super) outputs: BTreeMap<String, OutputRef>,
     pub(super) workspaces: BTreeMap<String, AttemptCheckout>,
+    /// Input views by owner, resolved when first listed. Core keeps its own
+    /// resolved copies private to the invocation.
+    views: BTreeMap<String, ResolvedPackage>,
     next_handle: u64,
 }
 
@@ -213,14 +215,36 @@ impl AttemptState {
         self.next_handle += 1;
         format!("{prefix}_{}", self.next_handle)
     }
+
+    /// The immediate children of a directory member of `attempt`'s inputs.
+    pub(super) async fn children(
+        &mut self,
+        attempt: &Attempt,
+        handle: &str,
+    ) -> Result<Option<Vec<ResolvedEntry>>> {
+        let Some(member) = attempt.member(handle) else {
+            return Ok(None);
+        };
+        // A member handle is its view's owner, then `/<path>` below the root.
+        let owner = handle.split_once('/').map_or(handle, |(owner, _)| owner);
+        if !self.views.contains_key(owner) {
+            let Some(grant) = attempt.invocation.views().iter().find(|v| v.owner == owner) else {
+                return Ok(None);
+            };
+            let view = PackageStore::new(self.staging())
+                .resolve(grant.root)
+                .await
+                .map_err(AppError::core)?;
+            self.views.insert(owner.to_owned(), view);
+        }
+        Ok(self.views[owner].children(&member.path))
+    }
 }
 
 impl Attempt {
     /// A member of one of this attempt's input views.
-    pub(super) fn member(&self, handle: &str) -> Option<&PackageMemberGrant> {
-        self.members
-            .get(handle)
-            .map(|&index| &self.invocation.members()[index])
+    pub(super) fn member(&self, handle: &str) -> Option<ResolvedEntry> {
+        self.invocation.member(handle)
     }
 
     /// One of this attempt's input packages.
@@ -455,12 +479,6 @@ impl NodeToolContext {
                 ))
             })
             .transpose()?;
-        let members = invocation
-            .members()
-            .iter()
-            .enumerate()
-            .map(|(index, member)| (member.handle.clone(), index))
-            .collect();
         let attempt = Arc::new(Attempt {
             id: invocation.id().to_string(),
             invocation,
@@ -468,13 +486,13 @@ impl NodeToolContext {
             node,
             definition,
             root_input,
-            members,
             unsent: Arc::default(),
             state: tokio::sync::Mutex::new(AttemptState {
                 ended: false,
                 staging: Some(staging),
                 outputs: BTreeMap::new(),
                 workspaces: BTreeMap::new(),
+                views: BTreeMap::new(),
                 next_handle: 0,
             }),
         });

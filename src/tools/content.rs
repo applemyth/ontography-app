@@ -158,7 +158,7 @@ pub(crate) fn resolved_view(
     offset: usize,
     limit: usize,
 ) -> Result<Value> {
-    let mut result = page(package.entries(), offset, limit)?;
+    let mut result = page(&package.entries(), offset, limit)?;
     result["root"] = json!(package.root());
     result["dependency_count"] = json!(package.dependencies().len());
     Ok(result)

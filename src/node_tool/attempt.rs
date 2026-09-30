@@ -507,13 +507,16 @@ async fn describe_inputs(
         inputs.push(json!({"handle": handle, "from": null, "workspace": false, "bytes": bytes}));
     }
     // A root input naming a package appears as the root member of its view.
-    for member in attempt
+    for view in attempt
         .invocation
-        .members()
+        .views()
         .iter()
-        .filter(|member| member.path.is_empty() && attempt.grant(&member.handle).is_none())
+        .filter(|view| attempt.grant(&view.owner).is_none())
     {
-        let mut input = json!({"handle": member.handle, "from": null,
+        let Some(member) = attempt.member(&view.owner) else {
+            continue;
+        };
+        let mut input = json!({"handle": view.owner, "from": null,
             "workspace": matches!(member.kind, ResolvedEntryKind::Directory)});
         if let ResolvedEntryKind::File { content, .. } = &member.kind {
             input["bytes"] = json!(content.size());

@@ -70,7 +70,8 @@ Beginning attempts, transfers, and retirements run one at a time, so a package
 is never both sent and retired.
 
 Handles are named for what they identify: `attempt_id`, `task_id`, `work_id`,
-`workspace_id`, and `output_id`, plus core's input and member `handle`s.
+`workspace_id`, and `output_id`, plus core's input and member `handle`s. A
+member's handle is its input's handle, then `/` and its path inside that input.
 Listings return `next_after` to continue the same listing after its last entry;
 entries added or taken between pages may be missed. Replies of the first five tools carry a
 `version`; pass it to `wait_for_change` as `after`, and the wait ends at once

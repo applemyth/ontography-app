@@ -31,7 +31,7 @@ use thiserror::Error;
 use ontography::content::Hash;
 use ontography::content::{ContentError, ContentId, ContentStore, StagedImports};
 use ontography::package::{
-    PackageDocument, PackageError, PackageStore, ResolvedEntryKind, ResolvedPackage, descendants,
+    PackageDocument, PackageError, PackageStore, ResolvedEntryKind, ResolvedPackage,
 };
 
 /// A filesystem operation or package validation failure.
@@ -336,11 +336,7 @@ impl WorkspaceStore {
         Ok(package)
     }
     fn validate_view(&self, package: &ResolvedPackage) -> Result<()> {
-        if !package
-            .entries()
-            .iter()
-            .any(|e| e.path.is_empty() && e.kind == ResolvedEntryKind::Directory)
-        {
+        if package.root_entry().kind != ResolvedEntryKind::Directory {
             return Err(WorkspaceError::Invalid(
                 "filesystem package root must be a collection or directory changes view".into(),
             ));
@@ -462,10 +458,24 @@ impl WorkspaceStore {
 fn entry_map(package: &ResolvedPackage) -> BTreeMap<String, ResolvedEntryKind> {
     package
         .entries()
-        .iter()
+        .into_iter()
         .filter(|e| !e.path.is_empty())
-        .map(|e| (e.path.clone(), e.kind.clone()))
+        .map(|e| (e.path, e.kind))
         .collect()
+}
+
+/// Canonical descendants in path order, excluding the named root itself.
+fn descendants<'a, T>(
+    tree: &'a BTreeMap<String, T>,
+    root: &str,
+) -> std::collections::btree_map::Range<'a, String, T> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    // '/' is immediately before '0', so the upper bound excludes every neighbor.
+    tree.range(if root.is_empty() {
+        (Excluded(String::new()), Unbounded)
+    } else {
+        (Included(format!("{root}/")), Excluded(format!("{root}0")))
+    })
 }
 
 fn tree_difference(

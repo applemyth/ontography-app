@@ -483,10 +483,11 @@ async fn open_workspace(
     store: &WorkspaceStore,
     root: ContentId,
 ) -> WorkerResult<(AttemptCheckout, u64)> {
-    let Some(input) = invocation.members().iter().find(|member| {
-        member.path.is_empty()
-            && matches!(member.kind, ResolvedEntryKind::Directory)
-            && member.package == root
+    let Some(input) = invocation.views().iter().find(|view| {
+        view.root == root
+            && invocation
+                .member(&view.owner)
+                .is_some_and(|member| matches!(member.kind, ResolvedEntryKind::Directory))
     }) else {
         return Err(failure(
             "The workspace is not a directory the task received",
@@ -499,7 +500,7 @@ async fn open_workspace(
     // The command is given the checkout as its working directory, not these
     // bytes; the receipt is marked sent when the command starts in it.
     let mut exposure = checkout.exposure();
-    exposure["handle"] = json!(input.handle);
+    exposure["handle"] = json!(input.owner);
     let receipt = invocation
         .record_tool_response(
             "workspace_exposure",
@@ -1142,11 +1143,7 @@ mod tests {
             .resolve(envelope.ontography_package)
             .await
             .unwrap();
-        let file = captured
-            .entries()
-            .iter()
-            .find(|entry| entry.path == "file.txt")
-            .unwrap();
+        let file = captured.entry("file.txt").unwrap();
         let ontography::ResolvedEntryKind::File { content: id, .. } = file.kind else {
             panic!("expected file");
         };

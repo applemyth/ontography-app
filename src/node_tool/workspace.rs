@@ -113,7 +113,7 @@ impl Tool for CaptureWorkspace {
                 let changed = root != workspace.base();
                 let output = state.handle("out");
                 let reply = json!({"output_id": output, "kind": "directory",
-                    "entries": capture.package().entries().len().saturating_sub(1),
+                    "entries": capture.package().entry_count().saturating_sub(1),
                     "changed": changed});
                 state.outputs.insert(
                     output,

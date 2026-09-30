@@ -144,14 +144,15 @@ pub async fn export(run: &ManagedRun, payload: WorkflowPayload, path: &Path) -> 
                 .await
                 .map_err(AppError::core)?;
             let mut staging = Staging::new(&parent, true)?;
-            for entry in package.entries() {
+            let entries = package.entries();
+            for entry in &entries {
                 if !entry.path.is_empty() && matches!(entry.kind, ResolvedEntryKind::Directory) {
                     let directory = entry_path(&staging.path, &entry.path)?;
                     fs::create_dir(&directory)?;
                     fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
                 }
             }
-            for entry in package.entries() {
+            for entry in &entries {
                 if let ResolvedEntryKind::File {
                     content: id,
                     executable,
@@ -170,7 +171,7 @@ pub async fn export(run: &ManagedRun, payload: WorkflowPayload, path: &Path) -> 
                 }
             }
             // Create links last; no later export write can traverse one.
-            for entry in package.entries() {
+            for entry in &entries {
                 if let ResolvedEntryKind::Symlink { target } = &entry.kind {
                     symlink(target, entry_path(&staging.path, &entry.path)?)?;
                 }

@@ -1813,3 +1813,38 @@ async fn a_package_sent_and_retired_at_once_is_never_both() {
     }
     Arc::try_unwrap(fixture).ok().unwrap().stop().await;
 }
+
+/// A collection too large to list is refused before core records a reply;
+/// smaller collections in the same input still list.
+#[tokio::test]
+async fn collections_of_more_than_1000_entries_are_refused() {
+    let fixture = Fixture::new(document(json!({})), "worker", None).await;
+    let big = (0..=1000)
+        .map(|i| format!("big/{i}.txt"))
+        .collect::<Vec<_>>();
+    let mut entries = big
+        .iter()
+        .map(|path| (path.as_str(), ""))
+        .collect::<Vec<_>>();
+    entries.push(("small/a.txt", "a"));
+    deliver_workspace(&fixture, &entries).await;
+    let begun = begin(&fixture).await;
+    let list = |handle: &Value| json!({"attempt_id": begun["attempt_id"], "handle": handle});
+    let root = fixture
+        .ok("list_package", list(&begun["inputs"][0]["handle"]))
+        .await;
+    let member = |path: &str| {
+        root["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["path"] == path)
+            .unwrap()["handle"]
+            .clone()
+    };
+    let refused = fixture.error("list_package", list(&member("big"))).await;
+    assert_eq!(refused.code, "too_many_members");
+    let small = fixture.ok("list_package", list(&member("small"))).await;
+    assert_eq!(small["members"].as_array().unwrap().len(), 1);
+    fixture.stop().await;
+}

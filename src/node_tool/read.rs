@@ -64,16 +64,9 @@ impl Tool for ListPackage {
 
     async fn run(context: &NodeToolContext, target: Target) -> Result<Reply> {
         context
-            .with_attempt(&target.attempt_id, async |attempt, _| {
-                if let Some(member) = attempt.member(&target.handle) {
-                    let children = attempt
-                        .invocation
-                        .members()
-                        .iter()
-                        .filter(|child| {
-                            child.owner == member.owner && is_child(&member.path, &child.path)
-                        })
-                        .count();
+            .with_attempt(&target.attempt_id, async |attempt, state| {
+                if let Some(children) = state.children(attempt, &target.handle).await? {
+                    let children = children.len();
                     if children > MAX_LISTED {
                         return Err(AppError::new(
                             "too_many_members",
@@ -180,7 +173,7 @@ async fn payload_size(
     handle: &str,
 ) -> Result<Option<u64>> {
     if let Some(ResolvedEntryKind::File { content, .. }) =
-        attempt.member(handle).map(|member| &member.kind)
+        attempt.member(handle).map(|member| member.kind)
     {
         return Ok(Some(content.size()));
     }
@@ -194,11 +187,4 @@ async fn payload_size(
         .content_size(digest)
         .await
         .map_err(AppError::core)
-}
-
-fn is_child(parent: &str, path: &str) -> bool {
-    !path.is_empty()
-        && path
-            .rsplit_once('/')
-            .map_or(parent.is_empty(), |(prefix, _)| prefix == parent)
 }

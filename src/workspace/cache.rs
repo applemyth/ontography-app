@@ -219,7 +219,7 @@ pub(super) async fn checkout(
     let store = store.clone();
     let package = package.clone();
     let destination = destination.to_owned();
-    let git = package.entries().iter().any(|entry| entry.path == ".git");
+    let git = package.entry(".git").is_some();
     let checkout = tokio::task::spawn_blocking(move || {
         let result = checkout_blocking(&store, &package, &destination);
         drop(serialized);

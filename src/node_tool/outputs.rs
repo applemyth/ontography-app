@@ -5,7 +5,9 @@ use super::context::{Attempt, AttemptState, OutputRef};
 use super::{NodeToolContext, Reply, Tool};
 use crate::tools::workspace::workspace_error;
 use crate::{AppError, Result};
-use ontography::{ContentId, PackageDocument, PackageMemberGrant, PackageStore, ResolvedEntryKind};
+use ontography::{
+    ContentId, PackageDocument, PackageStore, ResolvedEntryKind, package::ResolvedEntry,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -113,7 +115,7 @@ impl Tool for ComposePackage {
                     .map_err(workspace_error)?;
                 let output = state.handle("out");
                 let reply = json!({"output_id": output, "kind": "directory",
-                    "entries": view.entries().len().saturating_sub(1)});
+                    "entries": view.entry_count().saturating_sub(1)});
                 state.outputs.insert(
                     output,
                     OutputRef {
@@ -168,7 +170,7 @@ impl Compose {
 /// member of its inputs.
 pub(super) enum Source<'a> {
     Output(&'a OutputRef),
-    Input(&'a PackageMemberGrant),
+    Input(ResolvedEntry),
 }
 
 impl Source<'_> {
