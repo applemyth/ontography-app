@@ -76,7 +76,10 @@ async fn check(data: &Path, run: &str, export: &Value) -> Result<Vec<String>> {
             export["packages"].as_array().map_or(0, Vec::len)
         ));
     }
-    let fixed = state.retirements().is_empty();
+    // Core replays from scratch only a fixed graph's activations: no
+    // retirements, and no edit since the run began.
+    let fixed = state.retirements().is_empty()
+        && export["current_fingerprint"] == manifest["declaration_revision"];
     runtime.shutdown().await;
     drop(session);
     // Core can check a history of activations alone from its first record.
