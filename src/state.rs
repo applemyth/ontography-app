@@ -605,10 +605,13 @@ impl Service {
                 ));
             }
             run.environment = environment;
-            if run.live.is_none()
-                && !run.directory.join("core").exists()
-                && run.manifest.status == "creating"
-            {
+            if run.live.is_none() && run.manifest.status == "creating" {
+                // Its store was never finished, and nothing ran in it: a
+                // crash or failure while core created it leaves only a part.
+                let core = run.directory.join("core");
+                if core.exists() {
+                    std::fs::remove_dir_all(&core)?;
+                }
                 let runtime = runtime(kernel);
                 let session = runtime
                     .create_persistent(run.directory.join("core"))

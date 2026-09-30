@@ -375,7 +375,7 @@ async fn finish(server: &mut Server, tracker: &Tracker) {
 }
 
 /// Servers of this trial, so a later harness can stop any left behind.
-fn record_servers(dir: &Path, server: &Server) -> Result<()> {
+pub fn record_servers(dir: &Path, server: &Server) -> Result<()> {
     let lines: String = server
         .incarnations
         .iter()
@@ -396,7 +396,7 @@ async fn export(server: &Server, dir: &Path, run: &str) -> Result<Value> {
 
 /// What a stopped server must not leave behind: processes, its socket
 /// directory, the run's node socket directories, or half-written files.
-async fn after_stop(tracker: &Tracker, data: &Path, server: &Server, run: &str) -> Vec<String> {
+pub async fn after_stop(tracker: &Tracker, data: &Path, server: &Server, run: &str) -> Vec<String> {
     let mut problems = Vec::new();
     // Programs get a moment to notice their server is gone.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -448,7 +448,7 @@ fn node_endpoint(directory: &Path) -> Option<PathBuf> {
     )))
 }
 
-fn temporaries(root: &Path) -> Vec<PathBuf> {
+pub fn temporaries(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
@@ -473,7 +473,7 @@ fn temporaries(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Differences an orderly restart made to history.
-fn restart_changes(before: &Value, after: &Value) -> Vec<String> {
+pub fn restart_changes(before: &Value, after: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     for field in [
         "revision",

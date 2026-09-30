@@ -49,8 +49,9 @@ pub async fn send(client: &Client, operation: &str, args: Value) -> Reply {
         Err(error) => match error.code.as_str() {
             "rejected" => Reply::Rejected(error.message),
             "server_restarted" | "server_stopping" => Reply::NotRun(error.message),
-            // An oversized result replaces the reply of a change that happened.
-            "result_too_large" => Reply::Uncertain(error.message),
+            // An oversized result replaces the reply of a change that happened;
+            // a run whose storage failed mid-change cannot say whether it did.
+            "result_too_large" | "unknown_outcome" => Reply::Uncertain(error.message),
             code => Reply::Failed(code.into(), error.message),
         },
     }
@@ -64,17 +65,46 @@ pub struct Server {
     pub client: Client,
     /// Every process this server has been, by pid.
     pub incarnations: Vec<u32>,
+    /// Variables the server process gets besides the harness's own, such as
+    /// a library to interpose; restarts use them too.
+    env: Vec<(String, String)>,
 }
 
-async fn launch(binary: &Path, data: &Path, socket: &Path) -> Result<(Child, Client)> {
+/// A server that exited before it answered, as one killed at a crash point
+/// while starting does.
+#[derive(Debug)]
+pub struct Exited {
+    pub pid: u32,
+    pub status: std::process::ExitStatus,
+}
+
+impl std::fmt::Display for Exited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the server {} exited while starting: {}",
+            self.pid, self.status
+        )
+    }
+}
+
+impl std::error::Error for Exited {}
+
+async fn launch(
+    binary: &Path,
+    data: &Path,
+    socket: &Path,
+    env: &[(String, String)],
+) -> Result<(Child, Client)> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(data.join("server.log"))?;
-    let child = Command::new(binary)
+    let mut child = Command::new(binary)
         .arg("--data-dir")
         .arg(data)
         .args(["server", "run"])
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -83,6 +113,7 @@ async fn launch(binary: &Path, data: &Path, socket: &Path) -> Result<(Child, Cli
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("start {}", binary.display()))?;
+    let pid = child.id().context("server pid")?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match Client::connect(socket).await {
@@ -95,16 +126,31 @@ async fn launch(binary: &Path, data: &Path, socket: &Path) -> Result<(Child, Cli
             Err(error) if Instant::now() > deadline => {
                 bail!("server did not start: {}: {}", error.code, error.message)
             }
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Err(_) => {
+                // One that has exited will never answer.
+                if let Some(status) = child.try_wait()? {
+                    return Err(Exited { pid, status }.into());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
         }
     }
 }
 
 impl Server {
     pub async fn start(binary: &Path, data: &Path) -> Result<Self> {
+        Self::start_with(binary, data, Vec::new()).await
+    }
+
+    /// Starts the server with these variables in its environment.
+    pub async fn start_with(
+        binary: &Path,
+        data: &Path,
+        env: Vec<(String, String)>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(data)?;
         let socket = Paths::initialize(data)?.socket;
-        let (child, client) = launch(binary, data, &socket).await?;
+        let (child, client) = launch(binary, data, &socket, &env).await?;
         let pid = child.id().context("server pid")?;
         crate::procs::register(pid);
         Ok(Self {
@@ -114,7 +160,18 @@ impl Server {
             child: Some(child),
             client,
             incarnations: vec![pid],
+            env,
         })
+    }
+
+    /// Replaces the variables later restarts give the server.
+    pub fn set_env(&mut self, env: Vec<(String, String)>) {
+        self.env = env;
+    }
+
+    /// How the server process ended, once it has.
+    pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.as_mut()?.try_wait().ok().flatten()
     }
 
     /// Kills the server outright, as a crash or power cut would; its
@@ -134,7 +191,7 @@ impl Server {
 
     pub async fn restart(&mut self) -> Result<()> {
         self.crash().await?;
-        let (child, client) = launch(&self.binary, &self.data, &self.socket).await?;
+        let (child, client) = launch(&self.binary, &self.data, &self.socket, &self.env).await?;
         let pid = child.id().context("server pid")?;
         crate::procs::register(pid);
         self.incarnations.push(pid);

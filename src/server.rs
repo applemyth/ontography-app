@@ -344,7 +344,26 @@ impl Server {
 
 /// A result too large to send becomes an error. A `mutating` operation that
 /// succeeded has applied its change, so its error says so.
+/// Core faults a run's session when its storage fails after a change began
+/// to be written, because it cannot say whether the change was recorded. A
+/// client told only that the change failed would repeat it, perhaps twice.
+fn uncertain_when_faulted(error: AppError) -> AppError {
+    if error.code == "core_error" && error.message.starts_with("proposal session faulted") {
+        return AppError::new(
+            "unknown_outcome",
+            "the run's storage failed while this change was being recorded, so it may have been applied; resume the run and read its history before retrying",
+        )
+        .details(json!({"cause": error}));
+    }
+    error
+}
+
 fn bounded(result: Result<Value>, mutating: bool) -> Result<Value> {
+    let result = if mutating {
+        result.map_err(uncertain_when_faulted)
+    } else {
+        result
+    };
     let result = result.map(|mut value| {
         crate::tools::content::normalize_content_ids_output(&mut value);
         value
@@ -736,4 +755,24 @@ async fn connection(server: Arc<Server>, socket: UnixStream) -> Result<()> {
     // A complete received request reaches admission even if its client closes immediately.
     while requests.join_next().await.is_some() {}
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_change_that_faulted_its_run_is_of_unknown_outcome() {
+        let faulted = || AppError::core("proposal session faulted: disk I/O error");
+        let error = bounded(Err(faulted()), true).unwrap_err();
+        assert_eq!(error.code, "unknown_outcome");
+        assert_eq!(error.details.unwrap()["cause"]["code"], "core_error");
+        // A read changed nothing; a refusal before any write is certain.
+        assert_eq!(
+            bounded(Err(faulted()), false).unwrap_err().code,
+            "core_error"
+        );
+        let refused = AppError::core("proposal session storage failed: x");
+        assert_eq!(bounded(Err(refused), true).unwrap_err().code, "core_error");
+    }
 }

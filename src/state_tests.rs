@@ -325,3 +325,29 @@ async fn a_restarted_service_removes_metadata_writes_a_crash_cut_short() {
     assert!(!in_run.exists() && !in_node.exists());
     assert!(kept.exists() && other.exists());
 }
+
+#[tokio::test]
+async fn a_start_retry_creates_afresh_a_store_whose_creation_was_cut_short() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths::initialize(directory.path().join("data")).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let service = Service::new(paths.clone()).unwrap();
+    start_reserved(&service, directory.path(), &id)
+        .await
+        .unwrap();
+    service.shutdown().await.unwrap();
+    drop(service);
+    // As if the server died while core created the store: the manifest still
+    // says so, and the store holds only part of what core writes.
+    let run = paths.root.join("runs").join(&id);
+    let mut manifest: Value = read_json(&run.join("manifest.json")).unwrap();
+    manifest["status"] = json!("creating");
+    crate::persistence::write_json(&run.join("manifest.json"), &manifest).unwrap();
+    std::fs::remove_file(run.join("core/state.sqlite3")).unwrap();
+    let service = Service::new(paths).unwrap();
+    let started = start_reserved(&service, directory.path(), &id)
+        .await
+        .unwrap();
+    assert_eq!(started["status"], "active");
+    service.shutdown().await.unwrap();
+}

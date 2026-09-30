@@ -124,8 +124,64 @@ the sessions interleave is up to the machine. A trial with problems keeps
 `trials/runs/sessions-<seed>`, with a log of each session's steps (`s0.log`,
 …) and what each crash struck (`crash-1.txt`, …).
 
+## Crash points
+
+Random crashes rarely land between a commit and its reply, or inside a
+multi-step durable write. The `crashpoints` mode enumerates those points:
+
+```sh
+cargo run -p ontography-trials -- crashpoints --limit 10                  # every script and mode
+cargo run -p ontography-trials -- crashpoints --script command --mode after --limit 30 --seed 7
+cargo run -p ontography-trials -- crashpoints --script external --mode before --point 12,89
+```
+
+A small C library (`interpose/crashpoint.c`, compiled with `cc` into the
+runs directory at start) is loaded into the server only, through
+`DYLD_INSERT_LIBRARIES`, and removes itself from the environment its
+programs inherit. It numbers the server's durable calls on files in its
+data directory: `fsync`, `fcntl` with `F_FULLFSYNC` or `F_BARRIERFSYNC`,
+`rename`, `unlink`, `mkdir`, and `write`, `pwrite` and `writev`. A dry run
+of each script learns the points and names each by its call and path, with
+IDs replaced. Then each chosen point (all of them with `--limit 0`, or a
+seeded sample taking as many different names as it can) is played from a
+fresh data directory with the library armed there: `before` kills the
+server just before the call, `after` just after it, and `eio` or `enospc`
+fails that one call.
+
+| Script | What it does |
+| --- | --- |
+| `external` | `flow.start` with a `start_id`, roots at an external source, consumptions and a retirement at an external sink; the server's own start counts too |
+| `command` | a command that runs and publishes, beside a flaky one that fails first: the task harness's ledger, caches and markers |
+| `human` | a person's `flow.decide` |
+| `export` | `inspect.export` into the data directory, afresh and over itself |
+| `parked` | `flow.retry` and `flow.discard` of tasks parked at a broken command |
+
+A killed server is started again without the library and the run resumed
+(`run.resume`, or `flow.start` again with the same `start_id` during a
+start). The script then does what the documentation asks of a client
+after a restart: it reads history to learn whether its interrupted request
+happened, sends it again only if not, and finishes. It also makes the
+manager's documented recoveries, noting each: `run.resume` for a run whose
+core session faulted, `flow.resume` for a stopped worker. The judges: the
+server starts and the run opens; the workflow judge above, where a done move
+is in history once, a lost one at most once and a refused one never; the
+store agrees with the export; an orderly restart changes nothing; after the
+final orderly stop, no processes, socket directories or half-written files
+remain. A failed call must fail its request cleanly, once, and the server
+must go on serving. Problems a dry run shows too, without any crash, are
+reported once per script as the baseline. Notes record what is not a
+problem but worth knowing: a request that failed at the injected fault, a
+recovery the fault made necessary, a server that refused to start. The
+summary groups problems by crash point, then lists each kind of problem, and
+of note, with the points that cause it. Points with problems beyond the
+baseline keep their directories under
+`trials/runs/crashpoints/<script>-<mode>-<point>`, with the library's log
+(`crashpoints.log`: each call, and the steps the script began). A point
+takes a few seconds; `--jobs` (default 4) play at once, so `--limit 10`
+over every script and mode, 200 points, takes about five minutes.
+
 ## Not yet played
 
 Agent node terminals, Pi's `/new` and `/resume`, workspaces, the agent
-grants (`originate`, `send_later`, `retire`), systematic crash points, and
-scripted models for the real Pi, Codex and Claude.
+grants (`originate`, `send_later`, `retire`), crash points inside graph
+edits and sessions, and scripted models for the real Pi, Codex and Claude.
