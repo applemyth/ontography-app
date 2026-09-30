@@ -1,10 +1,11 @@
 //! A generated workflow of every node kind the app runs: external sources
 //! and sinks that players act for, command nodes running this binary in a
-//! chosen role, people's decisions, and inboxes. Work flows forward through
-//! layers, so it always ends; joins, parallel connections, bytes contracts,
-//! and tasks that can never succeed occur by chance.
+//! chosen role, agent nodes running it as a program that pulls work through
+//! the node tools, people's decisions, and inboxes. Work flows forward
+//! through layers, so it always ends; joins, parallel connections, bytes
+//! contracts, and tasks that can never succeed occur by chance.
 
-use crate::roles::Role;
+use crate::roles::{Role, Style};
 use rand::{Rng, seq::IndexedRandom};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -21,6 +22,7 @@ pub struct Scale {
     pub sinks: usize,
 }
 
+/// A command node.
 #[derive(Clone, Debug)]
 pub struct Worker {
     pub role: Role,
@@ -33,13 +35,47 @@ pub struct Worker {
     pub layer: usize,
 }
 
+/// An agent node whose program is this binary in agent mode.
+#[derive(Clone, Debug)]
+pub struct Agent {
+    pub style: Style,
+    pub attempts: u64,
+    pub all: bool,
+    pub layer: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum Kind {
     Source,
     Worker(Worker),
+    Agent(Agent),
     Human,
     Inbox,
     Sink,
+}
+
+impl Kind {
+    /// Whether the app runs a program for this node's tasks.
+    pub fn runs(&self) -> bool {
+        matches!(self, Self::Worker(_) | Self::Agent(_))
+    }
+
+    /// Whether the node joins one input from every incoming connection.
+    pub fn all(&self) -> bool {
+        match self {
+            Self::Worker(worker) => worker.all,
+            Self::Agent(agent) => agent.all,
+            _ => false,
+        }
+    }
+
+    fn layer(&self) -> Option<usize> {
+        match self {
+            Self::Worker(worker) => Some(worker.layer),
+            Self::Agent(agent) => Some(agent.layer),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -63,13 +99,6 @@ impl World {
         self.edges.iter().filter(move |(_, edge)| edge.from == node)
     }
 
-    pub fn worker(&self, node: &str) -> Option<&Worker> {
-        match self.nodes.get(node) {
-            Some(Kind::Worker(worker)) => Some(worker),
-            _ => None,
-        }
-    }
-
     pub fn named(&self, pick: fn(&Kind) -> bool) -> Vec<String> {
         self.nodes
             .iter()
@@ -90,15 +119,15 @@ fn role(rng: &mut impl Rng) -> Role {
     }
 }
 
-/// A world whose command nodes run `program` and record each run under
-/// `witness`.
-pub fn generate(
-    rng: &mut impl Rng,
-    scale: Scale,
-    name: &str,
-    program: &Path,
-    witness: &Path,
-) -> World {
+/// Where a world's programs are: this binary, the directory they record
+/// their runs in, and the `ontography` binary agents reach their tools with.
+pub struct Programs<'a> {
+    pub program: &'a Path,
+    pub witness: &'a Path,
+    pub ontography: &'a Path,
+}
+
+pub fn generate(rng: &mut impl Rng, scale: Scale, name: &str, programs: &Programs) -> World {
     let mut nodes = BTreeMap::new();
     let sources: Vec<String> = (0..scale.sources.max(1))
         .map(|i| format!("src{i}"))
@@ -114,19 +143,32 @@ pub fn generate(
         } else {
             rng.random_range(0..layers.len())
         };
-        let id = format!("w{i}");
-        layers[layer].push(id.clone());
-        let role = role(rng);
-        nodes.insert(
-            id,
-            Kind::Worker(Worker {
+        let attempts = rng.random_range(2..=3);
+        // About a third of the workers are agents that pull their work.
+        let (id, kind) = if rng.random_bool(0.3) {
+            let style = *[Style::Broadcast, Style::Route, Style::Flaky]
+                .choose(rng)
+                .expect("styles");
+            let agent = Agent {
+                style,
+                attempts,
+                all: false,
+                layer,
+            };
+            (format!("a{i}"), Kind::Agent(agent))
+        } else {
+            let role = role(rng);
+            let worker = Worker {
                 role,
-                attempts: rng.random_range(2..=3),
+                attempts,
                 bytes: role == Role::Binary && rng.random_bool(0.6),
                 all: false,
                 layer,
-            }),
-        );
+            };
+            (format!("w{i}"), Kind::Worker(worker))
+        };
+        layers[layer].push(id.clone());
+        nodes.insert(id, kind);
     }
     let terminals: Vec<String> = (0..scale.humans)
         .map(|i| format!("h{i}"))
@@ -170,8 +212,10 @@ pub fn generate(
             for _ in 0..count {
                 connect(&mut edges, earlier.choose(rng).expect("a source"), id);
             }
-            if let Some(Kind::Worker(worker)) = nodes.get_mut(id) {
-                worker.all = all;
+            match nodes.get_mut(id) {
+                Some(Kind::Worker(worker)) => worker.all = all,
+                Some(Kind::Agent(agent)) => agent.all = all,
+                _ => {}
             }
         }
     }
@@ -201,15 +245,12 @@ pub fn generate(
         .collect();
     for id in senders {
         if !edges.values().any(|edge| edge.from == id) {
-            let depth = match nodes.get(&id) {
-                Some(Kind::Worker(worker)) => worker.layer + 1,
-                _ => 0,
-            };
+            let depth = nodes.get(&id).and_then(Kind::layer).map_or(0, |l| l + 1);
             let later: Vec<String> = layers
                 .iter()
                 .skip(depth)
                 .flatten()
-                .filter(|w| !matches!(nodes.get(*w), Some(Kind::Worker(worker)) if worker.all))
+                .filter(|w| !nodes.get(*w).is_some_and(Kind::all))
                 .cloned()
                 .chain(terminals.iter().cloned())
                 .collect();
@@ -217,7 +258,7 @@ pub fn generate(
         }
     }
 
-    let document = document(name, &nodes, &edges, program, witness);
+    let document = document(name, &nodes, &edges, programs);
     World {
         document,
         nodes,
@@ -229,9 +270,9 @@ fn document(
     name: &str,
     nodes: &BTreeMap<String, Kind>,
     edges: &BTreeMap<String, Edge>,
-    program: &Path,
-    witness: &Path,
+    programs: &Programs,
 ) -> Value {
+    let (program, witness) = (programs.program, programs.witness);
     let bytes = nodes
         .values()
         .any(|kind| matches!(kind, Kind::Worker(worker) if worker.bytes));
@@ -243,6 +284,35 @@ fn document(
             Kind::Sink => json!({"id": id, "component": "external"}),
             Kind::Human => json!({"id": id, "component": "human", "config": {"prompt": "Decide"}}),
             Kind::Inbox => json!({"id": id, "component": "inbox"}),
+            Kind::Agent(agent) => {
+                let mut argv = vec![
+                    json!(program),
+                    json!("agent"),
+                    json!("--style"),
+                    json!(agent.style.name()),
+                    json!("--name"),
+                    json!(id),
+                    json!("--witness"),
+                    json!(witness),
+                    json!("--ontography"),
+                    json!(programs.ontography),
+                ];
+                let to: Vec<&str> = edges
+                    .iter()
+                    .filter(|(_, edge)| edge.from == *id)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !to.is_empty() {
+                    argv.extend([json!("--to"), json!(to.join(","))]);
+                }
+                json!({
+                    "id": id,
+                    "component": "agent",
+                    "config": {"prompt": "A trial agent: pull work through the node tools.", "argv": argv},
+                    "retry": {"max_attempts": agent.attempts, "initial_delay_secs": 0, "max_delay_secs": 0},
+                    "join": if agent.all { "all" } else { "any" },
+                })
+            }
             Kind::Worker(worker) => {
                 let mut value = json!({
                     "id": id,

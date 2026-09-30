@@ -29,12 +29,14 @@ stopped at the next start.
 | --- | --- | --- |
 | Players | Start work at external sources (`workflow.submit` roots), consume or retire what reaches external sinks | core moves, `inspect.frontier` |
 | Commands | This binary in node mode, placed by the document's `argv`, in a role: `digest`, `flaky` (fails once per input), `broken`, `binary` (non-UTF-8 output), `slow` (outlives its timeout), `big` (more output than the app keeps) | the task harness, joins, broadcast, retries and parking |
+| Agents | This binary as an agent node's `argv` program, pulling work through the node tools over `ontography node-mcp`: it broadcasts, routes to connections its input picks, or fails its first attempt at each input | node tools, attempts, receipts, the MCP proxy, agent processes |
 | A person | Decides every task at human nodes | `flow.decide`, `flow.status` |
 | The manager | Retries or discards parked tasks, pages inboxes | `flow.retry`, `flow.discard`, `flow.output` |
 | Chaos | Crashes the server (`kill -9`, restart, `run.resume`) and kills running commands, at moments fixed by the seed | crash recovery |
 
-Every command records each run of its program in a witness file: the only
-outside record of how often the app ran a task.
+Every command records each run of its program, and every agent each attempt
+and submission, in a witness file: the only outside record of how often the
+app ran a task and what a program decided.
 
 ## The judges
 
@@ -42,7 +44,9 @@ outside record of how often the app ran a task.
   producer and checked against its content digest. Every command activation
   consumed one of its node's tasks and published exactly what its program
   prints for those inputs, in package order, joined by blank lines; its
-  result went to each outgoing connection. Tasks that can never succeed
+  result went to each outgoing connection. Every agent activation published
+  what its program submitted, to every successor or exactly the connections
+  it chose, and its node tools refused none of its legal calls. Tasks that can never succeed
   never published. Every player move and decision that was done is in
   history once, every refused one never, every lost one at most once. After
   the run settles, work waits only in inboxes, at sinks, in incomplete joins,
@@ -63,6 +67,6 @@ program may run again.
 
 ## Not yet played
 
-Graph edits, sessions and terminals, agent nodes and the node tools,
-workspaces, systematic crash points, and scripted models for the real Pi,
-Codex and Claude.
+Graph edits, sessions and terminals, workspaces, the agent grants
+(`originate`, `send_later`, `retire`), systematic crash points, and scripted
+models for the real Pi, Codex and Claude.

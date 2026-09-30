@@ -6,10 +6,12 @@
 //! judges what the server kept, what its programs did, which processes it
 //! left, and its store.
 
+mod agent;
 mod audit;
 mod game;
 mod history;
 mod judge;
+mod mcp;
 mod node;
 mod procs;
 mod roles;
@@ -106,6 +108,8 @@ struct Args {
 enum Mode {
     /// Act as a command node's program, as a document's `argv` places it.
     Node(node::Args),
+    /// Act as an agent node's program, pulling work through the node tools.
+    Agent(agent::Args),
 }
 
 /// Builds the server from the tree this harness was built from.
@@ -185,8 +189,10 @@ fn report(seed: u64, outcome: &game::Outcome, took: Duration) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if let Some(Mode::Node(node)) = args.mode {
-        return node::run(node);
+    match args.mode {
+        Some(Mode::Node(node)) => return node::run(node),
+        Some(Mode::Agent(agent)) => return agent::run(agent).await,
+        None => {}
     }
     let plan = args.preset.plan();
     std::fs::create_dir_all(&args.runs)?;

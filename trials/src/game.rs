@@ -120,12 +120,16 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, settings: &Settings) ->
     let witness = dir.join("witness");
     std::fs::create_dir_all(&witness)?;
     let program = std::env::current_exe()?;
+    let programs = world::Programs {
+        program: &program,
+        witness: &witness,
+        ontography: binary,
+    };
     let world = world::generate(
         &mut rng,
         settings.scale,
         &format!("trial-{seed}"),
-        &program,
-        &witness,
+        &programs,
     );
     std::fs::write(
         dir.join("document.json"),
@@ -443,10 +447,11 @@ async fn settle(table: &Table, tracker: &mut Tracker) -> std::result::Result<Val
             .flatten()
             .any(|task| {
                 let node = task["node"].as_str().unwrap_or_default();
-                matches!(
-                    table.world.nodes.get(node),
-                    Some(Kind::Worker(_) | Kind::Human)
-                )
+                table
+                    .world
+                    .nodes
+                    .get(node)
+                    .is_some_and(|kind| kind.runs() || matches!(kind, Kind::Human))
             })
             || status["failures"]
                 .as_array()
