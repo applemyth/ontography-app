@@ -90,9 +90,11 @@ pub struct Log {
     pub names: BTreeMap<String, String>,
     /// Packages the committed edits' previews listed to retire, with why.
     pub edit_retirements: BTreeMap<String, String>,
-    /// Edits committed, and previews that went stale before their commit.
+    /// Edits committed, previews that went stale before their commit, and
+    /// the longest an edit took from its first preview to its commit.
     pub edits: usize,
     pub stale: usize,
+    pub slowest_edit: Duration,
     pub problems: Vec<String>,
 }
 
@@ -360,6 +362,9 @@ async fn collect(mut outcome: Outcome, table: Arc<Table>) -> Outcome {
     outcome.counts.insert("kills", log.kills.len());
     outcome.counts.insert("edits", log.edits);
     outcome.counts.insert("stale previews", log.stale);
+    if log.edits > 0 {
+        outcome.timing.insert("slowest edit", log.slowest_edit);
+    }
     outcome
 }
 
@@ -824,6 +829,7 @@ async fn editor(table: Arc<Table>, seed: u64, edits: usize, play: Duration) -> R
 /// Previews `next` and commits it, previewing again while work keeps
 /// making the preview stale, as the documentation says to.
 async fn edit(table: &Table, next: World, what: String) -> Result<()> {
+    let begun = Instant::now();
     let mut stale = 0;
     for _ in 0..EDIT_TRIES {
         let plan = match table
@@ -861,7 +867,9 @@ async fn edit(table: &Table, next: World, what: String) -> Result<()> {
             reply = table.send("flow.commit", json!({"plan_id": plan_id})).await;
         }
         match reply {
-            Reply::Done(_) => return committed(table, next, &plan_id, stale).await,
+            Reply::Done(_) => {
+                return committed(table, next, &plan_id, stale, begun.elapsed()).await;
+            }
             Reply::Failed(code, _)
                 if code == "stale_preview" || code == "retirement_preview_required" =>
             {
@@ -888,7 +896,13 @@ async fn edit(table: &Table, next: World, what: String) -> Result<()> {
 /// Records a committed edit: the identities its plan gave nodes and
 /// connections, the pending work its preview said it would retire, and the
 /// new version of the world.
-async fn committed(table: &Table, next: World, plan_id: &str, stale: usize) -> Result<()> {
+async fn committed(
+    table: &Table,
+    next: World,
+    plan_id: &str,
+    stale: usize,
+    took: Duration,
+) -> Result<()> {
     let path = table
         .data
         .join("runs")
@@ -913,6 +927,7 @@ async fn committed(table: &Table, next: World, plan_id: &str, stale: usize) -> R
     }
     log.edits += 1;
     log.stale += stale;
+    log.slowest_edit = log.slowest_edit.max(took);
     log.worlds.push(next.clone());
     *table
         .world
