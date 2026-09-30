@@ -386,8 +386,23 @@ mod tests {
         assert_eq!(migrate(&source, &dest).unwrap_err().code, "store_in_use");
         assert!(source.join("runs").exists());
         assert!(!home.path().join(".ontography-migration.json").exists());
-        drop(owner);
+        released(owner, &source.join("server.lock"));
         assert!(migrate(&source, &dest).unwrap().complete);
+    }
+
+    /// Closes the owner's lock and waits until nothing holds it. A process
+    /// another test forks shares this one's open files until it execs, and
+    /// holds the lock that long; a real owner has exited by then.
+    fn released(owner: File, path: &Path) {
+        drop(owner);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while lock(path).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lock was never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -528,7 +543,7 @@ mod tests {
         );
         assert_eq!(fs::read(destination.join("legacy")).unwrap(), b"preserved");
         assert!(!home.path().join(".ontography-migration.json").exists());
-        drop(owner);
+        released(owner, &destination.join("server.lock"));
         assert!(migrate(&source, &destination).unwrap().complete);
     }
 }

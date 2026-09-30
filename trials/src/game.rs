@@ -329,9 +329,13 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, settings: &Settings) ->
         .counts
         .insert("activations", history.activations.len());
     outcome.counts.insert("packages", history.packages.len());
-    outcome
-        .counts
-        .insert("parked", status["failures"].as_array().map_or(0, Vec::len));
+    outcome.counts.insert(
+        "parked",
+        status["failures_total"].as_u64().map_or_else(
+            || status["failures"].as_array().map_or(0, Vec::len),
+            |total| total as usize,
+        ),
+    );
     drop(log);
     outcome.timing.insert("judge", clock.elapsed());
 

@@ -121,7 +121,10 @@ pub fn read_witness(dir: &Path) -> Result<Witness> {
 
 /// What the judge needs of a node that runs a program for its tasks.
 struct Program {
+    /// The attempts after which its tasks park.
     attempts: u64,
+    /// Its node's `max_attempts`, the most a task can take.
+    max_attempts: u64,
     all: bool,
     /// Whether its tasks succeed, given no chaos.
     succeeds: bool,
@@ -140,6 +143,7 @@ fn program(kind: &Kind) -> Option<Program> {
             } else {
                 worker.attempts
             },
+            max_attempts: worker.attempts,
             all: worker.all,
             succeeds: worker.role.succeeds(worker.bytes),
             flaky: worker.role == Role::Flaky,
@@ -147,6 +151,7 @@ fn program(kind: &Kind) -> Option<Program> {
         }),
         Kind::Agent(agent) => Some(Program {
             attempts: agent.attempts,
+            max_attempts: agent.attempts,
             all: agent.all,
             succeeds: true,
             flaky: agent.style == Style::Flaky,
@@ -628,13 +633,22 @@ fn packages(evidence: &Evidence, problems: &mut Vec<String>) {
             by_edge.values().sum()
         };
         let held = parked.get(node).copied().unwrap_or_default();
-        if tasks > held {
+        if tasks > held && listed_all(evidence.status) {
             problems.push(format!(
                 "{tasks} tasks wait at {node} ({}), but only {held} are parked",
                 program.label
             ));
         }
     }
+}
+
+/// Whether status listed every failed task: it lists at most 100, and
+/// `failures_total` counts them all.
+fn listed_all(status: &Value) -> bool {
+    let listed = status["failures"].as_array().map_or(0, Vec::len);
+    status["failures_total"]
+        .as_u64()
+        .is_none_or(|total| total == listed as u64)
 }
 
 fn parked(status: &Value) -> BTreeMap<&str, usize> {
@@ -679,10 +693,28 @@ fn failures(evidence: &Evidence, problems: &mut Vec<String>) {
                 program.label, failure["error"]
             ));
         }
-        if failure["attempts"].as_u64() != Some(program.attempts) {
+        // A killed run is a failed attempt, which counts before one whose
+        // output core refuses and parks at once: each allows one more.
+        let killed = evidence.witness.runs.get(node).map_or(0, |runs| {
+            runs.iter()
+                .filter(|run| evidence.log.kills.contains(&run.pid))
+                .count() as u64
+        });
+        let most = (program.attempts + killed)
+            .min(program.max_attempts)
+            .max(program.attempts);
+        if !failure["attempts"]
+            .as_u64()
+            .is_some_and(|attempts| (program.attempts..=most).contains(&attempts))
+        {
             problems.push(format!(
-                "a task parked at {node} after {} attempts, not its {}",
-                failure["attempts"], program.attempts
+                "a task parked at {node} after {} attempts, not {}",
+                failure["attempts"],
+                if most == program.attempts {
+                    format!("its {most}")
+                } else {
+                    format!("{}–{most}, with {killed} killed", program.attempts)
+                }
             ));
         }
     }
