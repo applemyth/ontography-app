@@ -14,8 +14,9 @@ use crate::{
     terminal::{LaunchSpec, Terminal},
 };
 use nix::{
+    errno::Errno,
     sys::signal::{Signal, kill, killpg},
-    unistd::{Pid, getpgid, getsid},
+    unistd::{Pid, getpgid, getpgrp, getsid},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,7 +26,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::Stdio,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -90,6 +94,10 @@ pub struct ManagedShell {
     stop: watch::Sender<bool>,
     socket: PathBuf,
     rc: PathBuf,
+    /// Set once the reaped shell's OS session is seen empty. It cannot regain
+    /// members, and its ID may since name another session, so later cleanup
+    /// leaves that ID alone.
+    session_ended: AtomicBool,
 }
 
 fn lease_socket(paths: &Paths, generation: &str) -> Result<PathBuf> {
@@ -205,6 +213,7 @@ impl ManagedShell {
             stop,
             socket,
             rc,
+            session_ended: AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&shell);
         let mut stopping = shell.stop.subscribe();
@@ -451,9 +460,7 @@ impl ManagedShell {
                 let _ = killpg(lease.group, Signal::SIGTERM);
             }
         }
-        if let Some(pid) = self.terminal.status().pid {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-        }
+        self.terminal.signal(Signal::SIGTERM);
         // Job-control groups share the PTY's OS session. Include shell jobs in
         // other groups, even when the shell died before running its exit trap.
         self.signal_owned_groups(Signal::SIGTERM).await?;
@@ -479,9 +486,7 @@ impl ManagedShell {
         {
             let _ = killpg(lease.group, Signal::SIGKILL);
         }
-        if let Some(pid) = self.terminal.status().pid {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGHUP);
-        }
+        self.terminal.signal(Signal::SIGHUP);
     }
 
     fn terminal_settings(&self, restore: Option<&str>) -> Option<String> {
@@ -505,55 +510,84 @@ impl ManagedShell {
     }
 
     async fn signal_owned_groups(&self, signal: Signal) -> Result<()> {
-        let Some(owner) = self.terminal.status().pid else {
+        let (owner, reaped) = self.terminal.with_process(|pid, reaped| (pid, reaped));
+        if owner.is_none() || (reaped && self.session_ended.load(Ordering::Acquire)) {
             return Ok(());
-        };
-        let output = tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::process::Command::new("/bin/ps")
-                .args(["-axo", "pid="])
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
-        let output = output.map_err(|_| {
-            AppError::new(
-                "terminal_cleanup_timeout",
-                "process enumeration timed out while cleaning session jobs",
-            )
-        })??;
-        if !output.status.success() {
-            return Err(AppError::new(
-                "terminal_cleanup_failed",
-                "could not enumerate the session's remaining process groups",
-            ));
         }
-        let owner = Pid::from_raw(owner as i32);
-        let mut groups = std::collections::BTreeSet::new();
-        for pid in String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .filter_map(|s| s.parse::<i32>().ok())
-            .filter(|pid| *pid > 1)
-            .map(Pid::from_raw)
-        {
-            if getsid(Some(pid)).ok() == Some(owner)
-                && let Ok(group) = getpgid(Some(pid))
-            {
-                groups.insert(group);
-            }
-        }
-        for group in groups {
-            if group != nix::unistd::getpgrp() {
-                match killpg(group, signal) {
-                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-                    Err(error) => {
-                        return Err(AppError::new("terminal_cleanup_failed", error.to_string()));
-                    }
-                }
-            }
+        let members = process_ids().await?;
+        // Decide and signal while the reaper waits, so an unreaped shell's PID
+        // names its session throughout.
+        let found = self.terminal.with_process(|owner, reaped| match owner {
+            Some(owner) => signal_session(owner, reaped, &members, signal),
+            None => Ok(false),
+        })?;
+        if reaped && !found {
+            self.session_ended.store(true, Ordering::Release);
         }
         Ok(())
     }
+}
+
+/// Every process's ID, from a bounded enumeration.
+async fn process_ids() -> Result<Vec<Pid>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::process::Command::new("/bin/ps")
+            .args(["-axo", "pid="])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let output = output.map_err(|_| {
+        AppError::new(
+            "terminal_cleanup_timeout",
+            "process enumeration timed out while cleaning session jobs",
+        )
+    })??;
+    if !output.status.success() {
+        return Err(AppError::new(
+            "terminal_cleanup_failed",
+            "could not enumerate the session's remaining process groups",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|s| s.parse::<i32>().ok())
+        .filter(|pid| *pid > 1)
+        .map(Pid::from_raw)
+        .collect())
+}
+
+/// Signal every process group of the shell's OS session found among
+/// `members`, and report whether the session has any. While the shell is
+/// unreaped, its PID, which is also its session's ID, can name nothing else.
+/// Neither Linux nor XNU reuses a PID while a session or group with that ID
+/// exists, so once the shell is reaped, a process holding its PID shows that
+/// its session has ended and the ID now belongs to another.
+fn signal_session(owner: Pid, reaped: bool, members: &[Pid], signal: Signal) -> Result<bool> {
+    if reaped && kill(owner, None) != Err(Errno::ESRCH) {
+        return Ok(false);
+    }
+    let mut groups = std::collections::BTreeSet::new();
+    for &pid in members {
+        if getsid(Some(pid)).ok() == Some(owner)
+            && let Ok(group) = getpgid(Some(pid))
+        {
+            groups.insert(group);
+        }
+    }
+    let found = !groups.is_empty();
+    for group in groups {
+        if group != getpgrp() {
+            match killpg(group, signal) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => {
+                    return Err(AppError::new("terminal_cleanup_failed", error.to_string()));
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 impl Drop for ManagedShell {
@@ -702,4 +736,98 @@ pub async fn run_pi(paths: &Paths, session_id: &str, generation: &str) -> Result
     }
     reset_terminal(saved);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    /// Kills and reaps a process the test started, even after a failed assertion.
+    struct Spawned(std::process::Child);
+
+    impl Drop for Spawned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn reaped_shell_never_signals_a_session_that_took_its_pid() {
+        // A live session leader stands in for an unrelated process given the
+        // reaped shell's PID. This test keeps it unreaped, so its PID can name
+        // nothing else.
+        let mut leader = Spawned(
+            std::process::Command::new("perl")
+                .args([
+                    "-e",
+                    "use POSIX; POSIX::setsid() or die; exec 'sleep', '30'",
+                ])
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let owner = Pid::from_raw(leader.0.id() as i32);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while getsid(Some(owner)) != Ok(owner) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let members = process_ids().await.unwrap();
+        assert!(members.contains(&owner));
+        assert!(!signal_session(owner, true, &members, Signal::SIGTERM).unwrap());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            leader.0.try_wait().unwrap().is_none(),
+            "an unrelated session was signalled"
+        );
+        // Unreaped, the same PID still names the shell's own session.
+        assert!(signal_session(owner, false, &members, Signal::SIGKILL).unwrap());
+        assert_eq!(
+            leader.0.wait().unwrap().signal(),
+            Some(Signal::SIGKILL as i32)
+        );
+    }
+
+    #[tokio::test]
+    async fn reaped_shell_still_stops_what_remains_of_its_session() {
+        let hold = tempfile::NamedTempFile::new().unwrap();
+        // The leader leaves a member in its session and exits. Once it is
+        // reaped, that member alone keeps its PID from being reused. The
+        // member also ends by itself when the test removes its hold file.
+        let mut leader = Spawned(
+            std::process::Command::new("perl")
+                .args([
+                    "-e",
+                    r#"use POSIX; POSIX::setsid() or die; my $pid = fork() // die; if ($pid) { print "$pid\n"; exit 0 } close STDOUT; select(undef, undef, undef, 0.05) while -e $ARGV[0]"#,
+                ])
+                .arg(hold.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(leader.0.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let member = Pid::from_raw(line.trim().parse().unwrap());
+        let owner = Pid::from_raw(leader.0.id() as i32);
+        assert!(leader.0.wait().unwrap().success());
+        assert_eq!(getsid(Some(member)), Ok(owner));
+        let members = process_ids().await.unwrap();
+        assert!(signal_session(owner, true, &members, Signal::SIGKILL).unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while kill(member, None) != Err(Errno::ESRCH) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 }

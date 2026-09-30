@@ -762,6 +762,26 @@ impl Terminal {
             .and_then(|master| master.tty_name())
     }
 
+    /// Signal the terminal's process only while it is unreaped; a reaped
+    /// process's PID may name an unrelated one. Returns whether it was sent.
+    pub fn signal(&self, signal: nix::sys::signal::Signal) -> bool {
+        self.with_process(|pid, reaped| match pid {
+            Some(pid) if !reaped => nix::sys::signal::kill(pid, signal).is_ok(),
+            _ => false,
+        })
+    }
+
+    /// Run `action` with the terminal's process ID and whether that process
+    /// has been reaped. The reaper waits meanwhile, so an unreaped ID keeps
+    /// naming this process, and its OS session, until `action` returns.
+    pub(crate) fn with_process<T>(
+        &self,
+        action: impl FnOnce(Option<nix::unistd::Pid>, bool) -> T,
+    ) -> T {
+        let child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        action(child.pid, child.reaped)
+    }
+
     /// Recover the virtual terminal when an abruptly killed foreground owner
     /// could not disable its private modes before returning to the shell.
     pub fn reset_program_modes(&self) {
@@ -1750,6 +1770,36 @@ mod tests {
             "{:?}",
             terminal.status().fault
         );
+    }
+
+    #[tokio::test]
+    async fn signals_reach_the_process_only_until_it_is_reaped() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (spec, socket) = fixture(
+            directory.path(),
+            "trap 'exit 3' TERM; printf ready; while :; do sleep 0.05; done",
+        );
+        let terminal = Terminal::launch(spec, socket).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !terminal.snapshot().screen.contains("ready") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(terminal.signal(nix::sys::signal::Signal::SIGTERM));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while terminal.status().exit_code.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal.status().exit_code, Some(3));
+        // Reaped, its PID may already name another process.
+        assert!(!terminal.signal(nix::sys::signal::Signal::SIGTERM));
+        terminal.shutdown().await.unwrap();
     }
 
     #[tokio::test]
