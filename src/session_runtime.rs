@@ -279,6 +279,8 @@ async fn node_terminal(service: &Service, session: &str, args: &Value) -> Result
         .and_then(|live| live.workers.get(&state.identities.nodes[name]))
         .and_then(|worker| worker.node.as_ref())
         .and_then(|runtime| runtime.terminal())
+        // A terminal whose process just exited is not released at once.
+        .filter(|terminal| terminal.status().running)
         .ok_or_else(|| AppError::new("node_not_running", format!("Node {name:?} has no running terminal; inspect its status or resume it through the manager")))?;
     Ok(serde_json::to_value(terminal.attachment(
         args["rows"].as_u64().unwrap_or(24) as u16,
