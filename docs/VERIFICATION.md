@@ -2,24 +2,27 @@
 
 ## Worker recovery, blocked work, and whole-app trials — 2026-09-30
 
-Passed: **359 app Rust tests**, the [trials](../trials/README.md) crate's
+Passed: **360 app Rust tests**, the [trials](../trials/README.md) crate's
 included, against core `fcb37a9`; all-target workspace Clippy with warnings
 denied, formatting, and `git diff --check`. Six opt-in native tests remain
 ignored. The trials on this tree: the quick preset, **8 trials, 0 with
 problems**; the sessions trial at seed 1 and with 5 sessions, 3 rounds and 2
 crashes; a crashpoints sample of **200 points, 0 with problems**, and every
 one of the export script's **160 points**. A copy of ontography-stress
-`5778e30` replayed software seed 2, which kills a program and resumes 300 ms
-later, **15 times without a problem**; before the fix it lost the node in
-about one game in five.
+`d6546b7` played its kill arena, seeds 0–35: a program killed while a
+checkout, capture, or submission was in flight, and resumed 0, 100, 300, or
+1000 ms later. **All 36 nodes ran again**, and the nine resumed at once did
+again on a second run; before these fixes 16 of the 36 were lost. At
+`5778e30`, software seed 2 passed **15 of 15** games.
 
 - [Worker recovery tests](../tests/worker_recovery.rs): a node whose previous
   worker is still exiting shows `waiting` with `worker_still_exiting`, then
-  starts without a resume. A resume 100 ms after a program dies mid-checkout
-  waits for the node's cleanup, then starts it again. The lease tests
-  force-stop a frozen worker whose supervisor still proves itself, with its
-  session's jobs, and never signal a group recovery cannot prove it owns;
-  stopping the run ends the wait. Each fails on the tree before its fix.
+  starts without a resume. A resume made as soon as a program dies
+  mid-checkout, before the server reaps it, or 100 ms later, waits for the
+  node's cleanup, then starts it again. The lease tests force-stop a frozen
+  worker whose supervisor still proves itself, with its session's jobs, and
+  never signal a group recovery cannot prove it owns; stopping the run ends
+  the wait. Each fails on the tree before its fix.
 - [Blocked work tests](../tests/blocked_work.rs): a human task no decision can
   satisfy is discarded, and the task behind it becomes ready. Status lists 100
   of 105 parked tasks with `failures_total`, as a discard's reply does. Both
