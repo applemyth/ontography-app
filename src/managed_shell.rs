@@ -456,6 +456,18 @@ impl ManagedShell {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        // Pi stops the tool commands it runs in sessions of their own when
+        // asked to terminate, but revoking its lease kills it outright. Give
+        // it a moment to end on its own first.
+        if let Some(group) = self.lease_group() {
+            let _ = killpg(group, Signal::SIGTERM);
+            let _ = tokio::time::timeout(PI_STOP_GRACE, async {
+                while self.lease_group() == Some(group) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+        }
         self.stop.send_replace(true);
         {
             let mode = self.mode.lock().unwrap_or_else(|p| p.into_inner());
@@ -480,6 +492,11 @@ impl ManagedShell {
         let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_file(&self.rc);
         Ok(())
+    }
+
+    fn lease_group(&self) -> Option<Pid> {
+        let mode = self.mode.lock().unwrap_or_else(|p| p.into_inner());
+        mode.lease.as_ref().map(|lease| lease.group)
     }
 
     pub fn request_stop(&self) {

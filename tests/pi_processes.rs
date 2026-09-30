@@ -43,6 +43,7 @@ impl Drop for Endpoint {
 struct Fixture {
     /// The test's own child, so its PID is safe to signal.
     server: tokio::process::Child,
+    session: Client,
     processes: Vec<(&'static str, Pid)>,
     _endpoint: Endpoint,
     _directory: tempfile::TempDir,
@@ -119,6 +120,7 @@ impl Fixture {
         ];
         Self {
             server,
+            session,
             processes,
             _endpoint: endpoint,
             _directory: directory,
@@ -145,4 +147,15 @@ async fn killed_server_leaves_nothing_of_its_session_running() {
     fixture.server.start_kill().unwrap();
     fixture.server.wait().await.unwrap();
     fixture.ended("its server").await;
+}
+
+#[tokio::test]
+async fn suspending_a_session_stops_everything_pi_started() {
+    let fixture = Fixture::start().await;
+    fixture
+        .session
+        .call("session.suspend", json!({}))
+        .await
+        .unwrap();
+    fixture.ended("its suspended session").await;
 }
