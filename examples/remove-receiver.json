@@ -1,4 +1,0 @@
-{
-  "remove_nodes": ["B"],
-  "remove_edges": ["A_to_B"]
-}

@@ -4,7 +4,7 @@ use crate::catalog::Operation;
 use crate::state::{ManagedRun, Service};
 use crate::{AppError, Result, persistence, views};
 use ontography::{
-    Activation, ActivationId, ActivationProposal, ContentId, Emission, OutputAuthority,
+    Activation, ActivationId, ActivationProposal, ContentId, Emission, OutputAuthority, PackageId,
     PackageRecord, PendingFrontier, Retirement, SessionSnapshot, Trigger,
 };
 use serde::de::DeserializeOwned;
@@ -257,10 +257,55 @@ pub async fn dispatch_wait(service: &Service, args: &Value) -> Result<Value> {
     )
 }
 
+/// Core moves act only for external nodes: programs and people own the rest.
+/// A node the workflow does not know is left to core to refuse.
+async fn require_external(run: &ManagedRun, node: &str) -> Result<()> {
+    let state = crate::workflow::runtime::load(run)?;
+    let kernel = run.live()?.session.kernel().await.map_err(AppError::core)?;
+    let Some(name) = state.node_names(&kernel).remove(node) else {
+        return Ok(());
+    };
+    let Some(binding) = state.bindings.get(&name) else {
+        return Ok(());
+    };
+    if binding.implementation.is_external() {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "not_external",
+        format!(
+            "{name:?} runs a {} component; core moves act only for external nodes",
+            binding.implementation.kind()
+        ),
+    ))
+}
+
+/// Moving a live package acts for the node holding it.
+async fn require_holder_external(run: &ManagedRun, package: PackageId) -> Result<()> {
+    let history = run
+        .live()?
+        .session
+        .package_history(package)
+        .await
+        .map_err(AppError::core)?;
+    match history.filter(|history| history.package().is_live()) {
+        Some(history) => require_external(run, history.package().holder()).await,
+        None => Ok(()),
+    }
+}
+
 pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Result<Value> {
     match operation {
         "workflow.submit" => {
             let input: ProposalInput = parse_args(run, args)?;
+            match &input.trigger {
+                TriggerInput::Root { node_id, .. } => require_external(run, node_id).await?,
+                TriggerInput::Packages { package_ids } => {
+                    for id in package_ids {
+                        require_holder_external(run, views::package_id(id)?).await?;
+                    }
+                }
+            }
             let proposal = input.compile()?;
             let session = &run.live()?.session;
             let decision = session
@@ -272,6 +317,7 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         "workflow.transfer" => {
             let input: TransferInput = parse_args(run, args)?;
             let package_id = views::package_id(&input.package_id)?;
+            require_holder_external(run, package_id).await?;
             let delivery = run
                 .live()?
                 .session
@@ -286,6 +332,7 @@ pub async fn dispatch(run: &mut ManagedRun, operation: &str, args: &Value) -> Re
         "workflow.retire" => {
             let input: RetireInput = parse_args(run, args)?;
             let id = views::package_id(&input.package_id)?;
+            require_holder_external(run, id).await?;
             let evidence = input
                 .evidence_activation_id
                 .as_deref()
@@ -582,7 +629,7 @@ pub(crate) fn operation(
     mutating: bool,
 ) -> Operation {
     properties["run_id"] =
-        json!({"type":"string","description":"Exact run UUID from run.start or run.list"});
+        json!({"type":"string","description":"Exact run UUID from flow.start or run.list"});
     let mut required = required.to_vec();
     required.push("run_id");
     Operation::new(name, description, properties, &required, mutating)
@@ -609,21 +656,21 @@ pub fn operations() -> Vec<Operation> {
     vec![
         operation(
             "workflow.submit",
-            "Submit one root or package-triggered activation with explicit result, emissions, and content dependencies.",
+            "Submit one root or package-triggered activation for an external node, with explicit result, emissions, and content dependencies.",
             json!({"trigger":trigger,"result":payload_schema(),"emissions":emissions_schema(),"contents":{"type":"array","items":content_id_schema()}}),
             &["trigger", "result"],
             true,
         ),
         operation(
             "workflow.transfer",
-            "Deliver a live outbound occurrence through an accepting edge. A package can be delivered only once.",
+            "Deliver a live outbound package held at an external node through an accepting edge. A package can be delivered only once.",
             json!({"package_id":{"type":"string"},"edge_id":{"type":"string"}}),
             &["package_id", "edge_id"],
             true,
         ),
         operation(
             "workflow.retire",
-            "Retire one live received or outbound package without consuming it. Optional evidence must identify an accepted activation; retirement rejects if the package is already consumed or retired.",
+            "Retire one live received or outbound package held at an external node without consuming it. Optional evidence must identify an accepted activation; retirement rejects if the package is already consumed or retired.",
             json!({"package_id":{"type":"string"},"evidence_activation_id":{"type":"string"}}),
             &["package_id"],
             true,
@@ -690,16 +737,22 @@ pub fn operations() -> Vec<Operation> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::declarations::GraphDeclaration;
     use crate::state::{LiveRun, RunManifest};
+    use crate::workflow::{Catalog, Document};
     use ontography::ProposalRuntime;
     use std::collections::BTreeMap;
 
+    /// A live run of the example document: an outside client acts for both
+    /// of its nodes.
     pub(crate) fn test_run(directory: &std::path::Path) -> ManagedRun {
-        let declaration =
-            GraphDeclaration::parse(include_str!("../../examples/flow.json")).unwrap();
-        let compiled = declaration.compile().unwrap();
-        let runtime = ProposalRuntime::with_policy(compiled.kernel, compiled.policy);
+        let document = Document::parse(include_str!("../../examples/flow.json")).unwrap();
+        let (declaration, workflow) =
+            crate::workflow::tools::plan(&Catalog::builtin(), document, "logical-flow", None, None)
+                .unwrap();
+        let runtime = ProposalRuntime::with_policy(
+            declaration.compile().unwrap(),
+            crate::workflow::edit::policy(),
+        );
         let session = runtime.create_persistent(directory.join("core")).unwrap();
         ManagedRun {
             manifest: RunManifest {
@@ -708,18 +761,17 @@ pub(crate) mod tests {
                 core_version: ontography::VERSION.into(),
                 core_build: crate::CORE_BUILD.into(),
                 declaration_revision: declaration.fingerprint().unwrap(),
-                declaration: declaration.into(),
+                declaration,
                 project: directory.to_owned(),
                 core_path: "core".into(),
                 status: "active".into(),
                 created_at: 0,
                 checkpoints: BTreeMap::new(),
-                workflow: None,
+                workflow,
             },
             directory: directory.to_owned(),
             live: Some(LiveRun::new(runtime, session)),
             recovery_checkouts: BTreeMap::new(),
-            registry: std::sync::Arc::new(crate::registry::ImplementationRegistry::default()),
             environment: crate::environment::Environment::current(),
         }
     }

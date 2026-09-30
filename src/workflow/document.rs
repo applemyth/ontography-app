@@ -14,10 +14,9 @@ use super::{
 };
 use crate::declarations::{
     AuthorityMatchDeclaration, AuthorityTransitionDeclaration, ContractDeclaration,
-    DECLARATION_VERSION, EdgeDeclaration, Edits, GraphDeclaration, IngressDeclaration,
-    NodeDeclaration, RootDeclaration, SchemaDeclaration, VALIDATOR_VERSION, ValidatorKind,
+    DECLARATION_VERSION, EdgeDeclaration, GraphDeclaration, IngressDeclaration, NodeDeclaration,
+    RootDeclaration, SchemaDeclaration, VALIDATOR_VERSION, ValidatorKind,
 };
-use crate::registry::ExecutionBinding;
 use crate::{AppError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -484,8 +483,7 @@ impl IdentityMap {
 }
 
 /// Expand a bound document into a new run's declaration. Each node has its
-/// component's types in core, and its binding is its execution binding. The
-/// run declares `node_types` and every type its nodes have: edits can place
+/// component's types in core. The run declares `node_types` and every type its nodes have: edits can place
 /// nodes only of declared types. Its contracts and authority tags are the
 /// document's, and stay fixed for the run.
 pub fn expand(
@@ -531,10 +529,6 @@ pub fn expand(
         edges: vec![],
         roots: vec![],
         authority_transitions: vec![],
-        // The workflow editor's policy governs edits (`edit::policy`).
-        edits: Edits::Fixed,
-        rewrites: None,
-        execution_bindings: vec![],
     };
     for node in &document.nodes {
         let id = &identities.nodes[&node.id];
@@ -542,14 +536,6 @@ pub fn expand(
         declaration.nodes.push(core.node);
         declaration.roots.extend(core.root);
         declaration.authority_transitions.extend(core.transitions);
-        let implementation = &bindings[&node.id].implementation;
-        declaration.execution_bindings.push(ExecutionBinding {
-            id: id.clone(),
-            node_id: id.clone(),
-            implementation: implementation.kind().into(),
-            version: "1".into(),
-            configuration: implementation.configuration(),
-        });
     }
     for edge in &document.edges {
         declaration.edges.push(document.core_edge(
@@ -609,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn each_node_has_its_component_types_and_its_binding_as_execution_binding() {
+    fn each_node_has_its_component_types_and_binding() {
         let mut document = document();
         let identities = IdentityMap::fresh(&document);
         let mut fingerprints = BTreeSet::new();
@@ -619,13 +605,14 @@ mod tests {
             ("command", json!({"argv":["false"]}), "Command", "command"),
             ("human", json!({"prompt":"Approve?"}), "Human", "human"),
             ("inbox", json!({}), "Inbox", "inbox"),
+            ("external", json!({}), "External", "external"),
         ] {
             document.nodes[1].component = component.into();
             document.nodes[1].config = config;
             let declaration = expand_builtin(&document, "example", &identities).unwrap();
             assert_eq!(
                 declaration.schema.node_types,
-                ["Agent", "Command", "Human", "Inbox"]
+                ["Agent", "Command", "External", "Human", "Inbox"]
             );
             let node = declaration
                 .nodes
@@ -633,17 +620,15 @@ mod tests {
                 .find(|node| node.id == identities.nodes["write"])
                 .unwrap();
             assert_eq!(node.types, [node_type]);
-            let binding = declaration
-                .execution_bindings
-                .iter()
-                .find(|binding| binding.node_id == identities.nodes["write"])
-                .unwrap();
-            assert_eq!(binding.implementation, implementation);
+            assert_eq!(
+                bind(&document).unwrap()["write"].implementation.kind(),
+                implementation
+            );
             let compiled = declaration.compile().unwrap();
-            fingerprints.insert(compiled.kernel.fingerprint().to_string());
+            fingerprints.insert(compiled.fingerprint().to_string());
         }
         // Core records the role: agents share one graph, other roles differ.
-        assert_eq!(fingerprints.len(), 4);
+        assert_eq!(fingerprints.len(), 5);
     }
 
     #[test]
@@ -670,6 +655,25 @@ mod tests {
             .is_err()
         );
         assert!(Document::parse(r#"{"name":"a","name":"b","entry":"n","nodes":[]}"#).is_err());
+    }
+
+    #[test]
+    fn examples_are_documents_whose_names_are_core_identities() {
+        for text in [
+            include_str!("../../examples/flow.json"),
+            include_str!("../../examples/fifteen-node-chain.json"),
+        ] {
+            let document = Document::parse(text).unwrap();
+            let identities = IdentityMap::initial(&document);
+            let declaration = expand_builtin(&document, &document.name, &identities).unwrap();
+            declaration.compile().unwrap();
+            assert!(
+                declaration
+                    .nodes
+                    .iter()
+                    .all(|node| identities.nodes[&node.id] == node.id)
+            );
+        }
     }
 
     #[test]

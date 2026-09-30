@@ -1,12 +1,12 @@
 //! Server ownership of core objects. Connections never own graph resources.
-use crate::declarations::{CompiledGraph, GraphDeclaration};
-use crate::definition::RunDefinition;
+use crate::declarations::GraphDeclaration;
 use crate::environment::Environment;
 use crate::persistence::{Paths, read_json, write_json};
+use crate::workflow::runtime::InitialWorkflow;
 use crate::workspace::{Checkout, WorkspaceStore};
 use crate::{AppError, Result, views};
 use ontography::{
-    ContentId, ExecutionHandle, ExecutionHost, ProposalRuntime, SessionHandle, SessionRewrite,
+    ContentId, ExecutionHandle, ExecutionHost, Kernel, ProposalRuntime, SessionHandle,
     SessionStatus,
 };
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub struct RunManifest {
     pub core_version: String,
     #[serde(default)]
     pub core_build: String,
-    pub declaration: RunDefinition,
+    pub declaration: GraphDeclaration,
     pub declaration_revision: String,
     pub project: PathBuf,
     pub core_path: PathBuf,
@@ -36,8 +36,7 @@ pub struct RunManifest {
     #[serde(default)]
     pub checkpoints: BTreeMap<String, Checkpoint>,
     /// Original workflow and input, pinned before creating core storage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<crate::workflow::runtime::InitialWorkflow>,
+    pub workflow: InitialWorkflow,
 }
 
 impl RunManifest {
@@ -64,19 +63,13 @@ pub struct WorkspaceHandle {
     pub base: ContentId,
 }
 
-pub struct RewriteHandle {
-    pub plan: SessionRewrite,
-}
-
 pub struct LiveRun {
-    pub runtime: Option<ProposalRuntime>,
-    pub application: Option<ontography::RunningApplication>,
+    /// Keeps the run's proposal runtime alive for its session.
+    pub runtime: ProposalRuntime,
     pub session: SessionHandle,
     pub host: ExecutionHost,
     pub executions: BTreeMap<String, ExecutionHandle>,
-    pub rewrites: BTreeMap<String, RewriteHandle>,
     pub checkouts: BTreeMap<String, WorkspaceHandle>,
-    pub bindings: Vec<Value>,
     pub suspension_error: Option<AppError>,
     pub workers: BTreeMap<String, crate::workflow::runtime::Worker>,
 }
@@ -85,34 +78,9 @@ impl LiveRun {
     pub fn new(runtime: ProposalRuntime, session: SessionHandle) -> Self {
         Self {
             host: ExecutionHost::new(session.clone()),
-            runtime: Some(runtime),
-            application: None,
+            runtime,
             session,
             executions: BTreeMap::new(),
-            rewrites: BTreeMap::new(),
-            checkouts: BTreeMap::new(),
-            bindings: Vec::new(),
-            suspension_error: None,
-            workers: BTreeMap::new(),
-        }
-    }
-
-    fn from_application(application: ontography::RunningApplication) -> Self {
-        let session = application.session().clone();
-        let executions = application
-            .executions()
-            .iter()
-            .map(|h| (uuid::Uuid::new_v4().to_string(), h.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let bindings=executions.iter().map(|(id,h)|json!({"execution_id":id,"node_id":h.node_id(),"lifetime":"application","status":"launched"})).collect();
-        Self {
-            host: ExecutionHost::new(session.clone()),
-            session,
-            runtime: None,
-            application: Some(application),
-            executions,
-            bindings,
-            rewrites: BTreeMap::new(),
             checkouts: BTreeMap::new(),
             suspension_error: None,
             workers: BTreeMap::new(),
@@ -132,14 +100,8 @@ impl LiveRun {
             self.host.abort_all();
             self.host.wait_idle().await;
         }
-        if let Some(application) = self.application.take() {
-            application.suspend().await;
-        }
         self.executions.clear();
         self.workers.clear();
-        for binding in &mut self.bindings {
-            binding["status"] = json!("stopped");
-        }
     }
 }
 
@@ -147,7 +109,6 @@ pub struct ManagedRun {
     pub manifest: RunManifest,
     pub directory: PathBuf,
     pub live: Option<LiveRun>,
-    pub registry: Arc<crate::registry::ImplementationRegistry>,
     /// Preserve user checkouts while a faulted core owner is reopened.
     pub recovery_checkouts: BTreeMap<String, WorkspaceHandle>,
     /// What its programs start with: its session's environment, or the
@@ -156,10 +117,6 @@ pub struct ManagedRun {
 }
 
 impl ManagedRun {
-    pub fn is_workflow(&self) -> bool {
-        self.manifest.workflow.is_some()
-    }
-
     pub fn live(&self) -> Result<&LiveRun> {
         self.live.as_ref().ok_or_else(|| {
             AppError::new(
@@ -188,21 +145,6 @@ impl ManagedRun {
 
     pub fn core_path(&self) -> Result<PathBuf> {
         if self.manifest.core_path.as_os_str().is_empty()
-            && matches!(self.manifest.declaration, RunDefinition::Application(_))
-        {
-            // Core chooses the application run UUID. Reconcile a crash before the app manifest recorded it.
-            let paths = std::fs::read_dir(self.directory.join("application/runs"))?
-                .map(|e| e.map(|e| e.path()))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if paths.len() != 1 {
-                return Err(AppError::new(
-                    "incomplete_creation",
-                    "expected exactly one core application directory; inspect recovery files",
-                ));
-            }
-            return Ok(paths[0].clone());
-        }
-        if self.manifest.core_path.as_os_str().is_empty()
             || self
                 .manifest
                 .core_path
@@ -218,7 +160,7 @@ impl ManagedRun {
     }
 
     pub fn summary(&self) -> Value {
-        json!({"run_id":self.manifest.run_id,"definition_id":self.manifest.declaration.id(),
+        json!({"run_id":self.manifest.run_id,"definition_id":self.manifest.declaration.id,
             "definition_revision":self.manifest.declaration_revision,"project":self.manifest.project,
             "status":if self.live.as_ref().is_some_and(|l|l.session.status()==SessionStatus::Closed){"closed"}else if self.live.as_ref().is_some_and(|l|l.suspension_error.is_some()){"suspension_failed"}else if self.live.is_some(){"active"}else{self.manifest.resting_status()},
             "admission":self.live.as_ref().map(|l|views::status(l.session.status())),
@@ -249,9 +191,8 @@ impl ManagedRun {
                 "received":overview.received().iter().map(|(id,p)|views::package(*id,p)).collect::<Vec<_>>(),
                 "outbound":overview.outbound().iter().map(|(id,p)|views::package(*id,p)).collect::<Vec<_>>()});
             result["executions"] = json!(live.executions.iter().map(|(id,h)|json!({"execution_id":id,"node_id":h.node_id(),"status":format!("{:?}",h.status()).to_lowercase()})).collect::<Vec<_>>());
-            result["bindings"] = json!(live.bindings);
             result["suspension_error"] = json!(live.suspension_error);
-            result["resources"] = json!({"rewrites":live.rewrites.keys().collect::<Vec<_>>(),"checkouts":live.checkouts.iter().map(|(id,h)|json!({"checkout_id":id,"path":h.checkout.path(),"base":h.base})).collect::<Vec<_>>()});
+            result["resources"] = json!({"checkouts":live.checkouts.iter().map(|(id,h)|json!({"checkout_id":id,"path":h.checkout.path(),"base":h.base})).collect::<Vec<_>>()});
         }
         Ok(result)
     }
@@ -267,31 +208,12 @@ impl ManagedRun {
             self.recovery_checkouts.append(&mut live.checkouts);
             self.live = None;
         }
-        if self.live.is_some() {
-            if self.is_workflow() {
-                return crate::workflow::runtime::resume(self).await;
-            }
+        self.open()?;
+        if self.live()?.session.status() == SessionStatus::Closed {
+            // A closed run stays readable; nothing runs in it again.
             return Ok(());
         }
-        self.validate_metadata()?;
-        if let RunDefinition::Application(declaration) = &self.manifest.declaration {
-            let compiled = declaration.compile(&self.registry, &self.manifest.project)?;
-            match compiled.application.resume(self.core_path()?).await {
-                Ok(application) => {
-                    self.live = Some(LiveRun::from_application(application));
-                    self.manifest.status = "active".into();
-                    self.save()
-                }
-                Err(ontography::ApplicationStartError::NotResumable(_)) => self.open(),
-                Err(error) => Err(AppError::new(
-                    "application_resume_failed",
-                    error.to_string(),
-                )),
-            }
-        } else {
-            self.open()?;
-            self.launch_bindings().await
-        }
+        crate::workflow::runtime::resume(self).await
     }
 
     fn validate_metadata(&self) -> Result<()> {
@@ -304,7 +226,13 @@ impl ManagedRun {
                 "run format/core build does not match this installation",
             ));
         }
-        if self.manifest.declaration.fingerprint()? != self.manifest.declaration_revision {
+        if self
+            .manifest
+            .declaration
+            .fingerprint()
+            .map_err(AppError::core)?
+            != self.manifest.declaration_revision
+        {
             return Err(AppError::new(
                 "incompatible_run",
                 "saved definition fingerprint mismatch",
@@ -319,17 +247,12 @@ impl ManagedRun {
             return Ok(());
         }
         self.validate_metadata()?;
-        let compiled = self
+        let kernel = self
             .manifest
             .declaration
-            .compile(&self.registry, &self.manifest.project)?;
-        if !self.is_workflow() {
-            self.registry.validate_bindings(
-                self.manifest.declaration.execution_bindings(),
-                &compiled.kernel,
-            )?;
-        }
-        let runtime = runtime(compiled, self.is_workflow());
+            .compile()
+            .map_err(AppError::core)?;
+        let runtime = runtime(kernel);
         let session = runtime
             .open_persistent(self.core_path()?)
             .map_err(AppError::core)?;
@@ -341,23 +264,6 @@ impl ManagedRun {
             .append(&mut self.recovery_checkouts);
         self.manifest.status = "active".into();
         self.save()
-    }
-
-    async fn launch_bindings(&mut self) -> Result<()> {
-        if self.is_workflow() {
-            return crate::workflow::runtime::resume(self).await;
-        }
-        let launched = self
-            .registry
-            .launch_bindings(
-                self.manifest.declaration.execution_bindings(),
-                &self.live()?.host,
-            )
-            .await?;
-        let live = self.live_mut()?;
-        live.executions.extend(launched.executions);
-        live.bindings = launched.reports;
-        Ok(())
     }
 
     /// Called while the run's exclusive tool mutex is held; no connection can add resources.
@@ -421,7 +327,6 @@ impl ManagedRun {
         }
         .into();
         write_json(&self.directory.join("manifest.json"), &self.manifest)?;
-        live.rewrites.clear();
         let checkouts = std::mem::take(&mut live.checkouts);
         for (_, handle) in checkouts {
             handle.checkout.remove().await.map_err(AppError::core)?;
@@ -437,7 +342,6 @@ pub struct Service {
     pub paths: Paths,
     pub server_id: String,
     pub runs: Mutex<BTreeMap<String, Arc<Mutex<ManagedRun>>>>,
-    pub registry: Arc<crate::registry::ImplementationRegistry>,
     pub recovery_errors: BTreeMap<String, AppError>,
     pub sessions: crate::sessions::Sessions,
     /// What work no session owns starts with: the environment of the latest
@@ -451,15 +355,9 @@ fn programs(paths: &Paths, environment: Environment) -> Environment {
     environment.with("ONTOGRAPHY_DATA_DIR", paths.root.to_string_lossy())
 }
 
-/// The runtime for a compiled run. Workflow runs accept only their editor's
-/// edits, whatever their saved declaration says.
-fn runtime(compiled: CompiledGraph, workflow: bool) -> ProposalRuntime {
-    let policy = if workflow {
-        crate::workflow::edit::policy()
-    } else {
-        compiled.policy
-    };
-    ProposalRuntime::with_policy(compiled.kernel, policy)
+/// The runtime for a compiled run: it accepts only its document editor's edits.
+fn runtime(kernel: Arc<Kernel>) -> ProposalRuntime {
+    ProposalRuntime::with_policy(kernel, crate::workflow::edit::policy())
 }
 
 /// A crash may leave only the reserved directory. Nonempty unknown stores are never overwritten.
@@ -479,16 +377,6 @@ fn create_reserved_directory(directory: &std::path::Path) -> Result<()> {
 
 impl Service {
     pub fn new(paths: Paths) -> Result<Self> {
-        Self::with_registry(
-            paths,
-            Arc::new(crate::registry::ImplementationRegistry::default()),
-        )
-    }
-
-    pub fn with_registry(
-        paths: Paths,
-        registry: Arc<crate::registry::ImplementationRegistry>,
-    ) -> Result<Self> {
         let environment = programs(&paths, Environment::current());
         let mut runs = BTreeMap::new();
         let mut recovery_errors = BTreeMap::new();
@@ -516,7 +404,6 @@ impl Service {
                             manifest,
                             directory: entry.path(),
                             live: None,
-                            registry: registry.clone(),
                             recovery_checkouts: BTreeMap::new(),
                             environment: environment.clone(),
                         })),
@@ -532,7 +419,6 @@ impl Service {
             paths,
             server_id: uuid::Uuid::new_v4().to_string(),
             runs: Mutex::new(runs),
-            registry,
             recovery_errors,
             sessions,
             unowned: std::sync::Mutex::new(environment),
@@ -600,54 +486,17 @@ impl Service {
             .ok_or_else(|| AppError::new("not_found", format!("run {id} does not exist")))
     }
 
-    pub async fn start(&self, declaration: GraphDeclaration, project: PathBuf) -> Result<Value> {
-        self.start_reserved(
-            &uuid::Uuid::new_v4().to_string(),
-            declaration,
-            project,
-            self.environment(),
-        )
-        .await
-    }
-
-    /// Reconcile a durably reserved identity without creating another run on
-    /// retry. The run's programs start with `environment`.
+    /// Create the run reserved as `id`, or reconcile it on retry without
+    /// creating another. Its programs start with `environment`.
     pub async fn start_reserved(
         &self,
         id: &str,
         declaration: GraphDeclaration,
         project: PathBuf,
+        workflow: InitialWorkflow,
         environment: Environment,
     ) -> Result<Value> {
-        self.start_reserved_inner(id, declaration, project, None, environment)
-            .await
-    }
-
-    pub async fn start_workflow_reserved(
-        &self,
-        id: &str,
-        declaration: GraphDeclaration,
-        project: PathBuf,
-        workflow: crate::workflow::runtime::InitialWorkflow,
-        environment: Environment,
-    ) -> Result<Value> {
-        self.start_reserved_inner(id, declaration, project, Some(workflow), environment)
-            .await
-    }
-
-    async fn start_reserved_inner(
-        &self,
-        id: &str,
-        declaration: GraphDeclaration,
-        project: PathBuf,
-        workflow: Option<crate::workflow::runtime::InitialWorkflow>,
-        environment: Environment,
-    ) -> Result<Value> {
-        let compiled = declaration.compile().map_err(AppError::core)?;
-        if workflow.is_none() {
-            self.registry
-                .validate_bindings(&declaration.execution_bindings, &compiled.kernel)?;
-        }
+        let kernel = declaration.compile().map_err(AppError::core)?;
         let declaration_revision = declaration.fingerprint().map_err(AppError::core)?;
         let project = std::fs::canonicalize(project)?;
         if !project.is_dir() {
@@ -669,17 +518,17 @@ impl Service {
                 && !run.directory.join("core").exists()
                 && run.manifest.status == "creating"
             {
-                let runtime = runtime(compiled, workflow.is_some());
+                let runtime = runtime(kernel);
                 let session = runtime
                     .create_persistent(run.directory.join("core"))
                     .map_err(AppError::core)?;
                 run.live = Some(LiveRun::new(runtime, session));
                 run.manifest.status = "active".into();
                 run.save()?;
-                run.launch_bindings().await?;
+                crate::workflow::runtime::resume(&mut run).await?;
             } else if run.live.is_none() {
                 run.resume().await?;
-            } else if run.is_workflow() {
+            } else {
                 let workflow = crate::workflow::runtime::load(&run)?;
                 if workflow.pending.is_none() {
                     crate::workflow::runtime::reconcile(&mut run, &workflow, false).await?;
@@ -694,7 +543,7 @@ impl Service {
             run_id: id.into(),
             core_version: ontography::VERSION.into(),
             core_build: crate::CORE_BUILD.into(),
-            declaration: declaration.into(),
+            declaration,
             declaration_revision,
             project,
             core_path: "core".into(),
@@ -711,13 +560,12 @@ impl Service {
             manifest,
             directory,
             live: None,
-            registry: self.registry.clone(),
             recovery_checkouts: BTreeMap::new(),
             environment,
         }));
         self.runs.lock().await.insert(id.into(), run.clone());
         let mut run = run.lock().await;
-        let runtime = runtime(compiled, run.is_workflow());
+        let runtime = runtime(kernel);
         let session = runtime
             .create_persistent(run.directory.join("core"))
             .map_err(|e| {
@@ -726,9 +574,8 @@ impl Service {
         run.live = Some(LiveRun::new(runtime, session));
         run.manifest.status = "active".into();
         run.save()?;
-        run.launch_bindings().await?;
-        let result = run.inspect(100).await?;
-        Ok(result)
+        crate::workflow::runtime::resume(&mut run).await?;
+        run.inspect(100).await
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -737,123 +584,5 @@ impl Service {
             run.lock().await.suspend(false).await?;
         }
         Ok(())
-    }
-
-    pub async fn start_application(
-        &self,
-        declaration: crate::application::ApplicationDeclaration,
-        project: PathBuf,
-        input: ontography::Payload,
-    ) -> Result<Value> {
-        self.start_application_reserved(
-            &uuid::Uuid::new_v4().to_string(),
-            declaration,
-            project,
-            input,
-            self.environment(),
-        )
-        .await
-    }
-
-    pub async fn start_application_reserved(
-        &self,
-        id: &str,
-        declaration: crate::application::ApplicationDeclaration,
-        project: PathBuf,
-        input: ontography::Payload,
-        environment: Environment,
-    ) -> Result<Value> {
-        let project = std::fs::canonicalize(project)?;
-        if !project.is_dir() {
-            return Err(AppError::invalid("project must be a directory"));
-        }
-        let compiled = declaration.compile(&self.registry, &project)?;
-        let declaration_revision = declaration.fingerprint()?;
-        if let Some(run) = self.runs.lock().await.get(id).cloned() {
-            let mut run = run.lock().await;
-            if run.manifest.declaration_revision != declaration_revision
-                || run.manifest.project != project
-            {
-                return Err(AppError::new(
-                    "initialization_conflict",
-                    "reserved application identity has different initialization data",
-                ));
-            }
-            run.environment = environment;
-            let application_runs = run.directory.join("application/runs");
-            let has_core_run =
-                application_runs.exists() && std::fs::read_dir(&application_runs)?.next().is_some();
-            if run.live.is_none() && run.manifest.status == "creating" && !has_core_run {
-                let application = compiled
-                    .application
-                    .start_in(run.directory.join("application"), input)
-                    .await
-                    .map_err(|error| {
-                        AppError::new("application_start_failed", error.to_string())
-                    })?;
-                run.manifest.core_path = application
-                    .run_path()
-                    .expect("persistent application has a path")
-                    .strip_prefix(&run.directory)
-                    .map_err(AppError::core)?
-                    .to_path_buf();
-                run.live = Some(LiveRun::from_application(application));
-                run.manifest.status = "active".into();
-                run.save()?;
-            } else if run.live.is_none() {
-                // Existing applications resume without replaying their initial input.
-                run.resume().await?;
-            }
-            return run.inspect(100).await;
-        }
-        let directory = self.paths.run(id)?;
-        create_reserved_directory(&directory)?;
-        let manifest = RunManifest {
-            version: 1,
-            run_id: id.into(),
-            core_version: ontography::VERSION.into(),
-            core_build: crate::CORE_BUILD.into(),
-            declaration: RunDefinition::Application(declaration),
-            declaration_revision,
-            project,
-            core_path: PathBuf::new(),
-            status: "creating".into(),
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            checkpoints: BTreeMap::new(),
-            workflow: None,
-        };
-        write_json(&directory.join("manifest.json"), &manifest)?;
-        let run = Arc::new(Mutex::new(ManagedRun {
-            manifest,
-            directory,
-            live: None,
-            registry: self.registry.clone(),
-            recovery_checkouts: BTreeMap::new(),
-            environment,
-        }));
-        self.runs.lock().await.insert(id.into(), run.clone());
-        let mut run = run.lock().await;
-        let application = compiled
-            .application
-            .start_in(run.directory.join("application"), input)
-            .await
-            .map_err(|e| {
-                AppError::new("application_start_failed", e.to_string())
-                    .details(json!({"run_id":id,"status":"creation_incomplete"}))
-            })?;
-        let core_path = application
-            .run_path()
-            .expect("start_in creates a persistent run")
-            .strip_prefix(&run.directory)
-            .map_err(AppError::core)?
-            .to_path_buf();
-        run.live = Some(LiveRun::from_application(application));
-        run.manifest.core_path = core_path;
-        run.manifest.status = "active".into();
-        run.save()?;
-        run.inspect(100).await
     }
 }

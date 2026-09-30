@@ -1,8 +1,8 @@
-//! Serializable logical graph declarations compiled through public core APIs.
+//! Core graph declarations: what the document compiler produces and a run
+//! stores, compiled through public core APIs.
 //!
-//! This format does not imply executable node implementations. Contract kinds
-//! select the small trusted validator catalog below; they are not executable
-//! schemas supplied by a client.
+//! Contract kinds select the small trusted validator catalog below; they are
+//! not executable schemas supplied by a client.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -10,9 +10,8 @@ use std::sync::Arc;
 
 use ontography::{
     Authority, AuthorityMatch, AuthorityTag, Contract, ContractViolation, DefinitionError,
-    DefinitionId, DenyAll, Edge, EdgeDefinition, EditContext, EditPolicy, Graph, GraphEdit,
-    GraphFragment, IngressMode, Kernel, Node, NodeDefinition, PackageEnvelope, Payload, PermitAll,
-    PolicyDenial, RootRule, Schema,
+    DefinitionId, Edge, EdgeDefinition, Graph, GraphFragment, IngressMode, Kernel, Node,
+    NodeDefinition, PackageEnvelope, Payload, RootRule, Schema,
 };
 use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -36,10 +35,6 @@ pub enum DeclarationError {
         #[source]
         source: DefinitionError,
     },
-    #[error(
-        "rewrite productions are no longer supported: declare \"edits\" and send explicit graph edits"
-    )]
-    RewriteProductions,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -56,57 +51,11 @@ pub struct GraphDeclaration {
     pub roots: Vec<RootDeclaration>,
     #[serde(default)]
     pub authority_transitions: Vec<AuthorityTransitionDeclaration>,
-    /// Which graph edits a run of this graph accepts.
-    #[serde(default, skip_serializing_if = "Edits::is_fixed")]
-    pub edits: Edits,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)]
-    pub rewrites: SavedProductions,
-    #[serde(default)]
-    pub execution_bindings: Vec<crate::registry::ExecutionBinding>,
-}
-
-/// A graph ready to run: its admitted definition and the policy that decides
-/// which edits its runs accept.
-#[derive(Clone)]
-pub struct CompiledGraph {
-    pub kernel: Arc<Kernel>,
-    pub policy: Arc<dyn EditPolicy>,
-}
-
-impl fmt::Debug for CompiledGraph {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CompiledGraph")
-            .field("kernel", &self.kernel)
-            .finish_non_exhaustive()
-    }
 }
 
 impl GraphDeclaration {
-    /// Parse a new declaration without silently accepting duplicate keys,
-    /// including nested maps. Saved declarations are read as they were saved.
-    pub fn parse(document: &str) -> Result<Self, DeclarationError> {
-        let declaration: Self = parse_json(document)?;
-        declaration.check_new()?;
-        Ok(declaration)
-    }
-
-    /// Reject what only declarations saved by earlier versions may contain.
-    pub fn check_new(&self) -> Result<(), DeclarationError> {
-        if self
-            .rewrites
-            .as_ref()
-            .is_some_and(|rules| !rules.is_empty())
-        {
-            return Err(DeclarationError::RewriteProductions);
-        }
-        Ok(())
-    }
-
-    /// Construct the actual core schema, contracts, and graph, and the policy
-    /// its edits are admitted under.
-    pub fn compile(&self) -> Result<CompiledGraph, DeclarationError> {
+    /// Construct the actual core schema, contracts, and graph.
+    pub fn compile(&self) -> Result<Arc<Kernel>, DeclarationError> {
         if self.version != DECLARATION_VERSION {
             return Err(DeclarationError::UnsupportedVersion(self.version));
         }
@@ -124,13 +73,10 @@ impl GraphDeclaration {
             authority_transitions: &self.authority_transitions,
         }
         .admit(&id, &schema, &contracts, "graph")?;
-        Ok(CompiledGraph {
-            kernel: Arc::new(kernel),
-            policy: edit_policy(self.edits, &self.rewrites),
-        })
+        Ok(Arc::new(kernel))
     }
 
-    /// SHA-256 of the typed declaration, including validator versions and edits.
+    /// SHA-256 of the typed declaration, including validator versions.
     /// JSON whitespace and object-key ordering do not affect this identity;
     /// declared list ordering does. This is not the core kernel fingerprint.
     pub fn fingerprint(&self) -> Result<String, DeclarationError> {
@@ -341,96 +287,6 @@ impl GraphFragmentDeclaration {
     }
 }
 
-/// An explicit graph edit: existing nodes and edges to remove and new ones to
-/// add, in one transition. Removing a node requires removing its edges. Added
-/// nodes and edges take identities never used in the run, and only they may
-/// carry definitions, roots, or authority transitions: changing a surviving
-/// node or edge means replacing it.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GraphEditDeclaration {
-    #[serde(default)]
-    pub remove_nodes: BTreeSet<String>,
-    #[serde(default)]
-    pub remove_edges: BTreeSet<String>,
-    #[serde(default)]
-    pub add: GraphFragmentDeclaration,
-}
-
-impl GraphEditDeclaration {
-    pub fn parse(document: &str) -> Result<Self, DeclarationError> {
-        parse_json(document)
-    }
-
-    pub fn compile(&self) -> Result<GraphEdit, DeclarationError> {
-        let identities = |values: &BTreeSet<String>| {
-            values
-                .iter()
-                .map(|value| Arc::from(value.as_str()))
-                .collect()
-        };
-        Ok(GraphEdit::new(
-            identities(&self.remove_nodes),
-            identities(&self.remove_edges),
-            self.add.compile()?,
-        ))
-    }
-}
-
-/// Which graph edits a run accepts. Core admits an edit only when its result
-/// is a valid graph; this decides whether a run accepts edits at all.
-#[derive(
-    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Edits {
-    /// The graph is fixed.
-    #[default]
-    Fixed,
-    /// Any edit core admits.
-    Any,
-}
-
-impl Edits {
-    pub(crate) const fn is_fixed(&self) -> bool {
-        matches!(self, Self::Fixed)
-    }
-}
-
-/// Rewrite productions from declarations saved by earlier versions. Core no
-/// longer matches productions; they are kept only so that saved declarations
-/// keep their fingerprints.
-pub type SavedProductions = Option<Vec<RewriteProductionDeclaration>>;
-
-#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RewriteProductionDeclaration {
-    pub id: String,
-    pub left: GraphFragmentDeclaration,
-    #[serde(default)]
-    pub interface_nodes: BTreeSet<String>,
-    #[serde(default)]
-    pub interface_edges: BTreeSet<String>,
-    pub right: GraphFragmentDeclaration,
-}
-
-/// The policy for declared `edits`. A declaration saved with productions and
-/// no `edits` accepted only the edits its productions named; explicit edits
-/// name none, so its graph is fixed.
-pub(crate) fn edit_policy(edits: Edits, saved: &SavedProductions) -> Arc<dyn EditPolicy> {
-    match edits {
-        Edits::Any => Arc::new(PermitAll),
-        Edits::Fixed if saved.as_ref().is_some_and(|rules| !rules.is_empty()) => {
-            Arc::new(|_: &EditContext<'_>| {
-                Err(PolicyDenial::new(
-                    "this run was saved with rewrite productions, which are no longer supported; its graph is fixed",
-                ))
-            })
-        }
-        Edits::Fixed => Arc::new(DenyAll),
-    }
-}
-
 struct FragmentRef<'a> {
     nodes: &'a [NodeDeclaration],
     edges: &'a [EdgeDeclaration],
@@ -626,31 +482,30 @@ impl<'de> Visitor<'de> for UniqueJsonVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ontography::{
-        ActivationProposal, Emission, OutputAuthority, PackageId, Principal, RetirementReason,
-        RewriteError, RewriteRequest,
-    };
-    use std::collections::BTreeMap;
+    use ontography::{ActivationProposal, Emission, OutputAuthority, PackageId};
 
-    const FLOW: &str = include_str!("../examples/flow.json");
-    const REMOVE_RECEIVER: &str = include_str!("../examples/remove-receiver.json");
-    /// The example as saved before explicit edits, with a rewrite production.
-    const SAVED_FLOW: &str = include_str!("../tests/fixtures/saved-flow.json");
+    /// A root `A` sends text to `B` under `work` authority.
+    const FLOW: &str = r#"{
+        "version": 1, "id": "logical-flow",
+        "schema": {"node_types": ["Logical"], "object_types": ["Text"], "authority_tags": ["work"]},
+        "contracts": [{"id": "text", "object_type": "Text", "validator": "text", "validator_version": 1}],
+        "nodes": [
+            {"id": "A", "types": ["Logical"], "result_contract": "text"},
+            {"id": "B", "types": ["Logical"], "result_contract": "text"}
+        ],
+        "edges": [{"id": "A_to_B", "source": "A", "target": "B", "types": ["Flow"],
+            "package_contract": "text", "authority_tags": ["work"]}],
+        "roots": [{"node_id": "A", "ceiling": ["work"]}]
+    }"#;
 
-    fn request(edit: &str) -> RewriteRequest {
-        RewriteRequest::new(
-            Principal::new("test"),
-            GraphEditDeclaration::parse(edit)
-                .unwrap()
-                .compile()
-                .unwrap(),
-        )
+    fn flow() -> GraphDeclaration {
+        parse_json(FLOW).unwrap()
     }
 
     #[test]
-    fn example_delivers_and_edits_through_core() {
-        let compiled = GraphDeclaration::parse(FLOW).unwrap().compile().unwrap();
-        let mut state = compiled.kernel.empty_state();
+    fn a_declaration_delivers_through_core() {
+        let kernel = flow().compile().unwrap();
+        let mut state = kernel.empty_state();
         let mut proposal = ActivationProposal::root(
             "A",
             Authority::new([AuthorityTag::new("work").unwrap()]),
@@ -661,115 +516,20 @@ mod tests {
             OutputAuthority::Carry,
             Arc::from(&b"hello"[..]),
         ));
-        let accepted = compiled.kernel.activate(&mut state, proposal).unwrap();
+        let accepted = kernel.activate(&mut state, proposal).unwrap();
         let package = PackageId::from_parts(accepted, 0);
         assert_eq!(state.position(package).unwrap().holder(), "B");
-
-        let plan = compiled
-            .kernel
-            .prepare_rewrite(
-                &state,
-                compiled.policy.as_ref(),
-                &request(REMOVE_RECEIVER),
-                &BTreeMap::new(),
-            )
-            .unwrap();
-        assert_eq!(
-            plan.retirements().get(&package),
-            Some(&RetirementReason::HolderRemoved)
-        );
-        assert!(
-            state.position(package).is_some(),
-            "preparing does not mutate state"
-        );
-        let next = compiled.kernel.commit_rewrite(&mut state, plan).unwrap();
-        assert!(next.graph().node("B").is_none());
-        assert!(next.graph().edge("A_to_B").is_none());
-        assert!(state.position(package).is_none());
-        assert!(
-            state.activation(accepted).is_some(),
-            "history survives retirement"
-        );
-    }
-
-    #[test]
-    fn edits_add_declared_fragments_and_fixed_graphs_refuse_them() {
-        let mut declaration = GraphDeclaration::parse(FLOW).unwrap();
-        let compiled = declaration.compile().unwrap();
-        let state = compiled.kernel.empty_state();
-        let add_receiver = r#"{"add":{
-            "nodes":[{"id":"C","types":["Logical"],"result_contract":"text"}],
-            "edges":[{"id":"A_to_C","source":"A","target":"C","types":["Flow"],
-                "package_contract":"text","authority_tags":["work"]}]}}"#;
-        let plan = compiled
-            .kernel
-            .prepare_rewrite(
-                &state,
-                compiled.policy.as_ref(),
-                &request(add_receiver),
-                &BTreeMap::new(),
-            )
-            .unwrap();
-        assert!(plan.next_kernel().graph().edge("A_to_C").is_some());
-        declaration.edits = Edits::Fixed;
-        let fixed = declaration.compile().unwrap();
-        assert!(matches!(
-            fixed.kernel.prepare_rewrite(
-                &state,
-                fixed.policy.as_ref(),
-                &request(add_receiver),
-                &BTreeMap::new(),
-            ),
-            Err(RewriteError::Denied(_))
-        ));
-    }
-
-    #[test]
-    fn saved_declarations_keep_their_fingerprints_and_fix_their_graphs() {
-        // Saved runs are read as saved, then fingerprinted and compiled again.
-        // Their productions serialize exactly where earlier versions put them.
-        let saved: GraphDeclaration = serde_json::from_str(SAVED_FLOW).unwrap();
-        let serialized = serde_json::to_string(&saved).unwrap();
-        assert!(
-            serialized
-                .contains(r#""authority_transitions":[],"rewrites":[{"id":"remove_receiver","#),
-            "{serialized}"
-        );
-        assert!(!serialized.contains("edits"));
-        let mut none = saved.clone();
-        none.rewrites = Some(vec![]);
-        assert!(
-            serde_json::to_string(&none)
-                .unwrap()
-                .contains(r#""authority_transitions":[],"rewrites":[],"execution_bindings":[]"#)
-        );
-        let compiled = saved.compile().unwrap();
-        let state = compiled.kernel.empty_state();
-        let Err(RewriteError::Denied(reason)) = compiled.kernel.prepare_rewrite(
-            &state,
-            compiled.policy.as_ref(),
-            &request(REMOVE_RECEIVER),
-            &BTreeMap::new(),
-        ) else {
-            panic!("a graph saved with productions is fixed");
-        };
-        assert!(reason.contains("rewrite productions"), "{reason}");
-        // New declarations cannot declare productions.
-        assert!(matches!(
-            GraphDeclaration::parse(SAVED_FLOW),
-            Err(DeclarationError::RewriteProductions)
-        ));
     }
 
     #[test]
     fn invalid_references_and_versions_are_rejected() {
-        let mut declaration = GraphDeclaration::parse(FLOW).unwrap();
+        let mut declaration = flow();
         declaration.edges[0].target = "absent".into();
         assert!(matches!(
             declaration.compile(),
             Err(DeclarationError::Definition { .. })
         ));
-        declaration = GraphDeclaration::parse(FLOW).unwrap();
+        declaration = flow();
         declaration.version = 2;
         assert!(matches!(
             declaration.compile(),
@@ -784,29 +544,35 @@ mod tests {
     }
 
     #[test]
-    fn validator_kind_changes_real_admission() {
-        let mut declaration = GraphDeclaration::parse(FLOW).unwrap();
-        let compiled = declaration.compile().unwrap();
-        let mut state = compiled.kernel.empty_state();
-        let non_utf8 = ActivationProposal::root("A", Authority::new([]), Arc::from(&[0xff][..]));
+    fn validators_decide_real_admission() {
+        let mut declaration = flow();
+        let root = |bytes: &'static [u8]| {
+            ActivationProposal::root("A", Authority::new([]), Arc::from(bytes))
+        };
+        let kernel = declaration.compile().unwrap();
+        let mut state = kernel.empty_state();
+        assert!(kernel.activate(&mut state, root(&[0xff])).is_err());
         assert!(
-            compiled
-                .kernel
-                .activate(&mut state, non_utf8.clone())
+            kernel
+                .activate(&mut state, root(br#"{"ontography_package":7}"#))
                 .is_err()
         );
-        assert!(state.activations().is_empty());
+        assert!(kernel.activate(&mut state, root(b"text")).is_ok());
         declaration.contracts[0].validator = ValidatorKind::Bytes;
-        let compiled = declaration.compile().unwrap();
-        let mut state = compiled.kernel.empty_state();
-        assert!(compiled.kernel.activate(&mut state, non_utf8).is_ok());
+        let kernel = declaration.compile().unwrap();
+        let mut state = kernel.empty_state();
+        assert!(kernel.activate(&mut state, root(&[0xff])).is_ok());
+        declaration.contracts[0].validator = ValidatorKind::Workspace;
+        let kernel = declaration.compile().unwrap();
+        let mut state = kernel.empty_state();
+        assert!(kernel.activate(&mut state, root(b"text")).is_err());
     }
 
     #[test]
     fn duplicate_keys_and_unknown_fields_are_rejected() {
-        let duplicate = r#"{"remove_nodes":["A"],"add":{"nodes":[],"nodes":[]}}"#;
+        let duplicate = r#"{"nodes":[],"nodes":[]}"#;
         assert!(
-            GraphEditDeclaration::parse(duplicate)
+            parse_json::<GraphFragmentDeclaration>(duplicate)
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate JSON key")
@@ -816,26 +582,23 @@ mod tests {
             "\"version\": 1, \"implementation\": \"codex\"",
             1,
         );
-        assert!(GraphDeclaration::parse(&unknown).is_err());
+        assert!(parse_json::<GraphDeclaration>(&unknown).is_err());
     }
 
     #[test]
-    fn declaration_fingerprint_ignores_json_formatting_and_includes_edits() {
-        let declaration = GraphDeclaration::parse(FLOW).unwrap();
+    fn declaration_fingerprint_ignores_json_formatting() {
+        let declaration = flow();
         let compact = serde_json::to_string(&declaration).unwrap();
         let fingerprint = declaration.fingerprint().unwrap();
         assert_eq!(fingerprint.len(), 64);
         assert_eq!(
             fingerprint,
-            GraphDeclaration::parse(&compact)
+            parse_json::<GraphDeclaration>(&compact)
                 .unwrap()
                 .fingerprint()
                 .unwrap()
         );
-        let mut changed = declaration.clone();
-        changed.edits = Edits::Fixed;
-        assert_ne!(fingerprint, changed.fingerprint().unwrap());
-        changed = declaration;
+        let mut changed = declaration;
         changed.contracts[0].validator = ValidatorKind::Bytes;
         assert_ne!(fingerprint, changed.fingerprint().unwrap());
     }

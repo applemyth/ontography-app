@@ -1,10 +1,8 @@
 //! A process and tool boundary around Ontography's public core API.
 
-pub mod application;
 pub mod catalog;
 pub mod client;
 pub mod declarations;
-pub mod definition;
 pub mod environment;
 pub mod error;
 pub mod launcher;
@@ -18,7 +16,6 @@ pub mod node_tool;
 pub mod persistence;
 pub mod process;
 pub mod protocol;
-pub mod registry;
 pub mod server;
 pub mod session_runtime;
 pub mod sessions;

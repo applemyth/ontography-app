@@ -1,94 +1,52 @@
 //! Lifecycle gates at the public service boundary, using real core ownership.
 
-use crate::declarations::GraphDeclaration;
 use crate::persistence::Paths;
-use crate::registry::{ExecutionBinding, ImplementationDescriptor, ImplementationRegistry};
 use crate::state::Service;
 use crate::tools;
-use ontography::ExecutionContext;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-use std::time::Duration;
-use tokio::sync::Notify;
 
-#[derive(Default)]
-struct WorkObserved {
-    starts: AtomicUsize,
-    stops: AtomicUsize,
-    started: Notify,
+/// An outside client feeds a command worker, the run's one execution.
+fn document() -> Value {
+    json!({"name":"lifecycle","entry":"feed","nodes":[
+        {"id":"feed","component":"external"},
+        {"id":"work","component":"command","config":{"argv":["cat"]}}
+    ],"edges":[{"from":"feed","to":"work"}]})
 }
 
-fn registry(observed: &Arc<WorkObserved>) -> Arc<ImplementationRegistry> {
-    let mut registry = ImplementationRegistry::default();
-    let observed = observed.clone();
-    registry
-        .register_executable(
-            ImplementationDescriptor {
-                id: "test.lifecycle".into(),
-                version: "1".into(),
-                description: "Test-only cooperative execution with observed starts".into(),
-                configuration_schema: json!({"type":"object","additionalProperties":false}),
-            },
-            move |_| {
-                let observed = observed.clone();
-                Ok(Arc::new(move |context: ExecutionContext| {
-                    let observed = observed.clone();
-                    async move {
-                        observed.starts.fetch_add(1, Ordering::SeqCst);
-                        observed.started.notify_one();
-                        context.stop().requested().await;
-                        observed.stops.fetch_add(1, Ordering::SeqCst);
-                        Ok(())
-                    }
-                }))
-            },
-        )
-        .unwrap();
-    Arc::new(registry)
+async fn start(service: &Service, project: &std::path::Path) -> String {
+    tools::dispatch(
+        service,
+        "flow.start",
+        &json!({"document":document(),"project":project}),
+    )
+    .await
+    .unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
-fn declaration() -> GraphDeclaration {
-    let mut declaration = GraphDeclaration::parse(include_str!("../examples/flow.json")).unwrap();
-    declaration.execution_bindings.push(ExecutionBinding {
-        id: "worker".into(),
-        node_id: "A".into(),
-        implementation: "test.lifecycle".into(),
-        version: "1".into(),
-        configuration: json!({}),
-    });
-    declaration
-}
-
-async fn started(observed: &WorkObserved) {
-    tokio::time::timeout(Duration::from_secs(2), observed.started.notified())
+/// The run's executions, as `run.inspect` reports them.
+async fn executions(service: &Service, run_id: &str) -> Vec<Value> {
+    tools::dispatch(service, "run.inspect", &json!({"run_id":run_id}))
         .await
-        .unwrap();
+        .unwrap()["executions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[tokio::test]
-async fn failed_suspension_preserves_checkout_and_allows_explicit_work_after_repair() {
+async fn failed_suspension_preserves_checkout_and_allows_work_after_repair() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("source");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("work"), "original").unwrap();
-    let observed = Arc::new(WorkObserved::default());
-    let service = Service::with_registry(
-        Paths::initialize(directory.path().join("data")).unwrap(),
-        registry(&observed),
-    )
-    .unwrap();
-    let run_id = service
-        .start(declaration(), directory.path().to_owned())
-        .await
-        .unwrap()["run_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    started(&observed).await;
+    let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
+    let run_id = start(&service, directory.path()).await;
+    let first = executions(&service, &run_id).await;
+    assert_eq!(first.len(), 1);
     let imported = tools::dispatch(
         &service,
         "workspace.import",
@@ -126,18 +84,20 @@ async fn failed_suspension_preserves_checkout_and_allows_explicit_work_after_rep
         assert!(live.executions.is_empty());
         assert!(run.manifest.checkpoints.is_empty());
     }
-    assert_eq!(observed.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(observed.stops.load(Ordering::SeqCst), 1);
     assert_eq!(
         std::fs::read_to_string(displaced.join("work")).unwrap(),
         "edited before failed suspension"
     );
 
-    // This is a real explicit launch through the replacement host. Merely
+    // Resuming relaunches the worker through the replacement host. Merely
     // checking a flag would miss a permanently closed host after the failure.
-    tools::dispatch(&service,"execution.launch",&json!({"run_id":run_id,"node_id":"A","implementation":"test.lifecycle","version":"1","configuration":{}})).await.unwrap();
-    started(&observed).await;
-    assert_eq!(observed.starts.load(Ordering::SeqCst), 2);
+    tools::dispatch(&service, "run.resume", &json!({"run_id":run_id}))
+        .await
+        .unwrap();
+    let relaunched = executions(&service, &run_id).await;
+    assert_eq!(relaunched.len(), 1);
+    assert_eq!(relaunched[0]["status"], "running");
+    assert_ne!(relaunched[0]["execution_id"], first[0]["execution_id"]);
     std::fs::rename(&displaced, &path).unwrap();
     std::fs::write(path.join("more-work"), "still editable after failure").unwrap();
     tools::dispatch(&service, "run.suspend", &json!({"run_id":run_id}))
@@ -152,43 +112,25 @@ async fn failed_suspension_preserves_checkout_and_allows_explicit_work_after_rep
         imported["root"]
     );
     assert!(!path.exists());
-    assert_eq!(observed.stops.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
-async fn closing_a_suspended_declared_binding_never_starts_it_again() {
+async fn a_closed_run_never_starts_its_workers_again() {
     let directory = tempfile::tempdir().unwrap();
-    let observed = Arc::new(WorkObserved::default());
-    let service = Service::with_registry(
-        Paths::initialize(directory.path().join("data")).unwrap(),
-        registry(&observed),
-    )
-    .unwrap();
-    let run_id = service
-        .start(declaration(), directory.path().to_owned())
-        .await
-        .unwrap()["run_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    started(&observed).await;
+    let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
+    let run_id = start(&service, directory.path()).await;
+    assert_eq!(executions(&service, &run_id).await.len(), 1);
     tools::dispatch(&service, "run.suspend", &json!({"run_id":run_id}))
         .await
         .unwrap();
-    assert_eq!(observed.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(observed.stops.load(Ordering::SeqCst), 1);
-
     let closed = tools::dispatch(&service, "run.close", &json!({"run_id":run_id}))
         .await
         .unwrap();
     assert_eq!(closed["status"], "closed");
-    assert_eq!(observed.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(observed.stops.load(Ordering::SeqCst), 1);
     let readable = tools::dispatch(&service, "run.resume", &json!({"run_id":run_id}))
         .await
         .unwrap();
     assert_eq!(readable["admission"], "closed");
-    assert_eq!(observed.starts.load(Ordering::SeqCst), 1);
     assert!(readable["executions"].as_array().unwrap().is_empty());
     service.shutdown().await.unwrap();
 }

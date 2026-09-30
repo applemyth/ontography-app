@@ -85,15 +85,16 @@ async fn start(root: &Path) -> Value {
     command(root, &["server", "start"]).await
 }
 
-fn declaration() -> Value {
+/// An outside client acts for both nodes: `A` sends text to `B` under `work`.
+fn document() -> Value {
     serde_json::from_str(include_str!("../examples/flow.json")).unwrap()
 }
 
 async fn create_run(client: &Client, project: &Path) -> String {
     client
         .call(
-            "run.start",
-            json!({"declaration":declaration(),"project":project}),
+            "flow.start",
+            json!({"document":document(),"project":project}),
         )
         .await
         .unwrap()["run_id"]
@@ -171,8 +172,8 @@ async fn lost_response_is_recoverable_and_request_identity_prevents_duplicate_mu
         client_id: uuid::Uuid::new_v4().to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
         expected_server_id: Some(client.server_id().to_owned()),
-        operation: "run.start".into(),
-        args: json!({"declaration":declaration(),"project":fixture.directory.path()}),
+        operation: "flow.start".into(),
+        args: json!({"document":document(),"project":fixture.directory.path()}),
     };
     let mut socket = UnixStream::connect(&fixture.paths.socket).await.unwrap();
     protocol::write_frame(&mut socket, &request).await.unwrap();
@@ -215,7 +216,7 @@ async fn lost_response_is_recoverable_and_request_identity_prevents_duplicate_mu
     );
 
     let mut conflict = request.clone();
-    conflict.args["declaration"]["id"] = json!("changed-definition");
+    conflict.args["document"]["name"] = json!("changed-definition");
     assert_eq!(
         raw_request(&fixture.paths, &conflict)
             .await
@@ -277,7 +278,7 @@ async fn truncated_response_preserves_an_unknown_outcome_receipt_in_the_rust_cli
         request
     });
     let client = Client::connect(&socket_path).await.unwrap();
-    let error = client.call("run.start", json!({})).await.unwrap_err();
+    let error = client.call("flow.start", json!({})).await.unwrap_err();
     let sent = server.await.unwrap();
     assert_eq!(error.code, "unknown_outcome");
     let details = error.details.as_ref().unwrap();
@@ -450,8 +451,8 @@ async fn completing_one_request_does_not_drop_the_partial_frame_of_the_next() {
         client_id: uuid::Uuid::new_v4().to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
         expected_server_id: Some(client.server_id().to_owned()),
-        operation: "run.start".into(),
-        args: json!({"declaration":declaration(),"project":fixture.directory.path()}),
+        operation: "flow.start".into(),
+        args: json!({"document":document(),"project":fixture.directory.path()}),
     };
     let next = Request {
         environment: None,
@@ -499,8 +500,8 @@ async fn status_and_receipt_bypass_a_long_wait_on_the_same_connection() {
     let start_id = uuid::Uuid::new_v4().to_string();
     let started = client
         .request(
-            "run.start",
-            json!({"declaration":declaration(),"project":fixture.directory.path()}),
+            "flow.start",
+            json!({"document":document(),"project":fixture.directory.path()}),
             start_id.clone(),
         )
         .await
@@ -582,7 +583,7 @@ async fn status_and_receipt_bypass_a_long_wait_on_the_same_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_capabilities() {
+async fn killed_server_recovers_commits_only_on_resume_and_keeps_saved_previews() {
     let fixture = Fixture::new();
     let client = fixture.start().await;
     let run_id = create_run(&client, fixture.directory.path()).await;
@@ -608,14 +609,20 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
         before["frontier"]["received"][0]["producer"],
         accepted["activation_id"]
     );
+    let mut without_b = document();
+    without_b["nodes"].as_array_mut().unwrap().truncate(1);
+    without_b["edges"] = json!([]);
     let plan = client
-        .call(
-            "rewrite.prepare",
-            json!({"run_id":run_id,"request":{"remove_nodes":["B"],"remove_edges":["A_to_B"]}}),
-        )
+        .call("flow.edit", json!({"run_id":run_id,"document":without_b}))
         .await
         .unwrap();
-    assert_eq!(plan["revision"], before["revision"]);
+    assert_eq!(
+        client
+            .call("run.inspect", json!({"run_id":run_id}))
+            .await
+            .unwrap()["revision"],
+        before["revision"]
+    );
 
     // The PID comes from this test's unique data directory and validated
     // server-instance handshake. Never discover or signal unrelated processes.
@@ -694,23 +701,24 @@ async fn killed_server_recovers_commits_only_on_resume_and_expires_transient_cap
     assert_eq!(resumed["revision"], before["revision"]);
     assert_eq!(resumed["graph"], before["graph"]);
     assert_eq!(resumed["frontier"], before["frontier"]);
-    assert_eq!(
-        restarted
-            .call(
-                "rewrite.commit",
-                json!({"run_id":run_id,"plan_id":plan["plan_id"]})
-            )
-            .await
-            .unwrap_err()
-            .code,
-        "unknown_handle"
-    );
-    assert_eq!(
-        restarted
-            .call("run.inspect", json!({"run_id":run_id}))
-            .await
-            .unwrap()["frontier"],
-        before["frontier"]
+    // A preview is saved with its run, so it can still be applied.
+    restarted
+        .call(
+            "flow.commit",
+            json!({"run_id":run_id,"plan_id":plan["plan_id"]}),
+        )
+        .await
+        .unwrap();
+    let edited = restarted
+        .call("run.inspect", json!({"run_id":run_id}))
+        .await
+        .unwrap();
+    assert_eq!(edited["graph"]["nodes"], json!([{"id":"A"}]));
+    assert!(
+        edited["frontier"]["received"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
     fixture.stop().await;
 }
@@ -801,7 +809,7 @@ async fn killed_server_stops_worker_and_resumes_its_durable_invocation_input() {
     let manifest: ontography_app::state::RunManifest =
         ontography_app::persistence::read_json(&run_path.join("manifest.json")).unwrap();
     let core_path = run_path.join(&manifest.core_path);
-    let workflow = manifest.workflow.unwrap();
+    let workflow = manifest.workflow;
     let node = &workflow.state.identities.nodes["worker"];
     let records = ontography::context::read_invocations(&core_path, Some(node), None, 100).unwrap();
     assert_eq!(records.len(), 2);

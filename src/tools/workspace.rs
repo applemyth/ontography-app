@@ -148,7 +148,6 @@ pub async fn dispatch(run: &mut ManagedRun, name: &str, args: &Value) -> Result<
                 json!({"checkouts":page(&checkouts,input.checkout_offset,input.limit)?,"checkpoints":page(&checkpoints,input.checkpoint_offset,input.limit)?}),
             )
         }
-        // Internal workflow artifact paths; neither operation is registered.
         "workspace.import" => {
             let input: ImportInput = parse_args(run, args)?;
             let (content, workspace) = stores(run).await?;
@@ -157,7 +156,9 @@ pub async fn dispatch(run: &mut ManagedRun, name: &str, args: &Value) -> Result<
                 .await
                 .map_err(workspace_error)?;
             retain_package(&content, &package).await?;
-            resolved_view(&package, 0, default_limit())
+            let mut view = resolved_view(&package, 0, default_limit())?;
+            view["dependencies"] = json!(package.dependencies());
+            Ok(view)
         }
         "workspace.open" => {
             let input: RootPage = parse_args(run, args)?;
@@ -270,6 +271,13 @@ pub fn operations() -> Vec<Operation> {
     let limits = json!({"type":"integer","minimum":1,"maximum":1000});
     let offset = json!({"type":"integer","minimum":0});
     vec![
+        operation(
+            "workspace.import",
+            "Import a directory, relative to the run's project, into the run's content store. Returns its root, to send as a workspace envelope, and the content dependencies a submission that sends it declares.",
+            json!({"path":text}),
+            &["path"],
+            true,
+        ),
         operation(
             "workspace.open",
             "Validate a package as a filesystem workspace and page its resolved entries.",
@@ -401,7 +409,6 @@ mod tests {
             directory: dir.path().to_owned(),
             live: None,
             recovery_checkouts: std::collections::BTreeMap::new(),
-            registry: std::sync::Arc::new(crate::registry::ImplementationRegistry::default()),
             environment: crate::environment::Environment::current(),
         };
         run.resume().await.unwrap();

@@ -645,7 +645,7 @@ fn request(edit: GraphEdit) -> RewriteRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::declarations::{GraphEditDeclaration, IngressDeclaration};
+    use crate::declarations::IngressDeclaration;
     use crate::workflow::{document::expand_builtin as expand, edge_key};
     use ontography::{
         ActivationProposal, Emission, OutputAuthority, ProposalDecision, ProposalRuntime,
@@ -708,7 +708,7 @@ mod tests {
         let ids = IdentityMap::initial(&doc);
         let declaration = expand(&doc, "edit-test", &ids).unwrap();
         let compiled = declaration.compile().unwrap();
-        let runtime = ProposalRuntime::with_policy(compiled.kernel, policy());
+        let runtime = ProposalRuntime::with_policy(compiled, policy());
         let session = runtime
             .create_persistent(directory.path().join("core"))
             .unwrap();
@@ -833,12 +833,11 @@ mod tests {
         let review = &state.identities.nodes["review"];
         let connection = &state.identities.edges[&edge_key("writer", "review")];
         let edit = |principal: &str| {
-            let edit = serde_json::from_value::<GraphEditDeclaration>(
-                json!({"remove_nodes":[review],"remove_edges":[connection]}),
-            )
-            .unwrap()
-            .compile()
-            .unwrap();
+            let edit = GraphEdit::new(
+                BTreeSet::from([Arc::from(review.as_str())]),
+                BTreeSet::from([Arc::from(connection.as_str())]),
+                GraphFragmentDeclaration::default().compile().unwrap(),
+            );
             RewriteRequest::new(Principal::new(principal), edit)
         };
         let error = session
@@ -1250,7 +1249,7 @@ mod tests {
             drop(session);
             drop(runtime);
             let compiled = declaration.compile().unwrap();
-            let runtime = ProposalRuntime::with_policy(compiled.kernel, policy());
+            let runtime = ProposalRuntime::with_policy(compiled, policy());
             let session = runtime
                 .open_persistent(directory.path().join("core"))
                 .unwrap();

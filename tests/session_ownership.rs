@@ -1,7 +1,8 @@
 use ontography_app::{persistence::Paths, sessions::GraphInitialization, state::Service, tools};
 use serde_json::{Value, json};
 
-fn declaration() -> Value {
+/// An outside client acts for both nodes: `A` sends text to `B` under `work`.
+fn document() -> Value {
     serde_json::from_str(include_str!("../examples/flow.json")).unwrap()
 }
 
@@ -29,15 +30,15 @@ async fn sessions_bind_once_and_scope_every_run_dispatch_path() {
     let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
     let first = create(&service, directory.path()).await;
     let second = create(&service, directory.path()).await;
-    let args = json!({"declaration":declaration()});
-    let first_run = scoped(&service, &first, "run.start", args.clone())
+    let args = json!({"document":document()});
+    let first_run = scoped(&service, &first, "flow.start", args.clone())
         .await
         .unwrap();
-    let second_run = scoped(&service, &second, "run.start", args.clone())
+    let second_run = scoped(&service, &second, "flow.start", args.clone())
         .await
         .unwrap();
     assert_ne!(first_run["run_id"], second_run["run_id"]);
-    let retried = scoped(&service, &first, "run.start", args.clone())
+    let retried = scoped(&service, &first, "flow.start", args.clone())
         .await
         .unwrap();
     assert_eq!(retried["run_id"], first_run["run_id"]);
@@ -93,14 +94,14 @@ async fn sessions_bind_once_and_scope_every_run_dispatch_path() {
         .code,
         "session_scope_conflict"
     );
-    let mut different = declaration();
-    different["id"] = json!("different");
+    let mut different = document();
+    different["name"] = json!("different");
     assert_eq!(
         scoped(
             &service,
             &first,
-            "run.start",
-            json!({"declaration":different})
+            "flow.start",
+            json!({"document":different})
         )
         .await
         .unwrap_err()
@@ -137,19 +138,17 @@ async fn graph_initialization_recovers_reserved_identity_before_and_after_run_cr
         let service = Service::new(paths.clone()).unwrap();
         let id = create(&service, directory.path()).await;
         let reserved = uuid::Uuid::new_v4().to_string();
-        let args = json!({"declaration":declaration(),"project":std::fs::canonicalize(directory.path()).unwrap()});
+        let args = json!({"document":document(),"project":std::fs::canonicalize(directory.path()).unwrap()});
+        let (definition, workflow) =
+            ontography_app::workflow::tools::prepare_start(&service, &args, &reserved).unwrap();
         {
             let session = service.sessions.get(&id).await.unwrap();
             let mut record = session.lock().await;
             record.graph_initialization = Some(GraphInitialization {
                 run_id: reserved.clone(),
-                operation: "run.start".into(),
                 args: args.clone(),
-                definition: ontography_app::definition::RunDefinition::Logical(
-                    serde_json::from_value(declaration()).unwrap(),
-                ),
-                input: None,
-                workflow: None,
+                definition: definition.clone(),
+                workflow: workflow.clone(),
             });
             service.sessions.save(&record).unwrap();
         }
@@ -161,8 +160,9 @@ async fn graph_initialization_recovers_reserved_identity_before_and_after_run_cr
             service
                 .start_reserved(
                     &reserved,
-                    serde_json::from_value(declaration()).unwrap(),
+                    definition,
                     directory.path().into(),
+                    workflow,
                     service.environment(),
                 )
                 .await
@@ -175,7 +175,7 @@ async fn graph_initialization_recovers_reserved_identity_before_and_after_run_cr
             .await
             .unwrap();
         assert_eq!(recovered["run_id"], reserved);
-        let retry = scoped(&service, &id, "run.start", args).await.unwrap();
+        let retry = scoped(&service, &id, "flow.start", args).await.unwrap();
         assert_eq!(retry["run_id"], reserved);
         assert_eq!(
             tools::dispatch(&service, "run.list", &json!({}))
@@ -196,8 +196,8 @@ async fn adoption_is_explicit_exclusive_and_preserves_existing_run_identity() {
     let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
     let existing = tools::dispatch(
         &service,
-        "run.start",
-        &json!({"project":directory.path(),"declaration":declaration()}),
+        "flow.start",
+        &json!({"project":directory.path(),"document":document()}),
     )
     .await
     .unwrap();
@@ -277,14 +277,9 @@ async fn native_conversation_changes_preserve_graph_and_missing_history_stays_mi
     let paths = Paths::initialize(directory.path().join("data")).unwrap();
     let service = Service::new(paths.clone()).unwrap();
     let id = create(&service, directory.path()).await;
-    let started = scoped(
-        &service,
-        &id,
-        "run.start",
-        json!({"declaration":declaration()}),
-    )
-    .await
-    .unwrap();
+    let started = scoped(&service, &id, "flow.start", json!({"document":document()}))
+        .await
+        .unwrap();
     let context = scoped(&service, &id, "session.context", json!({}))
         .await
         .unwrap();
@@ -439,44 +434,21 @@ async fn sessions_without_graphs_suspend_close_and_reload_without_spawning_work(
 
 #[tokio::test]
 async fn scoped_observation_waits_do_not_hold_session_lifecycle_locks() {
-    use ontography_app::registry::{ImplementationDescriptor, ImplementationRegistry};
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
     let directory = tempfile::tempdir().unwrap();
-    let mut registry = ImplementationRegistry::default();
-    registry
-        .register_executable(
-            ImplementationDescriptor {
-                id: "test.wait".into(),
-                version: "1".into(),
-                description: "Cooperative test worker".into(),
-                configuration_schema: json!({"type":"object"}),
-            },
-            |_| {
-                Ok(Arc::new(
-                    |context: ontography::ExecutionContext| async move {
-                        context.stop().requested().await;
-                        Ok::<(), ontography::ExecutionFailure>(())
-                    },
-                ))
-            },
-        )
-        .unwrap();
-    let service = Service::with_registry(
-        Paths::initialize(directory.path().join("data")).unwrap(),
-        Arc::new(registry),
-    )
-    .unwrap();
+    let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
     let id = create(&service, directory.path()).await;
-    let mut declaration = declaration();
-    declaration["execution_bindings"] = json!([{"id":"worker","node_id":"A","implementation":"test.wait","version":"1","configuration":{}}]);
-    let run = scoped(
-        &service,
-        &id,
-        "run.start",
-        json!({"declaration":declaration}),
-    )
-    .await
-    .unwrap();
+    // A command worker waits for its tasks until it is stopped.
+    let document = json!({"name":"waiting","entry":"feed","nodes":[
+        {"id":"feed","component":"external"},
+        {"id":"worker","component":"command","config":{"argv":["cat"]}}
+    ],"edges":[{"from":"feed","to":"worker"}]});
+    scoped(&service, &id, "flow.start", json!({"document":document}))
+        .await
+        .unwrap();
+    let run = scoped(&service, &id, "run.inspect", json!({}))
+        .await
+        .unwrap();
     let execution_id = run["executions"][0]["execution_id"].clone();
     let (observed, suspended) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(

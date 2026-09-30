@@ -6,8 +6,8 @@
 
 use super::{
     config::{
-        AgentConfig, CommandConfig, HumanConfig, Implementation, InboxConfig, McpServer,
-        ProgramConfig,
+        AgentConfig, CommandConfig, ExternalConfig, HumanConfig, Implementation, InboxConfig,
+        McpServer, ProgramConfig,
     },
     preset::Preset,
 };
@@ -64,6 +64,7 @@ pub(super) fn components(
         ("command".to_owned(), Arc::new(Command) as Arc<_>),
         ("human".to_owned(), Arc::new(Human) as Arc<_>),
         ("inbox".to_owned(), Arc::new(Inbox) as Arc<_>),
+        ("external".to_owned(), Arc::new(External) as Arc<_>),
     ])
 }
 
@@ -313,5 +314,27 @@ impl ProjectComponent for Inbox {
     fn bind(&self, config: Value, _: &ComponentBindings) -> Result<BoundComponent, String> {
         let InboxSettings {} = settings(config)?;
         bound(Implementation::Inbox(InboxConfig {}))
+    }
+}
+
+/// Work an outside client performs; it has no settings.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExternalSettings {}
+
+struct External;
+
+impl ProjectComponent for External {
+    fn description(&self) -> ComponentDescription {
+        description::<ExternalSettings>(
+            "external",
+            "Work an outside client performs with core moves (workflow.submit, workflow.transfer, workflow.retire). Nothing runs here.",
+            "External",
+        )
+    }
+
+    fn bind(&self, config: Value, _: &ComponentBindings) -> Result<BoundComponent, String> {
+        let ExternalSettings {} = settings(config)?;
+        bound(Implementation::External(ExternalConfig {}))
     }
 }

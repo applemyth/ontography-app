@@ -60,7 +60,7 @@ async fn core_revision(service: &Service, run_id: &str) -> u64 {
 }
 
 #[tokio::test]
-async fn command_human_inbox_uses_document_names_and_rejects_raw_mutations() {
+async fn command_human_inbox_uses_document_names_and_owns_its_nodes() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
     let run_id = start(&service, directory.path()).await;
@@ -70,15 +70,30 @@ async fn command_human_inbox_uses_document_names_and_rejects_raw_mutations() {
     .await;
     let task = task_for(&status, "review").unwrap();
     assert!(task["input"].to_string().contains("draft"));
-    for operation in ["workflow.submit", "rewrite.prepare"] {
-        let error = tools::dispatch(&service, operation, &json!({"run_id":run_id}))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.code, "workflow_owned",
-            "{operation} must be rejected at the document ownership boundary"
-        );
-    }
+    // Programs and people own their nodes; core moves act only for external ones.
+    let forged = json!({"run_id":run_id,"trigger":{"kind":"root","node_id":"draft","authority":["workflow"]},"result":"forged"});
+    let error = tools::dispatch(&service, "workflow.submit", &forged)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "not_external");
+    let pending = call(
+        &service,
+        "inspect.frontier",
+        json!({"run_id":run_id,"node_id":"review"}),
+    )
+    .await;
+    let error = tools::dispatch(
+        &service,
+        "workflow.retire",
+        &json!({"run_id":run_id,"package_id":pending["packages"][0]["package_id"]}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "not_external");
+    let error = tools::dispatch(&service, "rewrite.prepare", &json!({"run_id":run_id}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "unknown_operation");
     call(
         &service,
         "flow.decide",

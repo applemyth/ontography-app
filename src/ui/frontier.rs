@@ -254,7 +254,7 @@ pub(super) fn submit(client: &Client, tx: &mpsc::Sender<Response>, request: Requ
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{declarations::GraphDeclaration, persistence::Paths, state::Service};
+    use crate::{persistence::Paths, state::Service};
 
     fn selection(node: &str) -> Selection {
         Selection {
@@ -269,12 +269,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service =
             Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
-        let declaration =
-            GraphDeclaration::parse(include_str!("../../examples/flow.json")).unwrap();
-        let started = service
-            .start(declaration, directory.path().to_owned())
-            .await
-            .unwrap();
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../../examples/flow.json")).unwrap();
+        let started = crate::tools::dispatch(
+            &service,
+            "flow.start",
+            &json!({"document":document,"project":directory.path()}),
+        )
+        .await
+        .unwrap();
         let run_id = started["run_id"].as_str().unwrap();
         let mut emissions = (0..200)
             .map(|i| json!({"object_type":"Text","payload":format!("A-{i}")}))

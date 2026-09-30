@@ -47,12 +47,9 @@ pub struct PiState {
 #[serde(deny_unknown_fields)]
 pub struct GraphInitialization {
     pub run_id: String,
-    pub operation: String,
     pub args: Value,
-    pub definition: crate::definition::RunDefinition,
-    pub input: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<crate::workflow::runtime::InitialWorkflow>,
+    pub definition: crate::declarations::GraphDeclaration,
+    pub workflow: crate::workflow::runtime::InitialWorkflow,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -626,8 +623,8 @@ pub async fn dispatch_scoped(
     if mutating {
         require_active(&record)?;
     }
-    if matches!(operation, "run.start" | "flow.start") {
-        return initialize_graph(service, &mut record, operation, &args).await;
+    if operation == "flow.start" {
+        return initialize_graph(service, &mut record, &args).await;
     }
     if operation == "run.list" {
         let runs = match &record.run_id {
@@ -706,12 +703,7 @@ async fn context(service: &Service, record: &mut SessionRecord) -> Result<Value>
     let graph = match &record.run_id {
         Some(id) => {
             let handle = service.run(id).await?;
-            let run = handle.lock().await;
-            if run.is_workflow() {
-                crate::workflow::tools::status(&run).await?
-            } else {
-                run.inspect(100).await?
-            }
+            crate::workflow::tools::status(&*handle.lock().await).await?
         }
         None => Value::Null,
     };
@@ -724,11 +716,7 @@ async fn context(service: &Service, record: &mut SessionRecord) -> Result<Value>
 /// initialization summarized.
 fn view(record: &SessionRecord) -> Result<Value> {
     let mut session = serde_json::to_value(record)?;
-    if record
-        .graph_initialization
-        .as_ref()
-        .is_some_and(|intent| intent.workflow.is_some())
-    {
+    if record.graph_initialization.is_some() {
         session["graph_initialization"] = json!({"run_id":record.run_id,"operation":"flow.start"});
     }
     Ok(session)
@@ -810,7 +798,7 @@ async fn dispatch_record(
             if record.run_id.is_none()
                 && let Some(intent) = record.graph_initialization.clone()
             {
-                initialize_graph(service, record, &intent.operation, &intent.args).await?;
+                initialize_graph(service, record, &intent.args).await?;
             }
             if let Some(id) = &record.run_id {
                 let environment = service.session_environment(&record.session_id).await;
@@ -876,12 +864,10 @@ async fn dispatch_record(
 async fn initialize_graph(
     service: &Service,
     record: &mut SessionRecord,
-    operation: &str,
     args: &Value,
 ) -> Result<Value> {
-    use crate::definition::RunDefinition;
     let intent = if let Some(intent) = &record.graph_initialization {
-        if intent.operation != operation || intent.args != *args {
+        if intent.args != *args {
             return Err(AppError::new(
                 "graph_already_initialized",
                 "session graph initialization already has a different declaration; inspect it before proceeding",
@@ -901,40 +887,11 @@ async fn initialize_graph(
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         uuid::Uuid::parse_str(&run_id).map_err(|_| AppError::invalid("start_id must be a UUID"))?;
-        let (definition, input, workflow) = if operation == "flow.start" {
-            let (declaration, workflow) =
-                crate::workflow::tools::prepare_start(service, args, &run_id)?;
-            (RunDefinition::Logical(declaration), None, Some(workflow))
-        } else if operation == "run.start" {
-            let declaration: crate::declarations::GraphDeclaration =
-                match (args.get("declaration"), args.get("revision")) {
-                    (Some(value), None) => serde_json::from_value(value.clone())?,
-                    (None, Some(Value::String(revision))) => {
-                        read_json(&service.paths.definition(revision)?)?
-                    }
-                    _ => {
-                        return Err(AppError::invalid(
-                            "supply exactly one of declaration or revision",
-                        ));
-                    }
-                };
-            let compiled = declaration.compile().map_err(AppError::core)?;
-            service
-                .registry
-                .validate_bindings(&declaration.execution_bindings, &compiled.kernel)?;
-            (RunDefinition::Logical(declaration), None, None)
-        } else {
-            return Err(AppError::new(
-                "invalid_session",
-                "unknown graph initialization operation",
-            ));
-        };
+        let (definition, workflow) = crate::workflow::tools::prepare_start(service, args, &run_id)?;
         let intent = GraphInitialization {
             run_id,
-            operation: operation.into(),
             args: args.clone(),
             definition,
-            input,
             workflow,
         };
         let mut next = record.clone();
@@ -952,57 +909,21 @@ async fn initialize_graph(
         intent
     };
     let environment = service.session_environment(&record.session_id).await;
-    let result = match intent.definition {
-        RunDefinition::Logical(declaration) => {
-            if let Some(workflow) = intent.workflow {
-                service
-                    .start_workflow_reserved(
-                        &intent.run_id,
-                        declaration,
-                        record.project.clone(),
-                        workflow,
-                        environment,
-                    )
-                    .await
-            } else {
-                service
-                    .start_reserved(
-                        &intent.run_id,
-                        declaration,
-                        record.project.clone(),
-                        environment,
-                    )
-                    .await
-            }
-        }
-        RunDefinition::Application(declaration) => {
-            let input = intent.input.ok_or_else(|| {
-                AppError::new(
-                    "invalid_session",
-                    "application initialization has no saved input",
-                )
-            })?;
-            service
-                .start_application_reserved(
-                    &intent.run_id,
-                    declaration,
-                    record.project.clone(),
-                    input.into(),
-                    environment,
-                )
-                .await
-        }
-    }?;
+    service
+        .start_reserved(
+            &intent.run_id,
+            intent.definition,
+            record.project.clone(),
+            intent.workflow,
+            environment,
+        )
+        .await?;
     let mut next = record.clone();
     next.run_id = Some(intent.run_id.clone());
     next.updated_at = now();
     service.sessions.save(&next)?;
     *record = next;
-    if operation == "flow.start" {
-        crate::workflow::tools::status(&*service.run(&intent.run_id).await?.lock().await).await
-    } else {
-        Ok(result)
-    }
+    crate::workflow::tools::status(&*service.run(&intent.run_id).await?.lock().await).await
 }
 
 fn owned_path(sessions: &Sessions, record: &SessionRecord, path: &Path) -> Result<PathBuf> {

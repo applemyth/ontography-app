@@ -1,7 +1,7 @@
 use ontography_app::{persistence::Paths, state::Service, tools};
 use serde_json::{Value, json};
 
-fn declaration() -> Value {
+fn document() -> Value {
     serde_json::from_str(include_str!("../examples/flow.json")).unwrap()
 }
 
@@ -43,8 +43,8 @@ async fn malformed_partial_and_missing_manifests_do_not_block_healthy_runs() {
     let service = Service::new(paths.clone()).unwrap();
     let started = tools::dispatch(
         &service,
-        "run.start",
-        &json!({"declaration":declaration(),"project":directory.path()}),
+        "flow.start",
+        &json!({"document":document(),"project":directory.path()}),
     )
     .await
     .unwrap();
@@ -102,13 +102,13 @@ async fn malformed_partial_and_missing_manifests_do_not_block_healthy_runs() {
     assert_eq!(resumed["frontier"], before["frontier"]);
     let additional = tools::dispatch(
         &recovered,
-        "run.start",
-        &json!({"declaration":declaration(),"project":directory.path()}),
+        "flow.start",
+        &json!({"document":document(),"project":directory.path()}),
     )
     .await
     .unwrap();
     assert_ne!(additional["run_id"], run_id);
-    assert_eq!(additional["admission"], "open");
+    assert_eq!(additional["status"], "active");
     recovered.shutdown().await.unwrap();
     let _ = std::fs::remove_dir(paths.socket.parent().unwrap());
 }

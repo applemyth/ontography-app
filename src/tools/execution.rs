@@ -1,4 +1,5 @@
-//! Bind registered opaque executables to the core execution host.
+//! Observe the executions that run a workflow's programs. Workers belong to
+//! their run: flow edits and run suspension start and stop them.
 
 use crate::{AppError, Result, catalog::Operation, state::Service, views};
 use ontography::{ExecutionHandle, ExecutionStatus};
@@ -7,14 +8,8 @@ use std::time::Duration;
 
 pub fn operations() -> Vec<Operation> {
     let text = json!({"type":"string"});
-    let mut operations = vec![
-        Operation::new(
-            "execution.launch",
-            "Launch a registered, versioned executable at a current graph node through core's host.",
-            json!({"run_id":text,"node_id":text,"implementation":text,"version":text,"configuration":{}}),
-            &["run_id", "node_id", "implementation", "version"],
-            true,
-        ),
+    let execution = json!({"run_id":text,"execution_id":text});
+    vec![
         Operation::new(
             "execution.list",
             "Inspect actual hosted execution instances independently of core admission status.",
@@ -22,83 +17,37 @@ pub fn operations() -> Vec<Operation> {
             &["run_id"],
             false,
         ),
-    ];
-    for (name, description, mutating) in [
-        (
-            "inspect",
+        Operation::new(
+            "execution.inspect",
             "Inspect execution status and explicitly self-reported activity.",
-            false,
-        ),
-        (
-            "activity",
-            "Read self-reported activity; this is not a graph commit or proof of external work.",
-            false,
-        ),
-        (
-            "stop",
-            "Request cooperative stop; external process cleanup belongs to the registered adapter.",
-            true,
-        ),
-        (
-            "abort",
-            "Abort the core executable future; external effects may require adapter cleanup.",
-            true,
-        ),
-        (
-            "release",
-            "Release a terminal execution handle; running instances must first stop.",
-            true,
-        ),
-    ] {
-        operations.push(Operation::new(
-            &format!("execution.{name}"),
-            description,
-            json!({"run_id":text,"execution_id":text}),
+            execution.clone(),
             &["run_id", "execution_id"],
-            mutating,
-        ));
-    }
-    operations.push(Operation::new("execution.wait","Wait up to timeout_ms for an execution to finish, without holding the run's operation lock.",json!({"run_id":text,"execution_id":text,"timeout_ms":{"type":"integer","minimum":1,"maximum":30000}}),&["run_id","execution_id"],false));
-    operations
+            false,
+        ),
+        Operation::new(
+            "execution.activity",
+            "Read self-reported activity; this is not a graph commit or proof of external work.",
+            execution,
+            &["run_id", "execution_id"],
+            false,
+        ),
+        Operation::new(
+            "execution.wait",
+            "Wait up to timeout_ms for an execution to finish, without holding the run's operation lock.",
+            json!({"run_id":text,"execution_id":text,"timeout_ms":{"type":"integer","minimum":1,"maximum":30000}}),
+            &["run_id", "execution_id"],
+            false,
+        ),
+    ]
 }
 
 pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Result<Value> {
     let run_id = views::field(args, "run_id")?;
     let run = service.run(run_id).await?;
-    let mut run = run.lock().await;
-    super::require_legacy_mutation(&run, operation)?;
-    if operation == "execution.launch" {
-        let implementation = views::field(args, "implementation")?;
-        let version = views::field(args, "version")?;
-        let configuration = args
-            .get("configuration")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let definition =
-            service
-                .registry
-                .executable(implementation, version, configuration.clone())?;
-        let node = views::field(args, "node_id")?;
-        let live = run.live_mut()?;
-        let handle = live
-            .host
-            .launch_arc(node, definition)
-            .await
-            .map_err(AppError::core)?;
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut value = inspect(&id, &handle);
-        value["implementation"] = json!(implementation);
-        value["version"] = json!(version);
-        value["configuration"] = configuration;
-        value["lifetime"] = json!("manual");
-        live.bindings.push(json!({"execution_id":id,"node_id":node,"implementation":implementation,"version":version,"configuration":value["configuration"],"lifetime":"manual"}));
-        live.executions.insert(id, handle);
-        return Ok(value);
-    }
+    let run = run.lock().await;
     if operation == "execution.list" {
-        let live = run.live()?;
         return Ok(
-            json!({"executions":live.executions.iter().map(|(id,handle)|with_metadata(inspect(id,handle),live.bindings.iter().find(|record|record["execution_id"].as_str()==Some(id.as_str())))).collect::<Vec<_>>()}),
+            json!({"executions":run.live()?.executions.iter().map(|(id,handle)|inspect(id,handle)).collect::<Vec<_>>()}),
         );
     }
     let id = views::field(args, "execution_id")?;
@@ -108,37 +57,8 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             "Execution is absent, expired, or belongs to another run",
         )
     })?;
-    let metadata = run
-        .live()?
-        .bindings
-        .iter()
-        .find(|record| record["execution_id"].as_str() == Some(id))
-        .cloned();
     match operation {
-        "execution.inspect" | "execution.activity" => {
-            Ok(with_metadata(inspect(id, &handle), metadata.as_ref()))
-        }
-        "execution.stop" => {
-            handle.request_stop();
-            Ok(with_metadata(inspect(id, &handle), metadata.as_ref()))
-        }
-        "execution.abort" => {
-            handle.abort();
-            Ok(with_metadata(inspect(id, &handle), metadata.as_ref()))
-        }
-        "execution.release" => {
-            if !handle.status().is_terminal() {
-                return Err(AppError::new(
-                    "execution_running",
-                    "Stop the executable before releasing its handle",
-                ));
-            }
-            run.live_mut()?.executions.remove(id);
-            run.live_mut()?
-                .bindings
-                .retain(|record| record["execution_id"].as_str() != Some(id));
-            Ok(json!({"released":true}))
-        }
+        "execution.inspect" | "execution.activity" => Ok(inspect(id, &handle)),
         "execution.wait" => {
             let timeout = views::integer(args, "timeout_ms", 1000)?;
             if !(1..=30_000).contains(&timeout) {
@@ -149,29 +69,12 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             let timed_out = tokio::time::timeout(Duration::from_millis(timeout), handle.wait())
                 .await
                 .is_err();
-            let mut result = with_metadata(inspect(id, &handle), metadata.as_ref());
+            let mut result = inspect(id, &handle);
             result["timed_out"] = json!(timed_out);
             Ok(result)
         }
         _ => Err(AppError::new("unknown_operation", operation)),
     }
-}
-
-fn with_metadata(mut observation: Value, metadata: Option<&Value>) -> Value {
-    if let Some(metadata) = metadata {
-        for key in [
-            "binding_id",
-            "implementation",
-            "version",
-            "configuration",
-            "lifetime",
-        ] {
-            if let Some(value) = metadata.get(key) {
-                observation[key] = value.clone();
-            }
-        }
-    }
-    observation
 }
 
 pub fn inspect(id: &str, handle: &ExecutionHandle) -> Value {
@@ -191,50 +94,40 @@ pub fn inspect(id: &str, handle: &ExecutionHandle) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        client::Client,
-        persistence::Paths,
-        registry::{ImplementationDescriptor, ImplementationRegistry},
-    };
-    use ontography::{
-        ActivationProposal, Authority, ExecutionContext, ExecutionFailure, ProposalDecision,
-    };
-    use std::sync::Arc;
+    use crate::{client::Client, persistence::Paths};
+    use serde_json::{Value, json};
+    use std::time::Duration;
 
-    /// This fixture is only registered by this test, never shipped as a node type.
-    fn ticker_registry() -> Arc<ImplementationRegistry> {
-        let mut registry = ImplementationRegistry::default();
-        registry.register_executable(ImplementationDescriptor{id:"test.ticker".into(),version:"1".into(),description:"Test-only root emitter".into(),configuration_schema:json!({"type":"object"})},|_|{
-            Ok(Arc::new(|context:ExecutionContext|async move {
-                let mut interval=tokio::time::interval(Duration::from_millis(30));
-                let mut stop=context.stop();
-                loop {tokio::select!{
-                    _=stop.requested()=>return Ok(()),
-                    _=interval.tick()=>{
-                        let proposal=ActivationProposal::root(context.node_id(),Authority::new([]),Arc::from(&b"tick"[..]));
-                        match context.submit(proposal).await.map_err(|error|ExecutionFailure::new("fixture",error.to_string()))?{
-                            ProposalDecision::Committed(_)=>{},
-                            ProposalDecision::Rejected(reason)=>return Err(ExecutionFailure::new("fixture",reason.to_string())),
-                        }
-                    }
-                }}
-            }))
-        }).unwrap();
-        Arc::new(registry)
+    /// An outside client feeds a command worker, whose results reach an inbox.
+    fn document() -> Value {
+        json!({"name":"background","entry":"feed","nodes":[
+            {"id":"feed","component":"external"},
+            {"id":"worker","component":"command","config":{"argv":["/bin/sh","-c","sleep 0.05; cat"]}},
+            {"id":"sink","component":"inbox"}
+        ],"edges":[{"from":"feed","to":"worker"},{"from":"worker","to":"sink"}]})
+    }
+
+    fn feed(run_id: &str, text: &str) -> Value {
+        json!({"run_id":run_id,"trigger":{"kind":"root","node_id":"feed","authority":["workflow"]},
+            "result":text,"emissions":[{"edge_id":"feed:worker","payload":text}]})
+    }
+
+    fn worker_execution(inspected: &Value) -> Value {
+        inspected["executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|execution| execution["node_id"] == "worker")
+            .unwrap()
+            .clone()
     }
 
     #[tokio::test]
-    async fn background_core_work_survives_clients_wait_does_not_block_stop_and_resume_relaunches()
-    {
+    async fn background_work_survives_clients_wait_does_not_block_suspend_and_resume_relaunches() {
         let directory = tempfile::tempdir().unwrap();
         let paths = Paths::initialize(directory.path().join("data")).unwrap();
         let socket = paths.socket.clone();
-        let server = tokio::spawn(crate::server::serve_with_registry(
-            paths,
-            ticker_registry(),
-            None,
-        ));
+        let server = tokio::spawn(crate::server::serve(paths, None));
         let client = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match Client::connect(&socket).await {
@@ -245,69 +138,63 @@ mod tests {
         })
         .await
         .unwrap();
-        let declaration = json!({"version":1,"id":"background-fixture","schema":{"node_types":["Node"],"object_types":["Result"],"authority_tags":[]},"contracts":[{"id":"result","object_type":"Result","validator":"bytes","validator_version":1}],"nodes":[{"id":"worker","types":["Node"],"result_contract":"result"}],"edges":[],"roots":[{"node_id":"worker","ceiling":[]}],"execution_bindings":[{"id":"ticker","node_id":"worker","implementation":"test.ticker","version":"1","configuration":{}}]});
         let started = client
             .call(
-                "run.start",
-                json!({"declaration":declaration,"project":directory.path()}),
+                "flow.start",
+                json!({"document":document(),"project":directory.path()}),
             )
             .await
             .unwrap();
         let run_id = started["run_id"].as_str().unwrap().to_owned();
-        let execution_id = started["executions"][0]["execution_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let before = started["revision"]
-            .as_str()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
+        for text in ["one", "two", "three"] {
+            client
+                .call("workflow.submit", feed(&run_id, text))
+                .await
+                .unwrap();
+        }
         drop(client);
-        tokio::time::sleep(Duration::from_millis(150)).await;
         let client = Client::connect(&socket).await.unwrap();
-        let observed = client
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = client
+                    .call("flow.status", json!({"run_id":run_id}))
+                    .await
+                    .unwrap();
+                if status["frontier"]["counts"]["sink"]["received"] == 3 {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("work continues without clients");
+        assert!(observed["nodes"].is_array());
+        let inspected = client
             .call("run.inspect", json!({"run_id":run_id}))
             .await
             .unwrap();
-        assert!(
-            observed["revision"]
-                .as_str()
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-                > before,
-            "no-client interval must still commit real core activations"
-        );
+        let execution_id = worker_execution(&inspected)["execution_id"].clone();
         let waiting_client = client.clone();
         let target = json!({"run_id":run_id,"execution_id":execution_id,"timeout_ms":5000});
         let waiting =
             tokio::spawn(async move { waiting_client.call("execution.wait", target).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         tokio::time::timeout(
-            Duration::from_secs(2),
-            client.call(
-                "execution.stop",
-                json!({"run_id":run_id,"execution_id":execution_id}),
-            ),
+            Duration::from_secs(5),
+            client.call("run.suspend", json!({"run_id":run_id})),
         )
         .await
         .unwrap()
         .unwrap();
         let waited = waiting.await.unwrap().unwrap();
-        assert_eq!(waited["status"], "exited");
-        assert_eq!(waited["lifetime"], "declared");
-        assert_eq!(waited["implementation"], "test.ticker");
-        client
-            .call("run.suspend", json!({"run_id":run_id}))
-            .await
-            .unwrap();
+        assert_eq!(waited["timed_out"], false);
         let resumed = client
             .call("run.resume", json!({"run_id":run_id}))
             .await
             .unwrap();
-        assert_ne!(resumed["executions"][0]["execution_id"], execution_id);
-        assert_eq!(resumed["executions"][0]["status"], "running");
+        let relaunched = worker_execution(&resumed);
+        assert_ne!(relaunched["execution_id"], execution_id);
+        assert_eq!(relaunched["status"], "running");
         client.call("server.stop", json!({})).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await

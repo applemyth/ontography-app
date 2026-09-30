@@ -562,7 +562,7 @@ async fn bare_launch_and_persistent_shell_preserve_session_and_latest_pi_convers
     assert_eq!(option(&initial_args, "--session"), None);
     let client = Client::connect(&fixture.paths.socket).await.unwrap();
     let scoped = client.for_session(id);
-    let run = scoped.call("run.start", json!({"declaration":serde_json::from_str::<Value>(include_str!("../examples/flow.json")).unwrap()})).await.unwrap();
+    let run = scoped.call("flow.start", json!({"document":serde_json::from_str::<Value>(include_str!("../examples/flow.json")).unwrap()})).await.unwrap();
     first_client.send(b"\x02d");
     first_client.exited().await;
     assert_eq!(fixture.terminal(id).await["running"], true);
@@ -731,7 +731,7 @@ async fn shell_exit_suspends_while_detached_reaps_jobs_and_resumes_after_server_
     let manager = fixture.mode(id, "pi").await;
     let client = Client::connect(&fixture.paths.socket).await.unwrap();
     let scoped = client.for_session(id);
-    let run=scoped.call("run.start",json!({"declaration":serde_json::from_str::<Value>(include_str!("../examples/flow.json")).unwrap()})).await.unwrap();
+    let run=scoped.call("flow.start",json!({"document":serde_json::from_str::<Value>(include_str!("../examples/flow.json")).unwrap()})).await.unwrap();
     let other = fixture.cli(&["new", "other", "--no-attach"]).await;
     let other_id = other["session_id"].as_str().unwrap();
     let mut other_terminal = TerminalClient::start(&fixture, &["attach", other_id]);

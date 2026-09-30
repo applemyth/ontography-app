@@ -70,8 +70,7 @@ impl Fixture {
             .unwrap()
             .compile()
             .unwrap();
-        let runtime =
-            ProposalRuntime::with_policy(compiled.kernel, crate::workflow::edit::policy());
+        let runtime = ProposalRuntime::with_policy(compiled, crate::workflow::edit::policy());
         let session = runtime.open().unwrap();
         let host = ExecutionHost::new(session.clone());
         let state = Arc::new(WorkflowState::builtin(document, identities.clone()).unwrap());

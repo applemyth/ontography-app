@@ -88,20 +88,10 @@ struct View {
     dialog_choice: usize,
     dialog_saved_input: Option<String>,
     pi_alive: bool,
-    preview: Option<RewritePreview>,
-    show_preview: bool,
     node_pages: frontier::State,
-}
-struct RewritePreview {
-    run_id: String,
-    plan_id: String,
-    base_revision: String,
-    graph: GraphView,
-    retirements: Value,
 }
 struct CallResult {
     operation: String,
-    server_id: String,
     result: Result<Value, AppError>,
     selection: Option<frontier::Selection>,
 }
@@ -124,8 +114,6 @@ impl Default for View {
             dialog_choice: 0,
             dialog_saved_input: None,
             pi_alive: true,
-            preview: None,
-            show_preview: false,
             node_pages: frontier::State::default(),
         }
     }
@@ -135,17 +123,12 @@ impl View {
     fn connected_to(&mut self, server_id: &str) {
         if self.server_id != server_id {
             self.server_id = server_id.into();
-            self.preview = None;
-            self.show_preview = false;
             self.selected = self.graph.selected_after_refresh(self.selected.as_deref());
             self.node_pages.sync(None);
         }
     }
 
     fn frontier_selection(&self) -> Option<frontier::Selection> {
-        if self.active_preview().is_some() {
-            return None;
-        }
         let node_id = self.selected.clone()?;
         if !self.graph.nodes.iter().any(|node| node.id == node_id) {
             return None;
@@ -171,55 +154,8 @@ impl View {
         Ok(())
     }
 
-    fn remember_tool_preview(&mut self, details: &Value) {
-        if details["receipt"]["server_id"]
-            .as_str()
-            .is_some_and(|id| id != self.server_id)
-        {
-            return;
-        }
-        self.remember_preview(details);
-        self.remember_preview(&details["result"]);
-    }
-
-    fn active_preview(&self) -> Option<&RewritePreview> {
-        self.preview.as_ref().filter(|preview| {
-            self.show_preview && Some(preview.run_id.as_str()) == self.run_id.as_deref()
-        })
-    }
-
-    fn visible_graph(&self) -> &GraphView {
-        self.active_preview()
-            .map_or(&self.graph, |preview| &preview.graph)
-    }
-
-    fn remember_preview(&mut self, value: &Value) {
-        if let (Some(plan), Some(run)) = (value["plan_id"].as_str(), value["run_id"].as_str())
-            && let Ok(graph) = GraphView::from_snapshot(value)
-        {
-            self.preview = Some(RewritePreview {
-                run_id: run.into(),
-                plan_id: plan.into(),
-                base_revision: value["base_revision"]
-                    .as_str()
-                    .or_else(|| value["revision"].as_str())
-                    .unwrap_or("unknown")
-                    .into(),
-                graph,
-                retirements: value["retirements"].clone(),
-            });
-            self.show_preview = Some(run) == self.run_id.as_deref();
-            self.selected = self
-                .visible_graph()
-                .selected_after_refresh(self.selected.as_deref());
-        }
-    }
-
     fn selected_detail(&self) -> Value {
         let node = self.selected.as_deref().unwrap_or("");
-        if let Some(preview) = self.active_preview() {
-            return json!({"preview_plan":preview.plan_id,"base_revision":preview.base_revision,"node_id":node,"proposed_edges":preview.graph.incident_edges(node),"retirements":preview.retirements});
-        }
         let at_node = |value: &Value| {
             value
                 .as_array()
@@ -305,9 +241,6 @@ async fn run_terminal(
                 },
                 event=pi_events.recv(),if view.pi_alive=>match event {
                     Some(PiEvent::Record(record))=>{
-                        if record["type"]=="tool_execution_end" {
-                            view.remember_tool_preview(&record["result"]["details"]);
-                        }
                         if record["type"]=="extension_ui_request" {
                             let opens_dialog=view.chat.dialog.is_none() && matches!(record["method"].as_str(),Some("select"|"confirm"|"input"|"editor"));
                             if opens_dialog {
@@ -343,14 +276,10 @@ async fn run_terminal(
                         }
                     }
                 },
-                result=call_rx.recv()=>if let Some(CallResult{operation,server_id,result,selection})=result {
+                result=call_rx.recv()=>if let Some(CallResult{operation,result,selection})=result {
                     if selection.is_some() && (selection!=view.frontier_selection() || selected_tx.borrow().as_ref().is_some_and(|selected|Some(selected)!=view.run_id.as_ref())){continue;}
                     match result {
                         Ok(value)=>{
-                            if server_id==view.server_id {
-                                view.remember_preview(&value);
-                                if operation=="rewrite.commit"{view.show_preview=false;}
-                            }
                             view.chat.push(operation,serde_json::to_string_pretty(&value)?);
                         },
                         Err(error)=>view.chat.push(format!("{operation} failed"),error.to_string()),
@@ -371,7 +300,7 @@ async fn run_terminal(
                             if snapshot.is_null(){view.graph=GraphView::default();view.snapshot=snapshot;}
                             else if snapshot.get("graph").is_none(){view.graph=GraphView::default();view.selected=None;view.status=format!("Run {} · resume to inspect live graph state",snapshot["status"].as_str().unwrap_or("unavailable"));view.snapshot=snapshot;}
                             else {match GraphView::from_snapshot(&snapshot){
-                                Ok(graph)=>{view.graph=graph;view.snapshot=snapshot;view.selected=view.visible_graph().selected_after_refresh(if changed{None}else{view.selected.as_deref()});if changed{view.pan_x=0;view.pan_y=0;}},
+                                Ok(graph)=>{view.graph=graph;view.snapshot=snapshot;view.selected=view.graph.selected_after_refresh(if changed{None}else{view.selected.as_deref()});if changed{view.pan_x=0;view.pan_y=0;}},
                                 Err(error)=>view.status=format!("Invalid graph snapshot: {error}"),
                             }}
                         },
@@ -490,25 +419,19 @@ async fn handle_key(
     match view.focus {
         Focus::Graph => match key.code {
             KeyCode::Up | KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                view.selected = view.visible_graph().navigate(
+                view.selected = view.graph.navigate(
                     view.selected.as_deref(),
                     if key.code == KeyCode::Up { -1 } else { 1 },
                 );
                 if let Some(id) = &view.selected {
-                    view.pan_y = view.visible_graph().node_y(id).max(0);
+                    view.pan_y = view.graph.node_y(id).max(0);
                 }
             }
             KeyCode::Up => view.pan_y = (view.pan_y - 3).max(0),
             KeyCode::Down => view.pan_y += 3,
             KeyCode::Left => view.pan_x = (view.pan_x - 4).max(0),
             KeyCode::Right => view.pan_x += 4,
-            KeyCode::Char('p') => {
-                view.show_preview = !view.show_preview;
-                view.selected = view
-                    .visible_graph()
-                    .selected_after_refresh(view.selected.as_deref());
-            }
-            KeyCode::Char('o') if view.active_preview().is_none() => {
+            KeyCode::Char('o') => {
                 view.node_pages.sync(view.frontier_selection());
                 if !view.node_pages.loaded() {
                     view.request_frontier(client, nodes, false, true)?;
@@ -528,12 +451,8 @@ async fn handle_key(
                     view.focus = Focus::Conversation;
                 }
             }
-            KeyCode::Char('n') if view.active_preview().is_none() => {
-                view.request_frontier(client, nodes, true, false)?
-            }
-            KeyCode::Char('r') if view.active_preview().is_none() => {
-                view.request_frontier(client, nodes, false, false)?
-            }
+            KeyCode::Char('n') => view.request_frontier(client, nodes, true, false)?,
+            KeyCode::Char('r') => view.request_frontier(client, nodes, false, false)?,
             KeyCode::Char('[') | KeyCode::Char(']') if !view.runs.is_empty() => {
                 let index = view
                     .run_id
@@ -549,9 +468,7 @@ async fn handle_key(
                 let _ = selected.send(Some(view.runs[next].clone()));
             }
             KeyCode::Enter => {
-                if view.active_preview().is_none() {
-                    view.request_frontier(client, nodes, false, false)?;
-                }
+                view.request_frontier(client, nodes, false, false)?;
                 let detail = view.selected_detail();
                 view.chat
                     .push("Graph inspection", serde_json::to_string_pretty(&detail)?);
@@ -615,7 +532,7 @@ async fn handle_key(
                         json!({"run_id":run,"package_id":package.trim()}),
                     );
                 } else if text == "/help" {
-                    view.chat.push("Controls","Tab changes pane. Graph: ↑/↓ select node; ←/→ pan; Shift+↑/↓ pan vertically; [/] select run; Enter loads node package pages; o cycles histories; n loads next pages; r refreshes first pages; p toggles rewrite preview. Esc stops Pi; Ctrl-Q detaches. /new, /session PATH, /clone, /fork ENTRY manage Pi sessions. :package PACKAGE_ID shows package history; :call OPERATION JSON invokes an Ontography binding.");
+                    view.chat.push("Controls","Tab changes pane. Graph: ↑/↓ select node; ←/→ pan; Shift+↑/↓ pan vertically; [/] select run; Enter loads node package pages; o cycles histories; n loads next pages; r refreshes first pages. Esc stops Pi; Ctrl-Q detaches. /new, /session PATH, /clone, /fork ENTRY manage Pi sessions. :package PACKAGE_ID shows package history; :call OPERATION JSON invokes an Ontography binding.");
                 } else {
                     if !view.pi_alive {
                         view.input = text;
@@ -664,7 +581,6 @@ fn submit_call_scoped(
         let _ = calls
             .send(CallResult {
                 operation,
-                server_id: client.server_id().into(),
                 result,
                 selection,
             })
@@ -758,21 +674,7 @@ fn render(frame: &mut Frame, view: &View) {
         })
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(areas[1]);
-    let graph_title = if let Some(preview) = view.active_preview() {
-        format!(
-            " Preview {} · base {}{} · p returns ",
-            preview.plan_id,
-            preview.base_revision,
-            if view.snapshot["revision"].as_str() == Some(preview.base_revision.as_str()) {
-                ""
-            } else {
-                " · stale"
-            }
-        )
-    } else {
-        " Graph · ↑↓ / [ ] / p preview ".into()
-    };
-    let graph_block = panel(&graph_title, view.focus == Focus::Graph);
+    let graph_block = panel(" Graph · ↑↓ / [ ] ", view.focus == Focus::Graph);
     let graph_inner = graph_block.inner(panes[0]);
     frame.render_widget(graph_block, panes[0]);
     let graph_areas = Layout::default()
@@ -784,7 +686,7 @@ fn render(frame: &mut Frame, view: &View) {
         .split(graph_inner);
     frame.render_widget(
         GraphCanvas {
-            graph: view.visible_graph(),
+            graph: &view.graph,
             selected: view.selected.as_deref(),
             pan_x: view.pan_x,
             pan_y: view.pan_y,
@@ -794,7 +696,7 @@ fn render(frame: &mut Frame, view: &View) {
     let edges = view
         .selected
         .as_deref()
-        .map(|id| view.visible_graph().incident_edges(id))
+        .map(|id| view.graph.incident_edges(id))
         .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(edges.join("\n")).style(Style::default().fg(Color::Gray)),
@@ -907,63 +809,5 @@ mod tests {
                 .push("Pi", "A graph run exists independently of this client.");
             terminal.draw(|frame| render(frame, &view)).unwrap();
         }
-    }
-
-    #[test]
-    fn preview_never_replaces_current_graph_or_reports_future_frontier() {
-        let mut view = View {
-            run_id: Some("run-a".into()),
-            snapshot: json!({"revision":"2","graph":{"nodes":[{"id":"old"}],"edges":[]},"frontier":{"received":[{"node_id":"old","package_id":"p1"},{"node_id":"other","package_id":"p2"}]}}),
-            ..View::default()
-        };
-        view.graph = GraphView::from_snapshot(&view.snapshot).unwrap();
-        view.selected = Some("old".into());
-        assert!(view.selected_detail()["received"].is_null());
-        view.remember_preview(&json!({"run_id":"run-a","plan_id":"plan-1","base_revision":"2","graph":{"nodes":[{"id":"new"}],"edges":[]},"retirements":[{"package_id":"p1"}]}));
-        assert_eq!(view.visible_graph().nodes[0].id, "new");
-        assert_eq!(view.graph.nodes[0].id, "old");
-        assert!(view.selected_detail().get("received").is_none());
-        view.show_preview = false;
-        assert_eq!(view.visible_graph().nodes[0].id, "old");
-    }
-
-    #[test]
-    fn server_restart_expires_preview_and_rejects_late_tool_results() {
-        let mut view = View {
-            run_id: Some("run-a".into()),
-            ..View::default()
-        };
-        view.graph =
-            GraphView::from_snapshot(&json!({"graph":{"nodes":[{"id":"live"}],"edges":[]}}))
-                .unwrap();
-        view.connected_to("server-1");
-        let details = json!({"receipt":{"server_id":"server-1"},"result":{"run_id":"run-a","plan_id":"p1","base_revision":"2","graph":{"nodes":[{"id":"future"}],"edges":[]}}});
-        view.remember_tool_preview(&details);
-        view.connected_to("server-1");
-        assert!(view.preview.is_some());
-        assert_eq!(view.selected.as_deref(), Some("future"));
-        view.connected_to("server-2");
-        assert!(view.preview.is_none());
-        assert!(!view.show_preview);
-        assert_eq!(view.selected.as_deref(), Some("live"));
-        view.remember_tool_preview(&details);
-        assert!(view.preview.is_none());
-    }
-
-    #[test]
-    fn inactive_preview_flags_do_not_block_live_node_package_queries() {
-        let mut view = View {
-            run_id: Some("run-a".into()),
-            selected: Some("live".into()),
-            show_preview: true,
-            ..View::default()
-        };
-        view.graph =
-            GraphView::from_snapshot(&json!({"graph":{"nodes":[{"id":"live"}],"edges":[]}}))
-                .unwrap();
-        assert!(view.frontier_selection().is_some());
-        view.remember_preview(&json!({"run_id":"another-run","plan_id":"plan","base_revision":"1","graph":{"nodes":[{"id":"future"}],"edges":[]}}));
-        view.show_preview = true;
-        assert!(view.frontier_selection().is_some());
     }
 }

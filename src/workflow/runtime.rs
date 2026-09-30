@@ -24,7 +24,8 @@ use tokio::sync::watch;
 #[serde(deny_unknown_fields)]
 pub struct InitialWorkflow {
     pub state: WorkflowState,
-    pub input: Value,
+    /// The entry's first task; none when an outside client acts for the entry.
+    pub input: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<PathBuf>,
 }
@@ -51,12 +52,7 @@ pub fn node_directory(run: &ManagedRun, node_id: &str) -> PathBuf {
 }
 
 pub fn load(run: &ManagedRun) -> Result<WorkflowState> {
-    let initial = run.manifest.workflow.as_ref().ok_or_else(|| {
-        AppError::new(
-            "not_a_workflow",
-            "This run was created with the legacy graph interface",
-        )
-    })?;
+    let initial = &run.manifest.workflow;
     let path = state_path(run);
     if path.exists() {
         edit::load(&path)
@@ -81,11 +77,10 @@ pub async fn resume(run: &mut ManagedRun) -> Result<()> {
 /// Read core when that cache is absent; an interrupted root is retried, never an
 /// accepted one. Normal tasks recover through their unconsumed package inputs.
 pub async fn initial_pending(run: &ManagedRun) -> Result<bool> {
-    let initial = run
-        .manifest
-        .workflow
-        .as_ref()
-        .ok_or_else(|| AppError::invalid("Workflow required"))?;
+    let initial = &run.manifest.workflow;
+    if initial.input.is_none() && initial.workspace.is_none() {
+        return Ok(false);
+    }
     let id = &initial.state.identities.nodes[&initial.state.current.entry];
     let marker = initial_marker(&node_directory(run, id));
     if marker.exists() {
@@ -128,11 +123,7 @@ fn initial_marker(node_directory: &Path) -> PathBuf {
 }
 
 pub async fn initial_payload(run: &ManagedRun) -> Result<ontography::Payload> {
-    let initial = run
-        .manifest
-        .workflow
-        .as_ref()
-        .ok_or_else(|| AppError::invalid("Workflow required"))?;
+    let initial = &run.manifest.workflow;
     let path = run.directory.join("initial-input.json");
     if path.exists() {
         return WorkflowPayload::from_value(&persistence::read_json(&path)?)?.encode();
@@ -151,7 +142,12 @@ pub async fn initial_payload(run: &ManagedRun) -> Result<ontography::Payload> {
             .map_err(AppError::core)?;
         WorkflowPayload::Workspace(ontography::PackageEnvelope::new(package.root()))
     } else {
-        WorkflowPayload::from_value(&initial.input)?
+        WorkflowPayload::from_value(
+            initial
+                .input
+                .as_ref()
+                .ok_or_else(|| AppError::invalid("This run has no initial input"))?,
+        )?
     };
     let bytes = payload.encode()?;
     persistence::write_json(&path, &payload)?;
@@ -181,10 +177,17 @@ pub async fn reconcile(
         ));
     }
     let kernel = run.live()?.session.kernel().await.map_err(AppError::core)?;
+    // Outside clients act for external nodes; no worker runs there.
     let desired = state
         .current
         .nodes
         .iter()
+        .filter(|node| {
+            state
+                .bindings
+                .get(&node.id)
+                .is_some_and(|binding| !binding.implementation.is_external())
+        })
         .map(|node| {
             Ok((
                 &state.identities.nodes[&node.id],
@@ -227,12 +230,7 @@ pub async fn reconcile(
         ledgers.insert(id, worker.ledger);
     }
     let pending_initial = initial_pending(run).await?;
-    let initial = run
-        .manifest
-        .workflow
-        .as_ref()
-        .expect("workflow checked")
-        .clone();
+    let initial = run.manifest.workflow.clone();
     let original_entry = &initial.state.identities.nodes[&initial.state.current.entry];
     let workflow = Arc::new(state.clone());
     for (id, node) in desired {

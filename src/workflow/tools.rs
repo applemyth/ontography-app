@@ -8,7 +8,6 @@ use super::{
 use crate::{
     AppError, Result,
     catalog::Operation,
-    definition::RunDefinition,
     persistence,
     state::{ManagedRun, Service},
     views,
@@ -34,7 +33,7 @@ pub fn operations() -> Vec<Operation> {
     vec![
         Operation::new(
             "flow.library",
-            "List the components a document's nodes can place, with their node types and settings, and the library's MCP servers.",
+            "List the components a document's nodes can place, with their node types and settings, the validators contracts can use, and the library's MCP servers.",
             json!({}),
             &[],
             false,
@@ -48,7 +47,7 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.start",
-            "Start a document or saved revision. Supply message or a workspace directory as the initial input. A start_id makes unscoped retries idempotent.",
+            "Start a document or saved revision. Supply message or a workspace directory as the entry's initial input; an external entry takes none. A start_id makes unscoped retries idempotent.",
             json!({"document":document,"revision":text,"project":text,"message":text,"workspace":text,"start_id":text}),
             &["project"],
             true,
@@ -156,6 +155,11 @@ fn library(service: &Service) -> Result<Value> {
     Ok(json!({
         "library": path,
         "components": Catalog::with_library(&library)?.describe(),
+        "validators": {
+            "text": "Valid UTF-8: a message, or a workspace envelope",
+            "bytes": "Any bytes",
+            "workspace": "Only a workspace",
+        },
         "servers": servers,
     }))
 }
@@ -193,6 +197,39 @@ pub(crate) fn optional_str<'a>(args: &'a Value, field: &str) -> Result<Option<&'
         .transpose()
 }
 
+/// A new run's declaration and initial workflow: `document` bound by
+/// `catalog`, under its own names as core identities.
+pub fn plan(
+    catalog: &Catalog,
+    document: Document,
+    id: &str,
+    input: Option<Value>,
+    workspace: Option<PathBuf>,
+) -> Result<(
+    crate::declarations::GraphDeclaration,
+    runtime::InitialWorkflow,
+)> {
+    let bindings = catalog.bind(&document)?;
+    let identities = IdentityMap::initial(&document);
+    let declaration = expand(
+        &document,
+        &bindings,
+        &catalog.node_types(&document)?,
+        id,
+        &identities,
+    )?;
+    declaration.compile().map_err(AppError::core)?;
+    let state = edit::WorkflowState::new(document, bindings, identities)?;
+    Ok((
+        declaration,
+        runtime::InitialWorkflow {
+            state,
+            input,
+            workspace,
+        },
+    ))
+}
+
 pub fn prepare_start(
     service: &Service,
     args: &Value,
@@ -206,18 +243,16 @@ pub fn prepare_start(
         return Err(AppError::invalid("Supply message or workspace, not both"));
     }
     let catalog = components(service)?;
-    let bindings = catalog.bind(&document)?;
-    let identities = IdentityMap::initial(&document);
-    let declaration = expand(
-        &document,
-        &bindings,
-        &catalog.node_types(&document)?,
-        id,
-        &identities,
-    )?;
-    declaration.compile().map_err(AppError::core)?;
-    let state = edit::WorkflowState::new(document, bindings, identities)?;
-    let input = json!({"message":optional_str(args,"message")?.unwrap_or("")});
+    let external = catalog.bind(&document)?[&document.entry]
+        .implementation
+        .is_external();
+    if external && (args.get("message").is_some() || args.get("workspace").is_some()) {
+        return Err(AppError::invalid(
+            "An external entry takes no initial input; its client starts work with root moves",
+        ));
+    }
+    let message = optional_str(args, "message")?.unwrap_or("");
+    let input = (!external).then(|| json!({"message": message}));
     let workspace = args
         .get("workspace")
         .map(|value| {
@@ -237,14 +272,7 @@ pub fn prepare_start(
             Ok(path)
         })
         .transpose()?;
-    Ok((
-        declaration,
-        runtime::InitialWorkflow {
-            state,
-            input,
-            workspace,
-        },
-    ))
+    plan(&catalog, document, id, input, workspace)
 }
 
 pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Result<Value> {
@@ -267,15 +295,10 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         uuid::Uuid::parse_str(&id).map_err(|_| AppError::invalid("start_id must be a UUID"))?;
         let project = std::fs::canonicalize(views::field(args, "project")?)?;
-        let (declaration, mut initial) = prepare_start(service, args, &id)?;
+        let (mut declaration, mut initial) = prepare_start(service, args, &id)?;
         if let Ok(run) = service.run(&id).await {
             let run = run.lock().await;
-            let original = run.manifest.workflow.as_ref().ok_or_else(|| {
-                AppError::new(
-                    "initialization_conflict",
-                    "This start_id names a different run",
-                )
-            })?;
+            let original = &run.manifest.workflow;
             if original.state.current != initial.state.current
                 || original.input != initial.input
                 || original.workspace != initial.workspace
@@ -286,24 +309,14 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
                     "This start_id has a different workflow or input",
                 ));
             }
-            initial = original.clone();
             // An incomplete core creation is recovered by the reserved start
             // path, from the declaration this start saved.
-            let RunDefinition::Logical(declaration) = run.manifest.declaration.clone() else {
-                return Err(AppError::new(
-                    "initialization_conflict",
-                    "This start_id names a different run",
-                ));
-            };
-            drop(run);
-            service
-                .start_workflow_reserved(&id, declaration, project, initial, service.environment())
-                .await?;
-        } else {
-            service
-                .start_workflow_reserved(&id, declaration, project, initial, service.environment())
-                .await?;
+            initial = original.clone();
+            declaration = run.manifest.declaration.clone();
         }
+        service
+            .start_reserved(&id, declaration, project, initial, service.environment())
+            .await?;
         return status(&*service.run(&id).await?.lock().await).await;
     }
     let id = views::field(args, "run_id")?;
@@ -337,7 +350,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
             )?;
             let bindings = components(service)?.bind(&next)?;
             let plan = edit::preview(&run.live()?.session, &state, next, bindings).await?;
-            let initial = run.manifest.workflow.as_ref().expect("workflow loaded");
+            let initial = &run.manifest.workflow;
             let entry = &initial.state.current.entry;
             if runtime::initial_pending(&run).await?
                 && (plan.document.entry != *entry
@@ -503,7 +516,7 @@ pub(super) async fn node_tasks<'a>(
 
 /// The core node holding the run's initial input while it is still pending.
 async fn initial_holder(run: &ManagedRun) -> Result<Option<&str>> {
-    let initial = run.manifest.workflow.as_ref().expect("workflow loaded");
+    let initial = &run.manifest.workflow;
     let entry = &initial.state.identities.nodes[&initial.state.current.entry];
     Ok((run.live.is_some() && runtime::initial_pending(run).await?).then_some(entry.as_str()))
 }
@@ -531,6 +544,10 @@ async fn ready_tasks<'a>(
         }
         let holds_initial = initial == Some(id.as_str());
         let binding = state.binding(&node.id)?;
+        if binding.implementation.is_external() {
+            // Its client, not the manager, takes the work there.
+            continue;
+        }
         let task = if binding.implementation.runs_tasks() {
             // Exactly what its worker runs next; failed tasks that wait or are
             // parked appear among the failures instead.

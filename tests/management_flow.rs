@@ -1,7 +1,8 @@
 use ontography_app::{persistence::Paths, state::Service, tools};
 use serde_json::{Value, json};
 
-fn declaration() -> Value {
+/// An outside client acts for both nodes: `A` sends text to `B` under `work`.
+fn document() -> Value {
     serde_json::from_str(include_str!("../examples/flow.json")).unwrap()
 }
 
@@ -14,8 +15,8 @@ async fn call(service: &Service, operation: &str, args: Value) -> Value {
 async fn start(service: &Service, project: &std::path::Path) -> String {
     call(
         service,
-        "run.start",
-        json!({"declaration":declaration(),"project":project}),
+        "flow.start",
+        json!({"document":document(),"project":project}),
     )
     .await["run_id"]
         .as_str()
@@ -28,32 +29,28 @@ fn root(run_id: &str, payload: Value) -> Value {
         "result":"sent","emissions":[{"edge_id":"A_to_B","payload":payload}]})
 }
 
-fn rewrite_request(run_id: &str) -> Value {
-    json!({"run_id":run_id,"request":{"remove_nodes":["B"],"remove_edges":["A_to_B"]}})
+/// The example without `B`: an edit that retires B's pending work.
+fn without_b() -> Value {
+    let mut document = document();
+    document["nodes"].as_array_mut().unwrap().truncate(1);
+    document["edges"] = json!([]);
+    document
 }
 
 #[tokio::test]
 async fn forbidden_root_authority_preserves_revision_and_frontier() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
-    let mut definition = declaration();
+    let mut definition = document();
     // Both tags are valid vocabulary. Only `work` is granted by A's root rule,
     // so rejection must come from authority governance, not a malformed tag.
-    definition["schema"]["authority_tags"] = json!(["work", "admin"]);
-    assert_eq!(definition["roots"][0]["ceiling"], json!(["work"]));
-    assert_eq!(
-        call(
-            &service,
-            "graph.validate",
-            json!({"declaration":definition})
-        )
-        .await["valid"],
-        true
-    );
+    definition["nodes"][1]["root"] = json!(["admin"]);
+    assert_eq!(definition["nodes"][0]["root"], json!(["work"]));
+    call(&service, "flow.define", json!({"document":definition})).await;
     let run_id = call(
         &service,
-        "run.start",
-        json!({"declaration":definition,"project":directory.path()}),
+        "flow.start",
+        json!({"document":definition,"project":directory.path()}),
     )
     .await["run_id"]
         .as_str()
@@ -100,13 +97,13 @@ async fn admitted_workflow_survives_suspension_and_closure_remains_terminal() {
     let directory = tempfile::tempdir().unwrap();
     let paths = Paths::initialize(directory.path().join("data")).unwrap();
     let service = Service::new(paths.clone()).unwrap();
-    let mut invalid = declaration();
-    invalid["edges"][0]["target"] = json!("missing");
+    let mut invalid = document();
+    invalid["edges"][0]["to"] = json!("missing");
     assert!(
         tools::dispatch(
             &service,
-            "run.start",
-            &json!({"declaration":invalid,"project":directory.path()})
+            "flow.start",
+            &json!({"document":invalid,"project":directory.path()})
         )
         .await
         .is_err()
@@ -118,15 +115,8 @@ async fn admitted_workflow_survives_suspension_and_closure_remains_terminal() {
             .is_empty()
     );
 
-    let saved = call(&service, "graph.save", json!({"declaration":declaration()})).await;
-    assert_eq!(saved["validated"], false);
-    let validated = call(
-        &service,
-        "graph.validate",
-        json!({"declaration":declaration()}),
-    )
-    .await;
-    assert_eq!(validated["valid"], true);
+    let saved = call(&service, "flow.define", json!({"document":document()})).await;
+    assert_eq!(saved["revision"].as_str().unwrap().len(), 64);
     let run_id = start(&service, directory.path()).await;
     let before = call(&service, "run.inspect", json!({"run_id":run_id})).await;
     let rejected = tools::dispatch(&service, "workflow.submit", &root(&run_id, json!([255])))
@@ -193,15 +183,15 @@ async fn admitted_workflow_survives_suspension_and_closure_remains_terminal() {
 }
 
 #[tokio::test]
-async fn stale_rewrites_reject_and_committed_topology_survives_reopening() {
+async fn stale_edits_reject_and_committed_topology_survives_reopening() {
     let directory = tempfile::tempdir().unwrap();
     let paths = Paths::initialize(directory.path().join("data")).unwrap();
     let service = Service::new(paths.clone()).unwrap();
-    let saved = call(&service, "graph.save", json!({"declaration":declaration()})).await;
     let run_id = start(&service, directory.path()).await;
     call(&service, "workflow.submit", root(&run_id, json!("first"))).await;
     let before = call(&service, "run.inspect", json!({"run_id":run_id})).await;
-    let stale = call(&service, "rewrite.prepare", rewrite_request(&run_id)).await;
+    let edit = json!({"run_id":run_id,"document":without_b()});
+    let stale = call(&service, "flow.edit", edit.clone()).await;
     assert_eq!(stale["retirements"].as_array().unwrap().len(), 1);
     assert_eq!(
         call(&service, "run.inspect", json!({"run_id":run_id})).await["revision"],
@@ -210,18 +200,24 @@ async fn stale_rewrites_reject_and_committed_topology_survives_reopening() {
     call(&service, "workflow.submit", root(&run_id, json!("second"))).await;
     let rejection = tools::dispatch(
         &service,
-        "rewrite.commit",
+        "flow.commit",
         &json!({"run_id":run_id,"plan_id":stale["plan_id"]}),
     )
     .await
     .unwrap_err();
-    assert_eq!(rejection.code, "stale");
+    assert_eq!(rejection.code, "stale_preview");
 
-    let fresh = call(&service, "rewrite.prepare", rewrite_request(&run_id)).await;
+    let fresh = call(&service, "flow.edit", edit).await;
     assert_eq!(fresh["retirements"].as_array().unwrap().len(), 2);
+    let pending = call(
+        &service,
+        "inspect.frontier",
+        json!({"run_id":run_id,"node_id":"B"}),
+    )
+    .await;
     call(
         &service,
-        "rewrite.commit",
+        "flow.commit",
         json!({"run_id":run_id,"plan_id":fresh["plan_id"]}),
     )
     .await;
@@ -234,13 +230,6 @@ async fn stale_rewrites_reject_and_committed_topology_survives_reopening() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        call(&service, "graph.get", json!({"revision":saved["revision"]})).await["nodes"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
     service.shutdown().await.unwrap();
     drop(service);
 
@@ -248,7 +237,7 @@ async fn stale_rewrites_reject_and_committed_topology_survives_reopening() {
     let reopened = call(&service, "run.resume", json!({"run_id":run_id})).await;
     assert_eq!(reopened["graph"], changed["graph"]);
     assert_eq!(reopened["revision"], changed["revision"]);
-    for retired in fresh["retirements"].as_array().unwrap() {
+    for retired in pending["packages"].as_array().unwrap() {
         let history = call(
             &service,
             "inspect.package",

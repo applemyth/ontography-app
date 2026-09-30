@@ -1,10 +1,8 @@
 //! The server exits once nothing runs and no client is connected.
 
-use ontography_app::{
-    client::Client, persistence::Paths, registry::ImplementationRegistry, server,
-};
+use ontography_app::{client::Client, persistence::Paths, server};
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 async fn connect(paths: &Paths) -> Client {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -23,9 +21,8 @@ async fn connect(paths: &Paths) -> Client {
 async fn an_idle_server_exits_while_an_open_run_keeps_it() {
     let directory = tempfile::tempdir().unwrap();
     let paths = Paths::initialize(directory.path().join("store")).unwrap();
-    let serving = tokio::spawn(server::serve_with_registry(
+    let serving = tokio::spawn(server::serve(
         paths.clone(),
-        Arc::new(ImplementationRegistry::default()),
         Some(Duration::from_millis(300)),
     ));
     let client = connect(&paths).await;
@@ -35,12 +32,12 @@ async fn an_idle_server_exits_while_an_open_run_keeps_it() {
     );
 
     // An open run keeps the server past its idle limit.
-    let declaration: serde_json::Value =
+    let document: serde_json::Value =
         serde_json::from_str(include_str!("../examples/flow.json")).unwrap();
     let run = client
         .call(
-            "run.start",
-            json!({"declaration":declaration,"project":directory.path()}),
+            "flow.start",
+            json!({"document":document,"project":directory.path()}),
         )
         .await
         .unwrap();
@@ -68,9 +65,8 @@ async fn an_idle_server_exits_while_an_open_run_keeps_it() {
 async fn commands_arriving_between_idle_checks_keep_the_server() {
     let directory = tempfile::tempdir().unwrap();
     let paths = Paths::initialize(directory.path().join("store")).unwrap();
-    let serving = tokio::spawn(server::serve_with_registry(
+    let serving = tokio::spawn(server::serve(
         paths.clone(),
-        Arc::new(ImplementationRegistry::default()),
         Some(Duration::from_millis(600)),
     ));
     let client = connect(&paths).await;

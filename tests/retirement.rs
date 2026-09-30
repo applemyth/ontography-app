@@ -1,7 +1,8 @@
 use ontography_app::{persistence::Paths, state::Service, tools};
 use serde_json::{Value, json};
 
-fn declaration() -> Value {
+/// An outside client acts for both nodes: `A` sends text to `B` under `work`.
+fn document() -> Value {
     serde_json::from_str(include_str!("../examples/flow.json")).unwrap()
 }
 
@@ -11,11 +12,11 @@ async fn call(service: &Service, operation: &str, args: Value) -> Value {
         .unwrap_or_else(|error| panic!("{operation} failed: {error}"))
 }
 
-async fn start(service: &Service, project: &std::path::Path, declaration: Value) -> String {
+async fn start(service: &Service, project: &std::path::Path, document: Value) -> String {
     call(
         service,
-        "run.start",
-        json!({"declaration":declaration,"project":project}),
+        "flow.start",
+        json!({"document":document,"project":project}),
     )
     .await["run_id"]
         .as_str()
@@ -70,7 +71,7 @@ async fn explicit_retirement_is_observable_bounded_and_durable() {
     let directory = tempfile::tempdir().unwrap();
     let paths = Paths::initialize(directory.path().join("data")).unwrap();
     let service = Service::new(paths.clone()).unwrap();
-    let run_id = start(&service, directory.path(), declaration()).await;
+    let run_id = start(&service, directory.path(), document()).await;
     let (received, evidence) = emit(&service, &run_id, "A", Some("A_to_B")).await;
     let (outbound, _) = emit(&service, &run_id, "A", None).await;
     let (consumed, _) = emit(&service, &run_id, "A", Some("A_to_B")).await;
@@ -250,42 +251,39 @@ async fn explicit_retirement_is_observable_bounded_and_durable() {
 }
 
 #[tokio::test]
-async fn local_rewrites_report_route_holder_and_acceptance_retirements() {
+async fn edits_report_route_holder_and_acceptance_retirements() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(Paths::initialize(directory.path().join("data")).unwrap()).unwrap();
-    let mut definition = declaration();
-    definition["nodes"][1]["ingress_mode"] = json!("all");
+    let mut definition = document();
+    definition["nodes"][1]["join"] = json!("all");
     let mut edge2 = definition["edges"][0].clone();
-    edge2["id"] = json!("A_to_B_2");
+    edge2["name"] = json!("A_to_B_2");
     definition["edges"].as_array_mut().unwrap().push(edge2);
     definition["nodes"]
         .as_array_mut()
         .unwrap()
-        .push(json!({"id":"C","types":["Logical"],"result_contract":"text"}));
-    definition["roots"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"node_id":"C","ceiling":["work"]}));
-    let run_id = start(&service, directory.path(), definition).await;
+        .push(json!({"id":"C","component":"external","result":"text","root":["work"]}));
+    let run_id = start(&service, directory.path(), definition.clone()).await;
     let (unrelated, _) = emit(&service, &run_id, "C", None).await;
     let (outbound, _) = emit(&service, &run_id, "A", None).await;
     let (receipt1, _) = emit(&service, &run_id, "A", Some("A_to_B")).await;
     let (receipt2, _) = emit(&service, &run_id, "A", Some("A_to_B_2")).await;
+    definition["edges"].as_array_mut().unwrap().pop();
     let plan = call(
         &service,
-        "rewrite.prepare",
-        json!({"run_id":run_id,"request":{"remove_edges":["A_to_B_2"]}}),
+        "flow.edit",
+        json!({"run_id":run_id,"document":definition}),
     )
     .await;
     assert_eq!(plan["retirements"].as_array().unwrap().len(), 1);
-    assert_eq!(plan["retirements"][0]["package_id"], receipt2);
+    assert_eq!(plan["retirements"][0]["node"], "B");
     assert_eq!(
         inspect(&service, &run_id, &receipt2).await["disposition"],
         "live"
     );
     call(
         &service,
-        "rewrite.commit",
+        "flow.commit",
         json!({"run_id":run_id,"plan_id":plan["plan_id"]}),
     )
     .await;
@@ -308,16 +306,21 @@ async fn local_rewrites_report_route_holder_and_acceptance_retirements() {
     .await;
     assert_eq!(trigger["packages"].as_array().unwrap().len(), 1);
     assert_eq!(trigger["packages"][0]["package_id"], receipt1);
+    definition["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|node| node["id"] != "B");
+    definition["edges"] = json!([]);
     let plan = call(
         &service,
-        "rewrite.prepare",
-        json!({"run_id":run_id,"request":{"remove_nodes":["B"],"remove_edges":["A_to_B"]}}),
+        "flow.edit",
+        json!({"run_id":run_id,"document":definition}),
     )
     .await;
     assert_eq!(plan["retirements"].as_array().unwrap().len(), 2);
     call(
         &service,
-        "rewrite.commit",
+        "flow.commit",
         json!({"run_id":run_id,"plan_id":plan["plan_id"]}),
     )
     .await;
@@ -357,8 +360,8 @@ async fn retirement_obeys_app_session_scope_and_lifecycle() {
     let run = tools::dispatch_scoped(
         &service,
         Some(session_id),
-        "run.start",
-        &json!({"declaration":declaration()}),
+        "flow.start",
+        &json!({"document":document()}),
     )
     .await
     .unwrap();

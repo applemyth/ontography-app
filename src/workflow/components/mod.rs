@@ -17,8 +17,8 @@ mod library;
 mod preset;
 
 pub use config::{
-    AgentConfig, Binding, CommandConfig, HumanConfig, Implementation, InboxConfig, McpServer,
-    NODE_TOOLS_SERVER, ProgramConfig,
+    AgentConfig, Binding, CommandConfig, ExternalConfig, HumanConfig, Implementation, InboxConfig,
+    McpServer, NODE_TOOLS_SERVER, ProgramConfig,
 };
 pub use library::{LIBRARY_FILE, Library, PROVIDER};
 
@@ -501,7 +501,9 @@ mod tests {
         );
         assert_eq!(
             catalog.node_types(&document).unwrap(),
-            types(["Agent", "Auditor", "Command", "Human", "Inbox", "Reviewer"])
+            types([
+                "Agent", "Auditor", "Command", "External", "Human", "Inbox", "Reviewer"
+            ])
         );
     }
 

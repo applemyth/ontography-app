@@ -41,6 +41,8 @@ pub enum Implementation {
     Human(HumanConfig),
     /// Incoming work, held.
     Inbox(InboxConfig),
+    /// Work an outside client performs with core moves; nothing runs here.
+    External(ExternalConfig),
 }
 
 impl Implementation {
@@ -53,6 +55,7 @@ impl Implementation {
             Self::Command(_) => "command",
             Self::Human(_) => "human",
             Self::Inbox(_) => "inbox",
+            Self::External(_) => "external",
         }
     }
 
@@ -84,10 +87,15 @@ impl Implementation {
     }
 
     /// Whether a worker takes the node's tasks, so that retry policies,
-    /// grants, and node tools apply. People decide human tasks, and inboxes
-    /// only hold work.
+    /// grants, and node tools apply. People decide human tasks, inboxes only
+    /// hold work, and outside clients act for external nodes.
     pub const fn runs_tasks(&self) -> bool {
-        !matches!(self, Self::Human(_) | Self::Inbox(_))
+        !matches!(self, Self::Human(_) | Self::Inbox(_) | Self::External(_))
+    }
+
+    /// Whether an outside client acts for the node, so that no worker runs.
+    pub const fn is_external(&self) -> bool {
+        matches!(self, Self::External(_))
     }
 
     /// Whether a continuing session runs at the node, rather than the task harness.
@@ -100,7 +108,7 @@ impl Implementation {
         match self {
             Self::Codex(agent) | Self::Claude(agent) => agent.pty,
             Self::Program(_) => true,
-            Self::Command(_) | Self::Human(_) | Self::Inbox(_) => false,
+            Self::Command(_) | Self::Human(_) | Self::Inbox(_) | Self::External(_) => false,
         }
     }
 }
@@ -187,6 +195,10 @@ pub struct HumanConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InboxConfig {}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalConfig {}
 
 fn is_env_name(name: &str) -> bool {
     name.bytes()

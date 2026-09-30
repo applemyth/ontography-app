@@ -91,7 +91,10 @@ async fn read(run: &ManagedRun, state: &WorkflowState, args: &Value) -> Result<V
     let node = views::field(args, "node")?;
     let implementation = &state.binding(node)?.implementation;
     let human = matches!(implementation, Implementation::Human(_));
-    let inbox = matches!(implementation, Implementation::Inbox(_));
+    let inbox = matches!(
+        implementation,
+        Implementation::Inbox(_) | Implementation::External(_)
+    );
     let id = &state.identities.nodes[node];
     let source = tools::optional_str(args, "source")?.unwrap_or("auto");
     if !matches!(source, "auto" | "output" | "pending") {

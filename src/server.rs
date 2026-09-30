@@ -61,18 +61,8 @@ pub struct Server {
 
 impl Server {
     pub fn new(paths: Paths) -> Result<Arc<Self>> {
-        Self::with_registry(
-            paths,
-            Arc::new(crate::registry::ImplementationRegistry::default()),
-        )
-    }
-
-    pub fn with_registry(
-        paths: Paths,
-        registry: Arc<crate::registry::ImplementationRegistry>,
-    ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            service: Arc::new(Service::with_registry(paths, registry)?),
+            service: Arc::new(Service::new(paths)?),
             managers: crate::session_runtime::Managers::default(),
             requests: Mutex::new(BTreeMap::new()),
             admission: RwLock::new(()),
@@ -504,19 +494,6 @@ impl Drop for Ownership {
 /// also stop once nothing has run and no client has connected for that long.
 /// A server under an external supervisor runs without one.
 pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
-    serve_with_registry(
-        paths,
-        Arc::new(crate::registry::ImplementationRegistry::default()),
-        idle_limit,
-    )
-    .await
-}
-
-pub async fn serve_with_registry(
-    paths: Paths,
-    registry: Arc<crate::registry::ImplementationRegistry>,
-    idle_limit: Option<Duration>,
-) -> Result<()> {
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -549,7 +526,7 @@ pub async fn serve_with_registry(
         _lock: lock,
         socket: paths.socket.clone(),
     };
-    let server = Server::with_registry(paths, registry)?;
+    let server = Server::new(paths)?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut clients = JoinSet::new();
