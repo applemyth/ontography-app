@@ -229,3 +229,35 @@ async fn a_start_retry_waits_for_its_run_without_holding_the_others() {
     assert_eq!(retried.unwrap()["run_id"], id);
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_start_retry_clears_the_temporary_of_its_interrupted_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths::initialize(directory.path().join("data")).unwrap();
+    // A start killed while writing its manifest leaves only its temporary.
+    let id = uuid::Uuid::new_v4().to_string();
+    let reserved = paths.run(&id).unwrap();
+    std::fs::create_dir(&reserved).unwrap();
+    std::fs::write(reserved.join(".x.tmp"), b"{\"version\":").unwrap();
+    let service = Service::new(paths).unwrap();
+    let errors = |status: Value| status["recovery_errors"].as_object().unwrap().clone();
+    let status = tools::dispatch(&service, "system.status", &json!({}))
+        .await
+        .unwrap();
+    assert!(errors(status).contains_key(&id));
+
+    let started = tools::dispatch(
+        &service,
+        "flow.start",
+        &json!({"document":document(),"project":directory.path(),"start_id":id}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(started["run_id"], id);
+    assert!(!reserved.join(".x.tmp").exists());
+    let status = tools::dispatch(&service, "system.status", &json!({}))
+        .await
+        .unwrap();
+    assert!(errors(status).is_empty());
+    service.shutdown().await.unwrap();
+}

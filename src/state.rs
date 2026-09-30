@@ -351,7 +351,9 @@ pub struct Service {
     pub paths: Paths,
     pub server_id: String,
     pub runs: Mutex<BTreeMap<String, Arc<Mutex<ManagedRun>>>>,
-    pub recovery_errors: BTreeMap<String, AppError>,
+    /// Run directories that could not be loaded at startup, by name. A start
+    /// that creates its run in one clears its error.
+    pub recovery_errors: std::sync::Mutex<BTreeMap<String, AppError>>,
     pub sessions: crate::sessions::Sessions,
     /// What work no session owns starts with: the environment of the latest
     /// command that changed such work, or the server's own before any.
@@ -369,15 +371,30 @@ fn runtime(kernel: Arc<Kernel>) -> ProposalRuntime {
     ProposalRuntime::with_policy(kernel, crate::workflow::edit::policy())
 }
 
-/// A crash may leave only the reserved directory. Nonempty unknown stores are never overwritten.
+/// A crash may leave only the reserved directory, perhaps holding the
+/// temporaries of an unfinished manifest write, which are removed.
+/// Nonempty unknown stores are never overwritten.
 fn create_reserved_directory(directory: &std::path::Path) -> Result<()> {
     match std::fs::create_dir(directory) {
         Ok(()) => Ok(()),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::AlreadyExists
-                && directory.is_dir()
-                && std::fs::read_dir(directory)?.next().is_none() =>
-        {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {
+            let mut temporaries = Vec::new();
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                // `write_json` writes `.<uuid>.tmp` beside its target.
+                let temporary = entry.file_type()?.is_file()
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"));
+                if !temporary {
+                    return Err(error.into());
+                }
+                temporaries.push(entry.path());
+            }
+            for temporary in temporaries {
+                std::fs::remove_file(temporary)?;
+            }
             Ok(())
         }
         Err(error) => Err(error.into()),
@@ -428,7 +445,7 @@ impl Service {
             paths,
             server_id: uuid::Uuid::new_v4().to_string(),
             runs: Mutex::new(runs),
-            recovery_errors,
+            recovery_errors: std::sync::Mutex::new(recovery_errors),
             sessions,
             unowned: std::sync::Mutex::new(environment),
         })
@@ -578,6 +595,11 @@ impl Service {
             environment,
         }));
         runs.insert(id.into(), run.clone());
+        // Its directory holds a run now, whatever startup found there.
+        self.recovery_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
         // Nothing else can reach the run before the map is released.
         let mut run = run.lock().await;
         drop(runs);
