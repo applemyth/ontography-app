@@ -49,8 +49,9 @@ pub async fn send(client: &Client, operation: &str, args: Value) -> Reply {
         Err(error) => match error.code.as_str() {
             "rejected" => Reply::Rejected(error.message),
             "server_restarted" | "server_stopping" => Reply::NotRun(error.message),
-            // An oversized result replaces the reply of a change that happened.
-            "result_too_large" => Reply::Uncertain(error.message),
+            // An oversized result replaces the reply of a change that happened;
+            // a run whose storage failed mid-change cannot say whether it did.
+            "result_too_large" | "unknown_outcome" => Reply::Uncertain(error.message),
             code => Reply::Failed(code.into(), error.message),
         },
     }
