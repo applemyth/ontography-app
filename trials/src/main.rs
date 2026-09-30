@@ -5,20 +5,26 @@
 //! killed programs. Then it drains the run, restarts the server in order, and
 //! judges what the server kept, what its programs did, which processes it
 //! left, and its store. The sessions trial plays app sessions instead: live
-//! shells and Pi on one server, crashes, and orderly stops.
+//! shells and Pi on one server, crashes, and orderly stops. The `crashpoints`
+//! mode crashes the server at each durable write of short scripts, or fails
+//! the write (see `crashpoints`).
 
 mod agent;
 mod attach;
 mod audit;
+mod crashpoints;
 mod driver;
 mod game;
 mod history;
+mod interpose;
 mod judge;
 mod mcp;
 mod node;
 mod pi;
 mod procs;
+mod recovery;
 mod roles;
+mod scripts;
 mod server;
 mod sessions;
 mod world;
@@ -122,6 +128,9 @@ enum Mode {
     /// Play the sessions trial: app sessions with live shells and Pi on one
     /// server, crashes, and orderly stops.
     Sessions(sessions::Args),
+    /// Crash the server at the durable writes of short scripts, or fail
+    /// them, and judge how it recovers.
+    Crashpoints(crashpoints::Args),
 }
 
 /// Builds the server from the tree this harness was built from.
@@ -322,6 +331,16 @@ async fn main() -> Result<()> {
         Some(Mode::Pi(pi)) => return pi::run(pi).await,
         Some(Mode::Sessions(trial)) => {
             return play_sessions(trial, &args.runs, args.ontography).await;
+        }
+        Some(Mode::Crashpoints(options)) => {
+            std::fs::create_dir_all(&args.runs)?;
+            clear_stale(&args.runs);
+            let binary = match &args.ontography {
+                Some(path) => path.clone(),
+                None => build_server()?,
+            };
+            stop_on_interrupt();
+            return crashpoints::run(options, &binary, &args.runs).await;
         }
         None => {}
     }

@@ -32,7 +32,9 @@ pub fn run(args: Args) -> Result<()> {
         .lines()
         .filter(|line| line.contains(&sha))
         .count();
-    let line = json!({"pid": std::process::id(), "sha": sha, "len": input.len(), "role": args.role.name()});
+    // Whether the crash-point library reached the program: it must not.
+    let preloaded = std::env::var_os("DYLD_INSERT_LIBRARIES").is_some();
+    let line = json!({"pid": std::process::id(), "sha": sha, "len": input.len(), "role": args.role.name(), "preloaded": preloaded});
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

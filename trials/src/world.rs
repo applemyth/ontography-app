@@ -402,7 +402,7 @@ pub fn mutate(rng: &mut impl Rng, world: &World, programs: &Programs) -> Option<
     ))
 }
 
-fn document(
+pub fn document(
     name: &str,
     nodes: &BTreeMap<String, Kind>,
     edges: &BTreeMap<String, Edge>,
