@@ -186,7 +186,7 @@ impl NodeRuntime {
             .await?,
         );
         lock(&self.state).tools = Arc::downgrade(&tools);
-        let endpoint = self.endpoint()?;
+        let endpoint = resources.endpoint.insert(self.endpoint()?).clone();
         let mcp = resources
             .mcp
             .insert(NodeMcp::bind(&endpoint, tools.clone(), self.log())?);
@@ -487,6 +487,8 @@ struct Resources<'a> {
     tools: Option<Arc<NodeToolContext>>,
     mcp: Option<NodeMcp>,
     hooks: Option<NodeHooks>,
+    /// The directory of this execution's sockets, once created.
+    endpoint: Option<PathBuf>,
 }
 
 impl<'a> Resources<'a> {
@@ -497,6 +499,7 @@ impl<'a> Resources<'a> {
             tools: None,
             mcp: None,
             hooks: None,
+            endpoint: None,
         }
     }
 
@@ -534,6 +537,12 @@ impl Drop for Resources<'_> {
             host.request_stop();
         }
         self.hooks.take();
+        // Every socket is gone: removed with its owner above, or with the
+        // Codex plan when its driver ended. Only an empty directory is
+        // removed, so an overlapping execution's sockets keep it.
+        if let Some(endpoint) = self.endpoint.take() {
+            let _ = std::fs::remove_dir(endpoint);
+        }
         let mut state = lock(&self.owner.state);
         if let Some(terminal) = self.host.as_ref().and_then(Host::terminal_handle) {
             state.status.terminal = Some(terminal.status());
