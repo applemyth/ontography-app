@@ -695,14 +695,35 @@ impl Driver {
             self.generation = after.difference(&before).next().cloned();
             self.generations.extend(after);
         }
+        // Now and then the client reattaches from a terminal of another
+        // size: the controller's dimensions are the terminal's.
+        let resized = !fresh && self.rng.random_bool(0.3);
+        if resized {
+            self.size = self.other_size();
+            self.note(&format!("  reattaching at {:?}", self.size));
+        }
         self.connect(g).await?;
         if fresh {
             return self.await_pi(g).await;
         }
         // Reattaching shows the terminal as it is.
-        let view = self
-            .screen(g, "the first snapshot", SEEN, |v| v.snapshots > 0)
+        let size = self.size;
+        let report = format!("{} {}", size.0, size.1);
+        let view = if resized && self.program == Program::Pi {
+            self.screen(g, &format!("Pi's report of the size {report}"), SEEN, |v| {
+                v.size == size && v.lines("SIZE ").last() == Some(&report)
+            })
+            .await?
+        } else {
+            self.screen(g, "the first snapshot", SEEN, |v| v.snapshots > 0)
+                .await?
+        };
+        if resized {
+            self.until(g, "the terminal to take the client's size", |s| {
+                s["rows"] == size.0 && s["cols"] == size.1
+            })
             .await?;
+        }
         if self.program == Program::Pi {
             self.check_echoes(&view)?;
             if let Some(last) = self.here.last()
@@ -918,15 +939,7 @@ impl Driver {
         if !self.ready(g, Some(Program::Pi)).await? {
             return Ok(());
         }
-        let size = loop {
-            let size = (
-                self.rng.random_range(18..=44),
-                self.rng.random_range(60..=140),
-            );
-            if size != self.size {
-                break size;
-            }
-        };
+        let size = self.other_size();
         if from_history {
             self.enter_history(g).await?;
         }
@@ -950,7 +963,52 @@ impl Driver {
         })
         .await?;
         let view = self.view();
-        self.check_echoes(&view)
+        self.check_echoes(&view)?;
+        // Asked, Pi reports the same size.
+        let Some(pid) = self.pi else { return Ok(()) };
+        let asked = self.sizes(pid).len();
+        self.type_text(g, "/size").await?;
+        let deadline = tokio::time::Instant::now() + SEEN;
+        loop {
+            if let Some(reported) = self.sizes(pid).get(asked) {
+                if *reported != size {
+                    return Err(Failure::Problem(format!(
+                        "after a resize to {size:?}, Pi's /size reports {reported:?}"
+                    )));
+                }
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(self.fail(g, "Pi never answered /size"));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A terminal size other than the current one.
+    fn other_size(&mut self) -> (u16, u16) {
+        loop {
+            let size = (
+                self.rng.random_range(18..=44),
+                self.rng.random_range(60..=140),
+            );
+            if size != self.size {
+                return size;
+            }
+        }
+    }
+
+    /// The sizes a Pi reported, in order, from its witness.
+    fn sizes(&self, pid: u32) -> Vec<(u16, u16)> {
+        self.stage
+            .witness(&self.id)
+            .iter()
+            .filter(|e| e["event"] == "size" && e["pid"].as_u64() == Some(u64::from(pid)))
+            .map(|e| {
+                let field = |name: &str| e[name].as_u64().unwrap_or_default() as u16;
+                (field("rows"), field("cols"))
+            })
+            .collect()
     }
 
     async fn enter_history(&mut self, g: u64) -> Played {

@@ -103,10 +103,10 @@ struct Args {
     jobs: Option<usize>,
     /// The ontography binary to test. By default the harness builds it from
     /// this tree, so harness and server always match.
-    #[arg(long)]
+    #[arg(long, global = true)]
     ontography: Option<PathBuf>,
     /// Where trials keep their data; failed trials are kept.
-    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/runs"))]
+    #[arg(long, global = true, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/runs"))]
     runs: PathBuf,
 }
 

@@ -106,7 +106,8 @@ The judges, from docs/SESSIONS.md and docs/SESSION_DESIGN.md:
   session; history stays frozen while Pi runs on; a closed session never
   resumes.
 - **Lines**: every line typed shows on screen once, in order, and reached
-  Pi once, in order (the witness); resizing reaches Pi.
+  Pi once, in order (the witness); a resize, or a reattach from a terminal of
+  another size, reaches Pi, which reports it on SIGWINCH and on `/size`.
 - **Processes**: after a suspension, a close or an orderly stop, nothing of
   the session runs: shell, launcher, Pi, or Pi's children. Processes are told
   apart by session ID, so whatever a crash struck, however late it started,

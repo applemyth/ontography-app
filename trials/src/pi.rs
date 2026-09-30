@@ -162,6 +162,10 @@ async fn pi(args: &Args) -> Result<()> {
         "rows": rows,
         "cols": cols,
     }));
+    // Ready for signals before saying so.
+    let mut resized = signal(SignalKind::window_change())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut terminate = signal(SignalKind::terminate())?;
     let mut screen = Screen::default();
     screen.write("\x1b[?1049h\x1b[2J\x1b[H");
     screen.say(format!("READY {} {conversation}", std::process::id()));
@@ -176,9 +180,6 @@ async fn pi(args: &Args) -> Result<()> {
             }
         }
     });
-    let mut resized = signal(SignalKind::window_change())?;
-    let mut hangup = signal(SignalKind::hangup())?;
-    let mut terminate = signal(SignalKind::terminate())?;
     let report_size = |witness: &Witness, screen: &mut Screen, redraw: bool| {
         let (rows, cols) = size();
         witness.record(json!({"event": "size", "rows": rows, "cols": cols}));
