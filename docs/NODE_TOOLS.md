@@ -50,8 +50,8 @@ pending.
 | `next_trigger` | The next task that may begin: the initial input, one input, or a complete join. | |
 | `wait_for_change` | Waits up to 30 seconds for a change that could make work runnable, or for a stop. | |
 | `begin_invocation` | Begins an attempt at a task and returns its input handles. | |
-| `describe_package`, `list_package`, `read_package` | Describe, list, and read the attempt's inputs. Reads return at most 256 KiB; collections of more than 1000 entries are refused, to be opened as a workspace instead. | |
-| `import_content` | Stores text as a new file output. | |
+| `describe_package`, `list_package`, `read_package` | Describe, list, and read the attempt's inputs. Reads return at most 256 KiB; collections of more than 1000 entries, or whose member paths and link targets exceed 256 KiB, are refused, to be opened as a workspace instead. | |
+| `import_content` | Stores text, up to 512 KiB, as a new file output; larger files go through a workspace. | |
 | `compose_package` | Builds a directory output from named entries, or from changes to a directory. | |
 | `open_workspace`, `capture_workspace`, `release_workspace` | Check out a workspace input or directory output, capture edits as an output, remove a checkout early. | |
 | `submit_invocation` | Submits the result and outputs. | |
