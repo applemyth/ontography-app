@@ -71,7 +71,7 @@ start and `run_id` afterward; a stable UUID `start_id` makes startup retryable.
 | `nodes[].root` | Optional: the authority tags work the node starts may carry. Only nodes with a root start work; the entry has `["workflow"]` unless given. |
 | `nodes[].transitions` | Optional: `[{from, to}]` authority changes the node may make to what it sends. |
 | `edges` | Directed `{from,to}` connections; defaults to `[]`. |
-| `edges[].name` | Optional; needed to connect the same two nodes twice. Otherwise a connection is named `from:to`. |
+| `edges[].name` | Optional; needed to connect the same two nodes twice. Otherwise a connection is named `from:to`. It cannot be a node's name, since node tools accept either in `to`. |
 | `edges[].contract` | Optional: what it carries; its source's `result` by default. |
 | `edges[].authority` | Optional: the tags it admits; `["workflow"]` by default. |
 | `edges[].match` | `any_of` by default, or `all_of`: whether work needs any or all of those tags. |
@@ -87,7 +87,7 @@ Every part of core's typed model is optional, and what a document leaves out
 takes a default:
 
 - **Contracts.** `payload` is built in: object type `Payload`, validator
-  `text`, which accepts a message or a workspace, all that programs send. A
+  `text`, which accepts a message or a workspace. A
   document names more under `contracts`, each an object type and one of three
   trusted validators: `text` (valid UTF-8, including a workspace), `bytes`
   (anything), or `workspace` (only a workspace).
@@ -106,7 +106,8 @@ takes a default:
  "components": {"mine": {"extends": "external", "types": ["Mine"]}},
  "nodes": [
    {"id": "mine", "component": "mine", "result": "ore", "root": ["red"]},
-   {"id": "smelter", "component": "command", "config": {"argv": ["./smelt"]},
+   {"id": "smelter", "component": "command",
+    "config": {"argv": ["./smelt"], "authority": ["sealed"]},
     "transitions": [{"from": ["red"], "to": ["sealed"]}]},
    {"id": "vault", "component": "inbox"}],
  "edges": [
@@ -114,10 +115,33 @@ takes a default:
    {"from": "smelter", "to": "vault", "authority": ["sealed"], "match": "all_of"}]}
 ```
 
+Save this executable script as `smelt` in the project:
+
+```sh
+#!/bin/sh
+printf 'Refined: '
+cat
+```
+
+After starting the document, submit this to `workflow.submit`, supplying the
+run's `run_id`:
+
+```json
+{"trigger": {"kind": "root", "node_id": "mine", "authority": ["red"]},
+ "result": "raw ore", "emissions": [{"edge_id": "mine:smelter", "payload": "raw ore"}]}
+```
+
+The vault receives `Refined: raw ore` carrying `sealed`. Command
+`config.authority` and human `flow.decide`'s `authority` request exactly those
+output tags; a declared transition must permit the change. Omit the setting
+to carry the task's authority. An explicit `[]` requests empty authority;
+connections still check whether they accept it.
+
 Core checks every result and every package against its contract and every
 move against authority. A command's result and a human's decision go through
-every outgoing connection; if one refuses it, the task fails and retries like
-any other failure. Agents choose connections, authority transitions, and
+every outgoing connection; if one refuses it, core rejects the whole
+submission. Commands retry under their task policy; human tasks remain ready
+for a corrected decision. Agents choose connections, authority transitions, and
 outbound object types with the node tools; see [Node tools](NODE_TOOLS.md).
 A run's contracts and authority tags are fixed when it starts: an edit that
 changes a contract or uses a new tag is refused, and needs a new run.
@@ -155,7 +179,7 @@ may connect to any other.
 | `agent` | Agent | Required `prompt`; optional `harness` (`codex`, the default, or `claude`), `model`, `pty`, `mcp`, `permission_mode`, or an `argv` program | A continuing agent conversation |
 | `codex` | Agent | As `agent`, with `harness:"codex"` | A Codex conversation |
 | `claude` | Agent | As `agent`, with `harness:"claude"` | A Claude Code conversation |
-| `command` | Command | Required nonempty `argv`; optional `timeout_secs` | The command once per task, with input messages on stdin |
+| `command` | Command | Required nonempty `argv`; optional `timeout_secs`, `authority` | The command once per task, with input bytes on stdin |
 | `human` | Human | Optional `prompt` | Waits for `flow.decide` on each task |
 | `inbox` | Inbox | None | Holds incoming work for inspection and export |
 | `external` | External | None | Nothing; an outside client acts for it (see [External nodes](#external-nodes)) |
@@ -385,7 +409,10 @@ as a reusable revision after any pending edit finishes.
 Start with `"workspace":"path/to/directory"` instead of `message` to import
 an initial workspace. A command task executes in a private checkout and
 publishes its captured changes. The original directory is preserved. Without a
-workspace, the command runs in the workflow project and publishes stdout.
+workspace, the command runs in the workflow project and publishes stdout's
+exact bytes. Non-UTF-8 results require a `bytes` contract. Stdout containing a
+core package envelope must pass the task's granted-view check, which supplies
+its content dependencies; malformed or ungranted envelopes are refused.
 Persistent agents use the selected node tools to open workspace packages in
 attempt checkouts, capture changes, and submit them. Their persistent session
 working directory is not automatically captured as graph output.

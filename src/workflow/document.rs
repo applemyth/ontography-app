@@ -224,6 +224,13 @@ impl Document {
             }
             if let Some(name) = &edge.name {
                 check_name("Connection", name)?;
+                // Node tools accept either name in `to`, so one must not
+                // shadow the other.
+                if names.contains(name.as_str()) {
+                    return Err(invalid(format!(
+                        "Connection name {name:?} is already a node's name"
+                    )));
+                }
             }
             if !keys.insert(edge.key()) {
                 return Err(invalid(match &edge.name {
@@ -640,6 +647,16 @@ mod tests {
         bad = original.clone();
         bad.edges[0].to = "missing".into();
         assert!(bad.canonicalized().is_err());
+        // A connection named like a node would shadow it in node tools' `to`.
+        for shadowed in ["write", "test"] {
+            bad = original.clone();
+            bad.edges[0].name = Some(shadowed.into());
+            let refused = bad.canonicalized().unwrap_err();
+            assert!(
+                refused.message.contains("already a node's name"),
+                "{refused:?}"
+            );
+        }
         bad = original.clone();
         bad.nodes[0].config["typo"] = json!(true);
         assert!(bind(&bad).is_err());

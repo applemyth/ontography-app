@@ -89,8 +89,8 @@ pub fn operations() -> Vec<Operation> {
         ),
         Operation::new(
             "flow.decide",
-            "Complete a specific human task with a message or captured workspace. The result goes to all connected successors.",
-            json!({"run_id":text,"node":text,"task_id":text,"message":text,"workspace_id":text}),
+            "Complete a specific human task with a message or captured workspace. The result goes to all connected successors, carrying the task's authority unless authority requests a declared transition.",
+            json!({"run_id":text,"node":text,"task_id":text,"message":text,"workspace_id":text,"authority":{"type":"array","items":{"type":"string"}}}),
             &["run_id", "node", "task_id"],
             true,
         ),
@@ -243,7 +243,8 @@ pub fn prepare_start(
         return Err(AppError::invalid("Supply message or workspace, not both"));
     }
     let catalog = components(service)?;
-    let external = catalog.bind(&document)?[&document.entry]
+    let (declaration, mut initial) = plan(&catalog, document, id, None, None)?;
+    let external = initial.state.bindings[&initial.state.current.entry]
         .implementation
         .is_external();
     if external && (args.get("message").is_some() || args.get("workspace").is_some()) {
@@ -252,7 +253,7 @@ pub fn prepare_start(
         ));
     }
     let message = optional_str(args, "message")?.unwrap_or("");
-    let input = (!external).then(|| json!({"message": message}));
+    initial.input = (!external).then(|| json!({"message": message}));
     let workspace = args
         .get("workspace")
         .map(|value| {
@@ -272,7 +273,8 @@ pub fn prepare_start(
             Ok(path)
         })
         .transpose()?;
-    plan(&catalog, document, id, input, workspace)
+    initial.workspace = workspace;
+    Ok((declaration, initial))
 }
 
 pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Result<Value> {
@@ -871,6 +873,13 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
             ));
         }
     };
+    let payload = result.encode()?;
+    let authority = match args.get("authority") {
+        Some(value) => OutputAuthority::Transition(views::authority(&serde_json::from_value::<
+            Vec<String>,
+        >(value.clone())?)?),
+        None => OutputAuthority::Carry,
+    };
     let session = &run.live()?.session;
     let core_node = &state.identities.nodes[node];
     let input = if task.task.is_initial() {
@@ -903,13 +912,12 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
         )
         .await
         .map_err(AppError::core)?;
-    let payload = result.encode()?;
     let emissions = kernel
         .graph()
         .edges()
         .iter()
         .filter(|edge| edge.source() == core_node)
-        .map(|edge| Emission::new(edge.id(), OutputAuthority::Carry, payload.clone()))
+        .map(|edge| Emission::new(edge.id(), authority.clone(), payload.clone()))
         .collect();
     let contents = dependencies(session, &payload).await?;
     let directory = runtime::node_directory(run, core_node);

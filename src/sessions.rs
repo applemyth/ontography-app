@@ -52,6 +52,74 @@ pub struct GraphInitialization {
     pub workflow: crate::workflow::runtime::InitialWorkflow,
 }
 
+/// Keep old initialization records readable without interpreting or replaying them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SavedGraphInitialization {
+    Current(Box<GraphInitialization>),
+    Legacy(LegacyGraphInitialization),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyGraphInitialization {
+    run_id: String,
+    operation: LegacyOperation,
+    args: Value,
+    definition: LegacyDefinition,
+    input: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum LegacyOperation {
+    #[serde(rename = "flow.start")]
+    Flow,
+    #[serde(rename = "run.start")]
+    Run,
+    #[serde(rename = "project.start")]
+    Project,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "declaration",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum LegacyDefinition {
+    Logical(BTreeMap<String, Value>),
+    Application(BTreeMap<String, Value>),
+}
+
+impl From<GraphInitialization> for SavedGraphInitialization {
+    fn from(intent: GraphInitialization) -> Self {
+        Self::Current(Box::new(intent))
+    }
+}
+
+impl SavedGraphInitialization {
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::Current(intent) => &intent.run_id,
+            Self::Legacy(intent) => &intent.run_id,
+        }
+    }
+
+    fn current(&self) -> Result<&GraphInitialization> {
+        match self {
+            Self::Current(intent) => Ok(intent),
+            Self::Legacy(_) => Err(AppError::new(
+                "graph_unavailable",
+                "this saved graph initialization uses an unsupported older format; its Pi conversations remain available",
+            )
+            .details(json!({"run_id":self.run_id()}))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {
@@ -61,7 +129,7 @@ pub struct SessionRecord {
     pub project: PathBuf,
     pub status: SessionStatus,
     pub run_id: Option<String>,
-    pub graph_initialization: Option<GraphInitialization>,
+    pub graph_initialization: Option<SavedGraphInitialization>,
     pub pi: PiState,
     pub created_at: u64,
     pub updated_at: u64,
@@ -160,11 +228,11 @@ impl Sessions {
                     uuid(id, "run_id")?;
                 }
                 if let Some(intent) = &record.graph_initialization {
-                    uuid(&intent.run_id, "run_id")?;
+                    uuid(intent.run_id(), "run_id")?;
                     if record
                         .run_id
                         .as_ref()
-                        .is_some_and(|id| id != &intent.run_id)
+                        .is_some_and(|id| id != intent.run_id())
                     {
                         return Err(AppError::new(
                             "invalid_session",
@@ -174,8 +242,8 @@ impl Sessions {
                 }
                 let claimed = record
                     .run_id
-                    .as_ref()
-                    .or_else(|| record.graph_initialization.as_ref().map(|i| &i.run_id));
+                    .as_deref()
+                    .or_else(|| record.graph_initialization.as_ref().map(|i| i.run_id()));
                 if let Some(run_id) = claimed {
                     if claims.contains_key(run_id) {
                         return Err(AppError::new(
@@ -183,7 +251,7 @@ impl Sessions {
                             "multiple sessions claim the same graph run",
                         ));
                     }
-                    claims.insert(run_id.clone(), record.session_id.clone());
+                    claims.insert(run_id.to_owned(), record.session_id.clone());
                 }
                 Ok(record)
             })();
@@ -700,24 +768,58 @@ async fn context(service: &Service, record: &mut SessionRecord) -> Result<Value>
         record.updated_at = now();
         service.sessions.save(record)?;
     }
-    let graph = match &record.run_id {
-        Some(id) => {
-            let handle = service.run(id).await?;
-            crate::workflow::tools::status(&*handle.lock().await).await?
-        }
-        None => Value::Null,
-    };
+    let graph = graph_view(service, record).await;
+    let mut session = view(record)?;
+    if graph["status"] == "unavailable" {
+        session["graph"] = graph.clone();
+    }
     Ok(
-        json!({"session":view(record)?,"conversations_dir":service.sessions.conversations_dir(&record.session_id)?,"graph":graph}),
+        json!({"session":session,"conversations_dir":service.sessions.conversations_dir(&record.session_id)?,"graph":graph}),
     )
+}
+
+fn unavailable_graph(run_id: &str, error: AppError) -> Value {
+    json!({"run_id":run_id,"status":"unavailable","error":error})
+}
+
+fn recovery_error(service: &Service, run_id: &str, error: AppError) -> AppError {
+    service
+        .recovery_errors
+        .get(run_id)
+        .cloned()
+        .unwrap_or(error)
+}
+
+async fn graph_view(service: &Service, record: &SessionRecord) -> Value {
+    if let Some(id) = &record.run_id {
+        return match service.run(id).await {
+            Ok(handle) => match crate::workflow::tools::status(&*handle.lock().await).await {
+                Ok(graph) => graph,
+                Err(error) => unavailable_graph(id, error),
+            },
+            Err(error) => unavailable_graph(id, recovery_error(service, id, error)),
+        };
+    }
+    if let Some(intent) = &record.graph_initialization
+        && let Err(error) = intent.current()
+    {
+        return unavailable_graph(intent.run_id(), error);
+    }
+    Value::Null
 }
 
 /// A session as `session.inspect` shows it: its record, with a workflow's
 /// initialization summarized.
 fn view(record: &SessionRecord) -> Result<Value> {
     let mut session = serde_json::to_value(record)?;
-    if record.graph_initialization.is_some() {
-        session["graph_initialization"] = json!({"run_id":record.run_id,"operation":"flow.start"});
+    if let Some(intent) = &record.graph_initialization {
+        session["graph_initialization"] =
+            json!({"run_id":intent.run_id(),"operation":"flow.start"});
+        if let SavedGraphInitialization::Legacy(legacy) = intent {
+            session["graph_initialization"]["operation"] = serde_json::to_value(&legacy.operation)?;
+            session["graph_initialization"]["status"] = json!("unavailable");
+            session["graph_initialization"]["error"] = json!(intent.current().unwrap_err());
+        }
     }
     Ok(session)
 }
@@ -795,22 +897,51 @@ async fn dispatch_record(
                     "a closed session cannot resume",
                 ));
             }
+            let mut graph_error = None;
             if record.run_id.is_none()
                 && let Some(intent) = record.graph_initialization.clone()
             {
-                initialize_graph(service, record, &intent.args).await?;
+                graph_error = match intent.current() {
+                    Ok(intent) => {
+                        initialize_graph(service, record, &intent.args).await?;
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
             }
-            if let Some(id) = &record.run_id {
+            if graph_error.is_none()
+                && let Some(id) = &record.run_id
+            {
                 let environment = service.session_environment(&record.session_id).await;
-                let run = service.run(id).await?;
-                let mut run = run.lock().await;
-                run.environment = environment;
-                run.resume().await?;
+                graph_error = match service.run(id).await {
+                    Ok(run) => {
+                        let mut run = run.lock().await;
+                        run.environment = environment;
+                        run.resume().await.err()
+                    }
+                    Err(error) => Some(recovery_error(service, id, error)),
+                };
             }
-            record.status = SessionStatus::Active;
-            record.updated_at = now();
-            service.sessions.save(record)?;
-            Ok(context(service, record).await?["session"].clone())
+            let mut next = record.clone();
+            next.status = SessionStatus::Active;
+            next.updated_at = now();
+            service.sessions.save(&next)?;
+            *record = next;
+            let mut session = context(service, record).await?["session"].clone();
+            if let Some(error) = graph_error {
+                let id = record
+                    .run_id
+                    .as_deref()
+                    .or_else(|| {
+                        record
+                            .graph_initialization
+                            .as_ref()
+                            .map(|intent| intent.run_id())
+                    })
+                    .expect("failed graph recovery has a run identity");
+                session["graph"] = unavailable_graph(id, error);
+            }
+            Ok(session)
         }
         "session.suspend" | "session.close" => {
             let close = operation == "session.close";
@@ -830,11 +961,11 @@ async fn dispatch_record(
             };
             record.updated_at = now();
             service.sessions.save(record)?;
-            let run_id = record.run_id.as_ref().or_else(|| {
+            let run_id = record.run_id.as_deref().or_else(|| {
                 record
                     .graph_initialization
                     .as_ref()
-                    .map(|intent| &intent.run_id)
+                    .map(|intent| intent.run_id())
             });
             if let Some(id) = run_id
                 && let Ok(run) = service.run(id).await
@@ -866,7 +997,8 @@ async fn initialize_graph(
     record: &mut SessionRecord,
     args: &Value,
 ) -> Result<Value> {
-    let intent = if let Some(intent) = &record.graph_initialization {
+    let intent = if let Some(saved) = &record.graph_initialization {
+        let intent = saved.current()?;
         if intent.args != *args {
             return Err(AppError::new(
                 "graph_already_initialized",
@@ -895,7 +1027,7 @@ async fn initialize_graph(
             workflow,
         };
         let mut next = record.clone();
-        next.graph_initialization = Some(intent.clone());
+        next.graph_initialization = Some(intent.clone().into());
         next.updated_at = now();
         service
             .sessions

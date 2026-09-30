@@ -1,5 +1,38 @@
 # Verification
 
+## Typed workflow and session recovery fixes — 2026-09-29
+
+Passed: **306 app Rust tests**, **32 Pi tests**, TypeScript checking,
+all-target Clippy with warnings denied, formatting, and `git diff --check`.
+Six opt-in native Rust tests remain ignored in the ordinary suite. The sibling
+`ontography-stress` quick preset passed **10 games, 0 with problems**, using
+fixed seeds 1–5 in tandem and concurrent modes and isolated temporary stores.
+
+- [Typed execution tests](../tests/typed_execution.rs) run the smelting document,
+  script, and submit request extracted directly from `WORKFLOWS.md`. Command
+  settings and human decisions request declared authority transitions; core
+  rejects unauthorized changes and connections that refuse the output.
+  Binary command input, output, and export preserve every byte. Stdout package
+  envelopes pass core's granted-view check, which supplies their dependencies;
+  malformed envelopes and unrelated imported workspaces are refused without
+  consuming the input. Granted workspace captures still publish and export.
+- [Workflow move tests](../tests/workflow_moves.rs) exercise submit, transfer,
+  retire, and filtered inspections after nodes and connections are added or
+  replaced. They cover pending ownership changes, missing bindings, and
+  collisions between document names and live core identities. Joined moves
+  reuse one workflow and kernel read.
+- [Session recovery tests](../tests/session_recovery.rs) preserve legacy
+  initialization records, conversation files, selection, and exclusive run
+  claims. Sessions can activate their manager with an unavailable graph;
+  recovery does not replay or replace incompatible old runs. Current-format
+  validation and failed session-save behavior remain covered.
+- Startup binds the document once. Validators avoid copying payloads that
+  cannot be envelopes. Obsolete workflow-state fallbacks and the plan `steps`
+  alias are removed; the document `kind` alias remains usable.
+
+These changes use existing core admission and identity rules. Empty authority
+sets and atomic broadcast submissions retain their core behavior.
+
 ## One run type: typed documents and external nodes — 2026-09-29
 
 Passed: **292 app Rust tests**, **32 Pi tests**, all-target Clippy with

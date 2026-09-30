@@ -149,7 +149,7 @@ Pi writes new histories lazily. Ontography reserves the initial UUID before laun
 
 Pi can save reusable documents with `flow.define` before starting a graph. The first scoped `flow.start` binds its resulting run. A run whose nodes are all `external` runs no process and waits for an outside client's moves.
 
-Initialization persists a reserved run ID, operation arguments, compiled declaration, and initial workflow and input before constructing core storage. Per-session serialization prevents competing initialization; retries recover the same identity. Recovery does not reinject fresh input. Partial state that core cannot reopen remains an explicit recovery error.
+Initialization persists a reserved run ID, operation arguments, compiled declaration, and initial workflow before constructing core storage. Per-session serialization prevents competing initialization; retries recover the same identity. Recovery does not reinject fresh input. Partial state that core cannot reopen remains an explicit recovery error.
 
 To associate an existing run:
 
@@ -183,6 +183,8 @@ Server startup does not relaunch every saved session. Attachment explicitly resu
 The server keeps sessions running after their clients detach. After 30 seconds in which nothing runs (no session shell, active graph, or operation in progress) and no client is connected, it exits by itself. Saved sessions stay on disk, and the next command that needs the server starts the current build.
 
 Server/machine failure loses PTY resources and process memory. Recovery uses core's durable state and Pi history. Prepared rewrite plans and other transient handles expire across server replacement. General operation receipts are bounded and server-instance-local; reconcile uncertain accepted work against current graph state after restart.
+
+Older session initialization records remain readable even when their graph format is unsupported. Session inspection, selection, and Pi conversations remain available. Resume can activate the manager while reporting its graph as `unavailable`, with the run ID and recovery error. The saved initialization, run ownership, and conversation files are retained; an unsupported old graph is not replayed or replaced. Graph operations continue to report its recovery failure.
 
 App-session fork/clone, archive/delete, complete portable backups, and multiple-controller/viewer attachment remain deferred. Native Pi conversation forks already operate within the existing graph.
 
