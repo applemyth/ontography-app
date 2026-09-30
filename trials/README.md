@@ -31,7 +31,7 @@ stopped at the next start.
 | Commands | This binary in node mode, placed by the document's `argv`, in a role: `digest`, `flaky` (fails once per input), `broken`, `binary` (non-UTF-8 output), `slow` (outlives its timeout), `big` (more output than the app keeps) | the task harness, joins, broadcast, retries and parking |
 | Agents | This binary as an agent node's `argv` program, pulling work through the node tools over `ontography node-mcp`: it broadcasts, routes to connections its input picks, or fails its first attempt at each input | node tools, attempts, receipts, the MCP proxy, agent processes |
 | A person | Decides every task at human nodes | `flow.decide`, `flow.status` |
-| The manager | Retries or discards parked tasks, pages inboxes | `flow.retry`, `flow.discard`, `flow.output` |
+| The manager | Retries or discards parked tasks, pages inboxes, and edits the running graph: changes a command's role, adds an inbox, adds or removes a connection, removes a sink with its work, or switches a node's join, which replaces it | `flow.retry`, `flow.discard`, `flow.output`, `flow.edit`, `flow.commit`, `flow.resume` |
 | Chaos | Crashes the server (`kill -9`, restart, `run.resume`) and kills running commands, at moments fixed by the seed | crash recovery |
 
 Every command records each run of its program, and every agent each attempt
@@ -46,8 +46,12 @@ app ran a task and what a program decided.
   prints for those inputs, in package order, joined by blank lines; its
   result went to each outgoing connection. Every agent activation published
   what its program submitted, to every successor or exactly the connections
-  it chose, and its node tools refused none of its legal calls. Tasks that can never succeed
-  never published. Every player move and decision that was done is in
+  it chose, and its node tools refused none of its legal calls. Tasks that
+  can never succeed never published. Work done while edits applied is judged
+  against a version of the graph that explains it; an edit retires exactly
+  the pending work its preview listed, and the run's final graph is its last
+  document's. An edit whose previews keep going stale is reported as
+  starved. Every player move and decision that was done is in
   history once, every refused one never, every lost one at most once. After
   the run settles, work waits only in inboxes, at sinks, in incomplete joins,
   or in parked tasks, parked after exactly their node's `max_attempts`; the
@@ -67,6 +71,6 @@ program may run again.
 
 ## Not yet played
 
-Graph edits, sessions and terminals, workspaces, the agent grants
+Sessions and terminals, workspaces, the agent grants
 (`originate`, `send_later`, `retire`), systematic crash points, and scripted
 models for the real Pi, Codex and Claude.

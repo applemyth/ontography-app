@@ -84,7 +84,9 @@ pub struct Edge {
     pub to: String,
 }
 
+#[derive(Clone, Debug)]
 pub struct World {
+    pub name: String,
     pub document: Value,
     pub nodes: BTreeMap<String, Kind>,
     pub edges: BTreeMap<String, Edge>,
@@ -260,10 +262,144 @@ pub fn generate(rng: &mut impl Rng, scale: Scale, name: &str, programs: &Program
 
     let document = document(name, &nodes, &edges, programs);
     World {
+        name: name.into(),
         document,
         nodes,
         edges,
     }
+}
+
+fn terminal(kind: &Kind) -> bool {
+    matches!(kind, Kind::Human | Kind::Inbox | Kind::Sink)
+}
+
+/// The next free `{prefix}N` name.
+fn fresh<T>(names: &BTreeMap<String, T>, prefix: &str) -> String {
+    let next = names
+        .keys()
+        .filter_map(|name| name.strip_prefix(prefix)?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |n| n + 1);
+    format!("{prefix}{next}")
+}
+
+/// One edit a manager might make to a running world, and what it does:
+/// change a command's role (a settings change), add an inbox, add or remove
+/// a connection, remove a sink with its work, or switch a node's join, which
+/// replaces it. Work keeps flowing forward, so the world still ends.
+pub fn mutate(rng: &mut impl Rng, world: &World, programs: &Programs) -> Option<(World, String)> {
+    let (mut nodes, mut edges) = (world.nodes.clone(), world.edges.clone());
+    let named = |pick: fn(&Kind) -> bool| -> Vec<String> {
+        nodes
+            .iter()
+            .filter(|(_, kind)| pick(kind))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let workers = named(Kind::runs);
+    let outgoing = |edges: &BTreeMap<String, Edge>, node: &str| {
+        edges.values().filter(|edge| edge.from == node).count()
+    };
+    let what = match rng.random_range(0..6) {
+        0 => {
+            let commands = named(|kind| matches!(kind, Kind::Worker(_)));
+            let id = commands.choose(rng)?.clone();
+            let Some(Kind::Worker(worker)) = nodes.get_mut(&id) else {
+                return None;
+            };
+            let next = role(rng);
+            if next == worker.role {
+                return None;
+            }
+            worker.role = next;
+            format!("{id} now runs as {}", next.name())
+        }
+        1 => {
+            let from = workers.choose(rng)?.clone();
+            let id = fresh(&nodes, "in");
+            nodes.insert(id.clone(), Kind::Inbox);
+            let edge = fresh(&edges, "e");
+            edges.insert(
+                edge.clone(),
+                Edge {
+                    from: from.clone(),
+                    to: id.clone(),
+                },
+            );
+            format!("{from} also sends to a new inbox {id} along {edge}")
+        }
+        2 => {
+            let removable: Vec<String> = edges
+                .iter()
+                .filter(|(_, edge)| {
+                    nodes.get(&edge.from).is_some_and(Kind::runs)
+                        && nodes.get(&edge.to).is_some_and(terminal)
+                        && outgoing(&edges, &edge.from) >= 2
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            let id = removable.choose(rng)?.clone();
+            let edge = edges.remove(&id).expect("chosen");
+            format!("{} no longer sends to {} ({id})", edge.from, edge.to)
+        }
+        3 => {
+            let sinks = named(|kind| matches!(kind, Kind::Sink));
+            if sinks.len() < 2 {
+                return None;
+            }
+            let id = sinks.choose(rng)?.clone();
+            nodes.remove(&id);
+            edges.retain(|_, edge| edge.to != id && edge.from != id);
+            format!("sink {id} is removed with its work")
+        }
+        4 => {
+            let joinable: Vec<String> = workers
+                .iter()
+                .filter(|id| edges.values().filter(|edge| edge.to == **id).count() >= 2)
+                .cloned()
+                .collect();
+            let id = joinable.choose(rng)?.clone();
+            let all = match nodes.get_mut(&id) {
+                Some(Kind::Worker(worker)) => {
+                    worker.all = !worker.all;
+                    worker.all
+                }
+                Some(Kind::Agent(agent)) => {
+                    agent.all = !agent.all;
+                    agent.all
+                }
+                _ => return None,
+            };
+            format!(
+                "{id} now joins {}, which replaces it",
+                if all { "all" } else { "any" }
+            )
+        }
+        _ => {
+            let from = workers.choose(rng)?.clone();
+            let targets = named(terminal);
+            let to = targets.choose(rng)?.clone();
+            let edge = fresh(&edges, "e");
+            edges.insert(
+                edge.clone(),
+                Edge {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+            );
+            format!("{from} also sends to {to} along {edge}")
+        }
+    };
+    let document = document(&world.name, &nodes, &edges, programs);
+    Some((
+        World {
+            name: world.name.clone(),
+            document,
+            nodes,
+            edges,
+        },
+        what,
+    ))
 }
 
 fn document(

@@ -1,4 +1,7 @@
-//! The server's exported history of a run, as typed records.
+//! The server's exported history of a run, as typed records named by the
+//! workflow's names. A new run's core identities are its names; a node or
+//! connection an edit adds or replaces takes a fresh identity, which the
+//! trial learns from each edit it commits.
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -68,14 +71,21 @@ fn text(value: &Value) -> Option<String> {
     value.as_str().map(String::from)
 }
 
+/// A core identity by its workflow name, when an edit gave it one.
+fn named(names: &BTreeMap<String, String>, id: Option<String>) -> Option<String> {
+    id.map(|id| names.get(&id).cloned().unwrap_or(id))
+}
+
 impl History {
-    pub fn parse(export: &Value) -> Result<Self> {
+    /// Parses an export, naming nodes and connections by `names`, which maps
+    /// core identities to workflow names.
+    pub fn parse(export: &Value, names: &BTreeMap<String, String>) -> Result<Self> {
         let mut history = Self::default();
         for record in export["activations"].as_array().context("activations")? {
             let id = text(&record["activation_id"]).context("activation_id")?;
             let trigger = match record["trigger"]["kind"].as_str() {
                 Some("root") => Trigger::Root {
-                    node: text(&record["trigger"]["node_id"]).context("root node")?,
+                    node: named(names, text(&record["trigger"]["node_id"])).context("root node")?,
                 },
                 Some("packages") => Trigger::Packages(
                     record["trigger"]["package_ids"]
@@ -97,7 +107,7 @@ impl History {
                 .map(|output| {
                     Ok(Output {
                         package: text(&output["package_id"]).context("package_id")?,
-                        edge: text(&output["edge_id"]),
+                        edge: named(names, text(&output["edge_id"])),
                         digest: text(&output["content_digest"]).context("content_digest")?,
                     })
                 })
@@ -118,8 +128,8 @@ impl History {
                 id,
                 Package {
                     producer: text(&fact["producer"]).context("producer")?,
-                    holder: text(&fact["node_id"]).context("node_id")?,
-                    edge: text(&fact["edge_id"]),
+                    holder: named(names, text(&fact["node_id"])).context("node_id")?,
+                    edge: named(names, text(&fact["edge_id"])),
                     disposition: text(&record["disposition"]).context("disposition")?,
                     consumer: text(&record["consumer"]),
                     digest: text(&fact["content_digest"]).context("content_digest")?,
@@ -140,4 +150,36 @@ impl History {
                 .map(|p| p.holder.clone()),
         }
     }
+}
+
+/// The run's current graph in the export: its nodes, and its connections as
+/// (name, from, to), by workflow names.
+pub fn graph(
+    export: &Value,
+    names: &BTreeMap<String, String>,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<(String, String, String)>,
+) {
+    let name = |value: &Value| named(names, text(value)).unwrap_or_default();
+    let graph = &export["current_graph"];
+    let nodes = graph["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|node| name(&node["id"]))
+        .collect();
+    let edges = graph["edges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|edge| {
+            (
+                name(&edge["id"]),
+                name(&edge["source"]),
+                name(&edge["target"]),
+            )
+        })
+        .collect();
+    (nodes, edges)
 }

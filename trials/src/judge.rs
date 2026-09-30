@@ -9,6 +9,9 @@
 //! - An agent's submission without outputs goes to every successor; with
 //!   outputs, exactly those are sent, each along the connection it names.
 //! - External nodes do only what their players did; inboxes hold work.
+//! - An edit retires exactly the pending work its preview listed, and leaves
+//!   the run's graph as its document says. Work done while edits applied is
+//!   judged against a version of the graph that explains it.
 //! - After the run settles, work waits only where it may: in inboxes, at
 //!   sinks, in an incomplete join, or in a parked task.
 
@@ -20,13 +23,37 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct Evidence<'a> {
-    pub world: &'a World,
+    /// Every committed version of the world, oldest first.
+    pub worlds: &'a [Arc<World>],
     pub history: &'a History,
     pub log: &'a Log,
     pub status: &'a Value,
     pub witness: Witness,
+}
+
+impl Evidence<'_> {
+    fn last(&self) -> &World {
+        self.worlds.last().expect("a first version")
+    }
+
+    /// The versions of the world that had `node`.
+    fn versions<'b>(&'b self, node: &'b str) -> impl Iterator<Item = &'b World> {
+        self.worlds
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(move |world| world.nodes.contains_key(node))
+    }
+
+    /// What `node` is, in the latest version that has it.
+    fn kind(&self, node: &str) -> Option<&Kind> {
+        self.worlds
+            .iter()
+            .rev()
+            .find_map(|world| world.nodes.get(node))
+    }
 }
 
 /// One run of a command's program, or one attempt an agent began, as the
@@ -97,21 +124,25 @@ struct Program {
     all: bool,
     /// Whether its tasks succeed, given no chaos.
     succeeds: bool,
+    /// Whether its first run at each input fails by design.
+    flaky: bool,
     label: &'static str,
 }
 
-fn program(world: &World, node: &str) -> Option<Program> {
-    match world.nodes.get(node)? {
+fn program(kind: &Kind) -> Option<Program> {
+    match kind {
         Kind::Worker(worker) => Some(Program {
             attempts: worker.attempts,
             all: worker.all,
             succeeds: worker.role.succeeds(worker.bytes),
+            flaky: worker.role == Role::Flaky,
             label: worker.role.name(),
         }),
         Kind::Agent(agent) => Some(Program {
             attempts: agent.attempts,
             all: agent.all,
             succeeds: true,
+            flaky: agent.style == Style::Flaky,
             label: agent.style.name(),
         }),
         _ => None,
@@ -129,6 +160,34 @@ pub fn judge(evidence: &Evidence) -> Vec<String> {
     problems
 }
 
+/// The run's graph after the last edit is the last version's.
+pub fn graph(
+    world: &World,
+    nodes: &BTreeSet<String>,
+    edges: &BTreeSet<(String, String, String)>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let expected: BTreeSet<String> = world.nodes.keys().cloned().collect();
+    if *nodes != expected {
+        problems.push(format!(
+            "the run's nodes are {nodes:?}, not its document's {expected:?}"
+        ));
+    }
+    let expected: BTreeSet<(String, String, String)> = world
+        .edges
+        .iter()
+        .map(|(id, edge)| (id.clone(), edge.from.clone(), edge.to.clone()))
+        .collect();
+    if *edges != expected {
+        let extra: Vec<_> = edges.difference(&expected).collect();
+        let missing: Vec<_> = expected.difference(edges).collect();
+        problems.push(format!(
+            "the run's connections differ from its document's: extra {extra:?}, missing {missing:?}"
+        ));
+    }
+    problems
+}
+
 /// The index of an output within its activation, from its package ID.
 fn output_index(package: &str) -> Option<usize> {
     let (_, output) = package.split_once('/')?;
@@ -137,7 +196,8 @@ fn output_index(package: &str) -> Option<usize> {
 }
 
 /// Every package's payload, rebuilt from its producer: a command's or a
-/// person's result, or what a player emitted.
+/// person's result, what a routing agent sent along each connection, or
+/// what a player emitted.
 fn payloads(evidence: &Evidence, problems: &mut Vec<String>) -> BTreeMap<String, Vec<u8>> {
     let mut payloads = BTreeMap::new();
     for (id, activation) in &evidence.history.activations {
@@ -146,7 +206,7 @@ fn payloads(evidence: &Evidence, problems: &mut Vec<String>) -> BTreeMap<String,
             continue;
         };
         for output in &activation.outputs {
-            let payload = match evidence.world.nodes.get(&node) {
+            let payload = match evidence.kind(&node) {
                 Some(Kind::Source) => {
                     let tag = String::from_utf8_lossy(&activation.result);
                     let emitted = evidence
@@ -193,7 +253,7 @@ fn payloads(evidence: &Evidence, problems: &mut Vec<String>) -> BTreeMap<String,
     payloads
 }
 
-/// A command activation's stdin, and whether all its inputs are known.
+/// A command activation's stdin, if all its inputs are known.
 fn stdin(activation: &Activation, payloads: &BTreeMap<String, Vec<u8>>) -> Option<Vec<u8>> {
     let Trigger::Packages(inputs) = &activation.trigger else {
         return None;
@@ -207,34 +267,40 @@ fn stdin(activation: &Activation, payloads: &BTreeMap<String, Vec<u8>>) -> Optio
     Some(parts?.join(&b"\n\n"[..]))
 }
 
-/// Checks each activation against its node's kind, returning each command
-/// activation's stdin by node.
+/// Checks each activation against its node's kind, returning each program
+/// activation's input by node.
 fn activations(
     evidence: &Evidence,
     payloads: &BTreeMap<String, Vec<u8>>,
     problems: &mut Vec<String>,
 ) -> BTreeMap<String, Vec<Vec<u8>>> {
-    let (world, history) = (evidence.world, evidence.history);
+    let history = evidence.history;
     let mut stdins: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
     let mut decided = BTreeSet::new();
     for (id, activation) in &history.activations {
         let Some(node) = history.node_of(activation) else {
             continue;
         };
+        let sent: BTreeSet<&str> = activation
+            .outputs
+            .iter()
+            .filter_map(|o| o.edge.as_deref())
+            .collect();
+        // Whether the outputs went to each connection of some version.
         let broadcast = |problems: &mut Vec<String>| {
-            let expected: BTreeSet<&str> = world.outgoing(&node).map(|(e, _)| e.as_str()).collect();
-            let actual: BTreeSet<&str> = activation
-                .outputs
-                .iter()
-                .filter_map(|o| o.edge.as_deref())
-                .collect();
-            if expected != actual || activation.outputs.len() != expected.len() {
+            let fits = evidence.versions(&node).any(|world| {
+                let expected: BTreeSet<&str> =
+                    world.outgoing(&node).map(|(e, _)| e.as_str()).collect();
+                expected == sent && activation.outputs.len() == expected.len()
+            });
+            if !fits {
                 problems.push(format!(
-                    "{node}'s result went to {actual:?}, not to each of its connections {expected:?} (activation {id})"
+                    "{node}'s result went to {sent:?}, not to each of its connections (activation {id})"
                 ));
             }
         };
-        // A program's task: one input, or one from every connection at a join.
+        // A program's task: one input, or one from every connection at a
+        // join, in some version.
         let task = |problems: &mut Vec<String>| {
             let Trigger::Packages(inputs) = &activation.trigger else {
                 problems.push(format!("{node} started work of its own ({id})"));
@@ -244,15 +310,17 @@ fn activations(
                 .iter()
                 .map(|i| history.packages.get(i).and_then(|p| p.edge.as_deref()))
                 .collect();
-            let incoming: BTreeSet<Option<&str>> = world
-                .incoming(&node)
-                .map(|(e, _)| Some(e.as_str()))
-                .collect();
-            let joined = if world.nodes.get(&node).is_some_and(Kind::all) {
-                inputs.len() == incoming.len() && edges == incoming
-            } else {
-                inputs.len() == 1
-            };
+            let joined = evidence.versions(&node).any(|world| {
+                let incoming: BTreeSet<Option<&str>> = world
+                    .incoming(&node)
+                    .map(|(e, _)| Some(e.as_str()))
+                    .collect();
+                if world.nodes.get(&node).is_some_and(Kind::all) {
+                    inputs.len() == incoming.len() && edges == incoming
+                } else {
+                    inputs.len() == 1
+                }
+            });
             if !joined {
                 problems.push(format!(
                     "{node} ran with inputs from {edges:?}, which is not one of its tasks (activation {id})"
@@ -260,7 +328,7 @@ fn activations(
             }
             true
         };
-        match world.nodes.get(&node) {
+        match evidence.kind(&node) {
             Some(Kind::Agent(agent)) => {
                 if !task(problems) {
                     continue;
@@ -285,19 +353,19 @@ fn activations(
                     ));
                 }
                 if agent.style == Style::Route {
-                    let to: Vec<String> = world.outgoing(&node).map(|(e, _)| e.clone()).collect();
-                    let expected: BTreeSet<String> = roles::routes(&to, &input, &result)
-                        .into_iter()
-                        .map(|(edge, _)| edge)
-                        .collect();
-                    let actual: BTreeSet<String> = activation
-                        .outputs
-                        .iter()
-                        .filter_map(|o| o.edge.clone())
-                        .collect();
-                    if expected != actual || activation.outputs.len() != expected.len() {
+                    let owned: BTreeSet<String> = sent.iter().map(|e| e.to_string()).collect();
+                    let fits = evidence.versions(&node).any(|world| {
+                        let to: Vec<String> =
+                            world.outgoing(&node).map(|(e, _)| e.clone()).collect();
+                        let expected: BTreeSet<String> = roles::routes(&to, &input, &result)
+                            .into_iter()
+                            .map(|(edge, _)| edge)
+                            .collect();
+                        expected == owned && activation.outputs.len() == expected.len()
+                    });
+                    if !fits {
                         problems.push(format!(
-                            "{node} routed to {actual:?}, but its program sent to {expected:?} (activation {id})"
+                            "{node} routed to {sent:?}, which its program never chose (activation {id})"
                         ));
                     }
                 } else {
@@ -305,14 +373,21 @@ fn activations(
                 }
                 stdins.entry(node.clone()).or_default().push(input);
             }
-            Some(Kind::Worker(worker)) => {
+            Some(Kind::Worker(_)) => {
                 if !task(problems) {
                     continue;
                 }
-                if !worker.role.succeeds(worker.bytes) {
+                // The roles the node has had; an edit can change it.
+                let roles: Vec<(Role, bool)> = evidence
+                    .versions(&node)
+                    .filter_map(|world| match world.nodes.get(&node) {
+                        Some(Kind::Worker(worker)) => Some((worker.role, worker.bytes)),
+                        _ => None,
+                    })
+                    .collect();
+                if !roles.iter().any(|(role, bytes)| role.succeeds(*bytes)) {
                     problems.push(format!(
-                        "{node} ({}) published a result, which it never can (activation {id})",
-                        worker.role.name()
+                        "{node} published a result, which it never can (activation {id})"
                     ));
                     continue;
                 }
@@ -322,8 +397,12 @@ fn activations(
                     ));
                     continue;
                 };
-                let expected = roles::output(worker.role, &node, &input);
-                if activation.result != expected {
+                let matches = roles.iter().any(|(role, bytes)| {
+                    role.succeeds(*bytes)
+                        && activation.result == roles::output(*role, &node, &input)
+                });
+                if !matches {
+                    let expected = roles::output(roles[roles.len() - 1].0, &node, &input);
                     problems.push(format!(
                         "{node} published {:?}, but its program prints {:?} for that input (activation {id}, {} input bytes)",
                         String::from_utf8_lossy(&activation.result[..activation.result.len().min(80)]),
@@ -444,13 +523,13 @@ fn moves(evidence: &Evidence, problems: &mut Vec<String>) {
 
 /// Where each package ended up.
 fn packages(evidence: &Evidence, problems: &mut Vec<String>) {
-    let (world, history, log) = (evidence.world, evidence.history, evidence.log);
+    let (history, log, last) = (evidence.history, evidence.log, evidence.last());
     let retired_by_players: BTreeSet<&String> = log.retirements.iter().map(|(p, _)| p).collect();
     let mut discarded: BTreeMap<&str, usize> = BTreeMap::new();
-    // Live inputs at each command node, by the connection that brought them.
+    // Live inputs at each program node, by the connection that brought them.
     let mut waiting: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
     for (id, package) in &history.packages {
-        let kind = world.nodes.get(&package.holder);
+        let kind = evidence.kind(&package.holder);
         match package.disposition.as_str() {
             "consumed" => {
                 let consumer = package
@@ -472,11 +551,17 @@ fn packages(evidence: &Evidence, problems: &mut Vec<String>) {
                 (Some("explicit"), Some(Kind::Worker(_) | Kind::Agent(_) | Kind::Human)) => {
                     *discarded.entry(package.holder.as_str()).or_default() += 1
                 }
+                (Some(reason), _)
+                    if log.edit_retirements.get(id).map(String::as_str) == Some(reason) => {}
                 (reason, _) => problems.push(format!(
-                    "{id} at {} was retired ({reason:?}) though no one asked",
+                    "{id} at {} was retired ({reason:?}) though neither an actor nor an edit's preview asked",
                     package.holder
                 )),
             },
+            "live" if !last.nodes.contains_key(&package.holder) => problems.push(format!(
+                "{id} is still live at {}, which an edit removed",
+                package.holder
+            )),
             "live" => match kind {
                 Some(Kind::Inbox | Kind::Sink) => {}
                 Some(Kind::Worker(_) | Kind::Agent(_)) => {
@@ -495,9 +580,25 @@ fn packages(evidence: &Evidence, problems: &mut Vec<String>) {
             other => problems.push(format!("{id} has disposition {other}")),
         }
     }
+    // An edit discards exactly the work its preview listed.
+    for (id, reason) in &log.edit_retirements {
+        let retired = history.packages.get(id).is_some_and(|p| {
+            p.disposition == "retired" && p.retirement.as_deref() == Some(reason.as_str())
+        });
+        if !retired {
+            problems.push(format!(
+                "an edit's preview listed {id} to retire ({reason}), but it was not"
+            ));
+        }
+    }
     for (node, count) in discarded {
         let tasks = log.discarded.get(node).copied().unwrap_or_default();
-        let inputs = world.incoming(node).count().max(1);
+        let inputs = evidence
+            .versions(node)
+            .map(|world| world.incoming(node).count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
         if count > tasks * inputs {
             problems.push(format!(
                 "{count} packages were retired at {node}, but only {tasks} of its tasks were discarded"
@@ -506,14 +607,13 @@ fn packages(evidence: &Evidence, problems: &mut Vec<String>) {
     }
     let parked = parked(evidence.status);
     for (node, by_edge) in waiting {
-        let Some(program) = program(world, node) else {
+        let Some(program) = last.nodes.get(node).and_then(program) else {
             continue;
         };
         // Tasks the waiting inputs form: each input alone, or one per
         // connection at a join.
         let tasks = if program.all {
-            world
-                .incoming(node)
+            last.incoming(node)
                 .map(|(edge, _)| by_edge.get(edge.as_str()).copied().unwrap_or_default())
                 .min()
                 .unwrap_or_default()
@@ -542,12 +642,22 @@ fn parked(status: &Value) -> BTreeMap<&str, usize> {
     parked
 }
 
+/// Whether chaos or an edit may have run a node's tasks more or less often
+/// than its program alone explains.
+fn disturbed(evidence: &Evidence, node: &str) -> bool {
+    let variants: BTreeSet<String> = evidence
+        .versions(node)
+        .filter_map(|world| world.nodes.get(node))
+        .map(|kind| format!("{kind:?}"))
+        .collect();
+    evidence.log.crashes > 0 || !evidence.log.kills.is_empty() || variants.len() > 1
+}
+
 /// The failed tasks the settled run reports.
 fn failures(evidence: &Evidence, problems: &mut Vec<String>) {
-    let chaos = !evidence.log.kills.is_empty() || evidence.log.crashes > 0;
     for failure in evidence.status["failures"].as_array().into_iter().flatten() {
         let node = failure["node"].as_str().unwrap_or_default();
-        let Some(program) = program(evidence.world, node) else {
+        let Some(program) = evidence.last().nodes.get(node).and_then(program) else {
             problems.push(format!(
                 "a task failed at {node}, which runs nothing: {failure}"
             ));
@@ -556,7 +666,7 @@ fn failures(evidence: &Evidence, problems: &mut Vec<String>) {
         if failure["state"] != "parked" {
             problems.push(format!("a settled run still retries at {node}: {failure}"));
         }
-        if program.succeeds && !chaos {
+        if program.succeeds && !disturbed(evidence, node) {
             problems.push(format!(
                 "a task parked at {node} ({}), whose tasks succeed: {}",
                 program.label, failure["error"]
@@ -571,22 +681,17 @@ fn failures(evidence: &Evidence, problems: &mut Vec<String>) {
     }
 }
 
-/// How often each command's program ran, from its witness file, against how
-/// often its tasks succeeded and its role.
+/// How often each program ran, from its witness file, against how often its
+/// tasks succeeded and its role.
 fn runs(evidence: &Evidence, stdins: &BTreeMap<String, Vec<Vec<u8>>>, problems: &mut Vec<String>) {
-    // Crashes interrupt attempts, which then run again; killed runs fail.
-    let chaos = evidence.log.crashes > 0 || !evidence.log.kills.is_empty();
     for (node, runs) in &evidence.witness.runs {
-        let Some(program) = program(evidence.world, node) else {
+        let Some(program) = evidence.kind(node).and_then(program) else {
             problems.push(format!("a program ran as {node}, which runs nothing"));
             continue;
         };
-        // Whether a task's first run fails by design.
-        let flaky = match evidence.world.nodes.get(node) {
-            Some(Kind::Worker(worker)) => worker.role == Role::Flaky,
-            Some(Kind::Agent(agent)) => agent.style == Style::Flaky,
-            _ => false,
-        };
+        // Crashes interrupt attempts, which then run again; killed runs
+        // fail; an edit may change the program.
+        let chaos = disturbed(evidence, node);
         let mut ran: BTreeMap<&str, usize> = BTreeMap::new();
         for run in runs.iter().filter(|r| !evidence.log.kills.contains(&r.pid)) {
             *ran.entry(run.sha.as_str()).or_default() += 1;
@@ -597,15 +702,13 @@ fn runs(evidence: &Evidence, stdins: &BTreeMap<String, Vec<Vec<u8>>>, problems: 
         }
         for (sha, times) in &ran {
             let wins = succeeded.get(*sha).copied().unwrap_or_default();
-            let fits = match (program.succeeds, flaky) {
-                (true, false) if chaos => *times >= wins,
+            let fits = match (program.succeeds, program.flaky) {
+                _ if chaos => *times >= wins,
                 (true, false) => *times == wins,
-                (true, true) if chaos => *times > wins,
                 (true, true) => *times == wins + 1,
                 (false, _) => {
-                    chaos
-                        || (*times >= program.attempts as usize
-                            && (*times as u64).is_multiple_of(program.attempts))
+                    *times >= program.attempts as usize
+                        && (*times as u64).is_multiple_of(program.attempts)
                 }
             };
             if !fits {

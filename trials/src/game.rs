@@ -1,6 +1,6 @@
 //! One trial: a generated world on a real server, driven by players, a
-//! person, a manager and chaos until its time is up, then drained, restarted
-//! in order, and judged.
+//! person, a manager who also edits the running graph, and chaos until its
+//! time is up, then drained, restarted in order, and judged.
 
 use crate::history::History;
 use crate::procs::Tracker;
@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
@@ -28,7 +28,12 @@ pub struct Settings {
     /// Server crashes and killed commands per trial, at random moments.
     pub crashes: usize,
     pub kills: usize,
+    /// Edits the manager makes to the running graph.
+    pub edits: usize,
 }
+
+/// How many previews an edit may need before it counts as starved.
+const EDIT_TRIES: usize = 40;
 
 /// How long a drained run may take to settle.
 const SETTLE: Duration = Duration::from_secs(120);
@@ -79,6 +84,15 @@ pub struct Log {
     /// Commands chaos killed, by pid.
     pub kills: BTreeSet<u32>,
     pub crashes: usize,
+    /// Every committed version of the world, oldest first.
+    pub worlds: Vec<Arc<World>>,
+    /// The core identities edits gave nodes and connections, to their names.
+    pub names: BTreeMap<String, String>,
+    /// Packages the committed edits' previews listed to retire, with why.
+    pub edit_retirements: BTreeMap<String, String>,
+    /// Edits committed, and previews that went stale before their commit.
+    pub edits: usize,
+    pub stale: usize,
     pub problems: Vec<String>,
 }
 
@@ -90,8 +104,16 @@ pub struct Outcome {
 }
 
 struct Table {
-    world: World,
+    world: std::sync::RwLock<Arc<World>>,
+    /// Moves built against an older version may be refused for what an edit
+    /// changed; it counts each commit's start and end.
+    version: AtomicU64,
     run: String,
+    /// The data directory, where the editor reads the plans it committed.
+    data: PathBuf,
+    program: PathBuf,
+    witness: PathBuf,
+    ontography: PathBuf,
     client: RwLock<Client>,
     /// Players, the manager and chaos stop; the person keeps deciding.
     stop: AtomicBool,
@@ -103,6 +125,17 @@ struct Table {
 }
 
 impl Table {
+    fn world(&self) -> Arc<World> {
+        self.world
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
     async fn send(&self, operation: &str, mut args: Value) -> Reply {
         args["run_id"] = json!(self.run);
         let client = self.client.read().await.clone();
@@ -149,13 +182,22 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, settings: &Settings) ->
         )
         .await?;
     let run = started_run["run_id"].as_str().context("run_id")?.to_owned();
+    let world = Arc::new(world);
     let table = Arc::new(Table {
-        world,
+        world: std::sync::RwLock::new(world.clone()),
+        version: AtomicU64::new(0),
         run: run.clone(),
+        data: data.clone(),
+        program: program.clone(),
+        witness: witness.clone(),
+        ontography: binary.into(),
         client: RwLock::new(server.client.clone()),
         stop: AtomicBool::new(false),
         drained: AtomicBool::new(false),
-        log: Mutex::new(Log::default()),
+        log: Mutex::new(Log {
+            worlds: vec![world],
+            ..Log::default()
+        }),
         claims: Mutex::new(BTreeSet::new()),
     });
     let mut outcome = Outcome::default();
@@ -165,6 +207,12 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, settings: &Settings) ->
         .collect();
     let person = tokio::spawn(person(Arc::clone(&table)));
     let manager = tokio::spawn(manager(Arc::clone(&table), seed));
+    let editor = tokio::spawn(editor(
+        Arc::clone(&table),
+        seed,
+        settings.edits,
+        settings.play,
+    ));
 
     // Chaos runs here, where the server is owned, at moments fixed by the
     // seed: the first crash or kill comes after the players have begun.
@@ -210,6 +258,7 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, settings: &Settings) ->
         task.await??;
     }
     manager.await??;
+    editor.await??;
     outcome.timing.insert("play", started.elapsed());
 
     // Drain: the person decides what is left, and the run must settle.
@@ -253,16 +302,26 @@ pub async fn trial(seed: u64, dir: &Path, binary: &Path, settings: &Settings) ->
     outcome.timing.insert("restart", clock.elapsed());
 
     let clock = Instant::now();
-    let history = History::parse(&after)?;
     let log = table.log.lock().await;
+    let history = History::parse(&after, &log.names)?;
     let evidence = judge::Evidence {
-        world: &table.world,
+        worlds: &log.worlds,
         history: &history,
         log: &log,
         status: &status,
         witness: judge::read_witness(&witness)?,
     };
     outcome.problems.extend(judge::judge(&evidence));
+    let (nodes, edges) = crate::history::graph(&after, &log.names);
+    outcome
+        .problems
+        .extend(judge::graph(&table.world(), &nodes, &edges));
+    if !status["pending_edit"].is_null() {
+        outcome.problems.push(format!(
+            "a settled run still has an edit pending: {}",
+            status["pending_edit"]["plan_id"]
+        ));
+    }
     outcome
         .counts
         .insert("activations", history.activations.len());
@@ -298,6 +357,8 @@ async fn collect(mut outcome: Outcome, table: Arc<Table>) -> Outcome {
         .insert("discards", log.discarded.values().sum());
     outcome.counts.insert("crashes", log.crashes);
     outcome.counts.insert("kills", log.kills.len());
+    outcome.counts.insert("edits", log.edits);
+    outcome.counts.insert("stale previews", log.stale);
     outcome
 }
 
@@ -448,7 +509,7 @@ async fn settle(table: &Table, tracker: &mut Tracker) -> std::result::Result<Val
             .any(|task| {
                 let node = task["node"].as_str().unwrap_or_default();
                 table
-                    .world
+                    .world()
                     .nodes
                     .get(node)
                     .is_some_and(|kind| kind.runs() || matches!(kind, Kind::Human))
@@ -498,10 +559,11 @@ fn kill_a_command(witness: &Path) -> Option<u32> {
 /// consumes or retires what reaches the sinks.
 async fn player(table: Arc<Table>, seed: u64, index: usize) -> Result<()> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_mul(1000).wrapping_add(index as u64 + 1));
-    let sources = table.world.named(|kind| matches!(kind, Kind::Source));
-    let sinks = table.world.named(|kind| matches!(kind, Kind::Sink));
     let mut step = 0;
     while !table.stop.load(Ordering::Relaxed) {
+        let world = table.world();
+        let sources = world.named(|kind| matches!(kind, Kind::Source));
+        let sinks = world.named(|kind| matches!(kind, Kind::Sink));
         step += 1;
         let tag = format!("p{index}.m{step}");
         match rng.random_range(0..100) {
@@ -532,8 +594,9 @@ async fn root(table: &Table, rng: &mut ChaCha8Rng, sources: &[String], tag: Stri
     let Some(node) = sources.choose(rng) else {
         return;
     };
+    let version = table.version();
     let chosen: Vec<String> = table
-        .world
+        .world()
         .outgoing(node)
         .filter(|_| rng.random_bool(0.7))
         .map(|(edge, _)| edge.clone())
@@ -553,10 +616,12 @@ async fn root(table: &Table, rng: &mut ChaCha8Rng, sources: &[String], tag: Stri
         })).collect::<Vec<_>>(),
     });
     let reply = table.send("workflow.submit", args).await;
+    // An edit may have removed a connection it named meanwhile.
     if !matches!(
         reply,
         Reply::Done(_) | Reply::Uncertain(_) | Reply::NotRun(_)
-    ) {
+    ) && table.version() == version
+    {
         table
             .problem(format!(
                 "the server refused a legal root at {node}: {reply}"
@@ -639,7 +704,7 @@ async fn person(table: Arc<Table>) -> Result<()> {
         };
         for task in status["tasks"].as_array().into_iter().flatten() {
             let node = task["node"].as_str().unwrap_or_default().to_owned();
-            if !matches!(table.world.nodes.get(&node), Some(Kind::Human)) {
+            if !matches!(table.world().nodes.get(&node), Some(Kind::Human)) {
                 continue;
             }
             count += 1;
@@ -676,8 +741,8 @@ async fn person(table: Arc<Table>) -> Result<()> {
 async fn manager(table: Arc<Table>, seed: u64) -> Result<()> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(99));
     let mut handled = BTreeSet::new();
-    let inboxes = table.world.named(|kind| matches!(kind, Kind::Inbox));
     while !table.stop.load(Ordering::Relaxed) {
+        let inboxes = table.world().named(|kind| matches!(kind, Kind::Inbox));
         tokio::time::sleep(Duration::from_millis(300)).await;
         let Reply::Done(status) = table.send("flow.status", json!({})).await else {
             continue;
@@ -706,21 +771,152 @@ async fn manager(table: Arc<Table>, seed: u64) -> Result<()> {
                     *log.discarded.entry(node).or_default() += 1
                 }
                 (Reply::NotRun(_), _) => {}
+                // It finished, or an edit replaced or retired it, meanwhile.
+                (Reply::Failed(code, _), _) if code == "stale_task" => {}
                 (other, _) => log.problems.push(format!(
                     "{action} of a parked task at {node} failed: {other}"
                 )),
             }
         }
         if let Some(inbox) = inboxes.choose(&mut rng) {
+            let version = table.version();
             let reply = table
                 .send("flow.output", json!({"node": inbox, "limit": 20}))
                 .await;
-            if let Reply::Failed(code, message) = reply {
+            if let Reply::Failed(code, message) = reply
+                && table.version() == version
+            {
                 table
                     .problem(format!("reading inbox {inbox} failed: {code}: {message}"))
                     .await;
             }
         }
     }
+    Ok(())
+}
+
+/// The manager's edits: now and then a change to the running document,
+/// previewed and committed while everything else keeps working.
+async fn editor(table: Arc<Table>, seed: u64, edits: usize, play: Duration) -> Result<()> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(4242));
+    let pause = play / (edits as u32 + 1);
+    for _ in 0..edits {
+        tokio::time::sleep(pause).await;
+        if table.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let current = table.world();
+        let programs = world::Programs {
+            program: &table.program,
+            witness: &table.witness,
+            ontography: &table.ontography,
+        };
+        let Some((next, what)) = (0..10).find_map(|_| world::mutate(&mut rng, &current, &programs))
+        else {
+            continue;
+        };
+        edit(&table, next, what).await?;
+    }
+    Ok(())
+}
+
+/// Previews `next` and commits it, previewing again while work keeps
+/// making the preview stale, as the documentation says to.
+async fn edit(table: &Table, next: World, what: String) -> Result<()> {
+    let mut stale = 0;
+    for _ in 0..EDIT_TRIES {
+        let plan = match table
+            .send("flow.edit", json!({"document": next.document}))
+            .await
+        {
+            Reply::Done(plan) => plan,
+            Reply::NotRun(_) | Reply::Uncertain(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            other => {
+                table
+                    .problem(format!("previewing an edit ({what}) failed: {other}"))
+                    .await;
+                return Ok(());
+            }
+        };
+        let plan_id = plan["plan_id"].as_str().unwrap_or_default().to_owned();
+        // Moves built before or during the commit may meet the new graph.
+        table.version.fetch_add(1, Ordering::AcqRel);
+        let mut reply = table.send("flow.commit", json!({"plan_id": plan_id})).await;
+        // Repeating a saved commit recovers that edit, as after a lost reply
+        // or a crash, or once `flow.resume` finished a busy one.
+        for _ in 0..10 {
+            match &reply {
+                Reply::Uncertain(_) | Reply::NotRun(_) => {}
+                Reply::Failed(code, _) if code == "workflow_busy" => {
+                    stale += 1;
+                    let _ = table.send("flow.resume", json!({})).await;
+                }
+                _ => break,
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            reply = table.send("flow.commit", json!({"plan_id": plan_id})).await;
+        }
+        match reply {
+            Reply::Done(_) => return committed(table, next, &plan_id, stale).await,
+            Reply::Failed(code, _)
+                if code == "stale_preview" || code == "retirement_preview_required" =>
+            {
+                table.version.fetch_add(1, Ordering::AcqRel);
+                stale += 1;
+            }
+            other => {
+                table.version.fetch_add(1, Ordering::AcqRel);
+                table
+                    .problem(format!("committing an edit ({what}) failed: {other}"))
+                    .await;
+                return Ok(());
+            }
+        }
+    }
+    let mut log = table.log.lock().await;
+    log.stale += stale;
+    log.problems.push(format!(
+        "an edit ({what}) never committed: {stale} previews went stale while work kept moving"
+    ));
+    Ok(())
+}
+
+/// Records a committed edit: the identities its plan gave nodes and
+/// connections, the pending work its preview said it would retire, and the
+/// new version of the world.
+async fn committed(table: &Table, next: World, plan_id: &str, stale: usize) -> Result<()> {
+    let path = table
+        .data
+        .join("runs")
+        .join(&table.run)
+        .join("edit-plans")
+        .join(format!("{plan_id}.json"));
+    let plan: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let next = Arc::new(next);
+    let mut log = table.log.lock().await;
+    for kind in ["nodes", "edges"] {
+        for (name, id) in plan["identities"][kind].as_object().into_iter().flatten() {
+            if let Some(id) = id.as_str() {
+                log.names.insert(id.to_owned(), name.clone());
+            }
+        }
+    }
+    for (package, reason) in plan["retirements"].as_object().into_iter().flatten() {
+        if let Some(reason) = reason.as_str() {
+            log.edit_retirements
+                .insert(package.clone(), reason.to_owned());
+        }
+    }
+    log.edits += 1;
+    log.stale += stale;
+    log.worlds.push(next.clone());
+    *table
+        .world
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+    table.version.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }

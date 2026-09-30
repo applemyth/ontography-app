@@ -45,12 +45,13 @@ struct Plan {
 
 impl Preset {
     fn plan(self) -> Plan {
-        let settings = |scale, play, players, crashes, kills| Settings {
+        let settings = |scale, play, players, crashes, kills, edits| Settings {
             scale,
             play: Duration::from_secs(play),
             players,
             crashes,
             kills,
+            edits,
         };
         let scale = |sources, workers, layers| Scale {
             sources,
@@ -65,19 +66,19 @@ impl Preset {
                 budget: Duration::from_secs(120),
                 jobs: 4,
                 seeds: Some((1..=8).collect()),
-                settings: settings(scale(2, 6, 2), 10, 2, 1, 2),
+                settings: settings(scale(2, 6, 2), 10, 2, 1, 2, 2),
             },
             Self::Medium => Plan {
                 budget: Duration::from_secs(15 * 60),
                 jobs: 6,
                 seeds: None,
-                settings: settings(scale(3, 16, 3), 60, 4, 3, 8),
+                settings: settings(scale(3, 16, 3), 60, 4, 3, 8, 6),
             },
             Self::Soak => Plan {
                 budget: Duration::from_secs(60 * 60),
                 jobs: 8,
                 seeds: None,
-                settings: settings(scale(4, 40, 4), 300, 6, 8, 30),
+                settings: settings(scale(4, 40, 4), 300, 6, 8, 30, 20),
             },
         }
     }
