@@ -320,6 +320,7 @@ async fn incompatible_server_handshake_is_reported_before_any_operation() {
 #[tokio::test]
 async fn cli_can_explicitly_stop_an_old_build_without_allowing_other_operations() {
     let fixture = Fixture::new();
+    fixture.paths.create_endpoint().unwrap();
     let listener = UnixListener::bind(&fixture.paths.socket).unwrap();
     let (requests, mut observed) = tokio::sync::mpsc::unbounded_channel();
     let server = tokio::spawn(async move {
@@ -380,6 +381,8 @@ async fn cli_can_explicitly_stop_an_old_build_without_allowing_other_operations(
         json!({"stopped":true})
     );
     server.await.unwrap();
+    // As the old server would on exit.
+    std::fs::remove_file(&fixture.paths.socket).unwrap();
     let mut methods = Vec::new();
     while let Some(method) = observed.recv().await {
         methods.push(method);

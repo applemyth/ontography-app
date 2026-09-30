@@ -18,7 +18,7 @@ use std::{
     fs::{File, OpenOptions},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     panic::AssertUnwindSafe,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -64,6 +64,8 @@ pub struct Server {
 
 impl Server {
     pub fn new(paths: Paths) -> Result<Arc<Self>> {
+        // Sessions' shells bind their sockets beside the server's.
+        paths.create_endpoint()?;
         Ok(Arc::new(Self {
             service: Arc::new(Service::new(paths)?),
             managers: crate::session_runtime::Managers::default(),
@@ -322,6 +324,9 @@ impl Server {
             self.stopping.store(false, Ordering::Release);
             return Err(error);
         }
+        // Stopped shells have removed their sockets. The directory goes only
+        // if empty: while `serve` runs, its own socket keeps it.
+        let _ = std::fs::remove_dir(self.service.paths.endpoint());
         self.stopped.notify_one();
         Ok(json!({"stopped":true,"runs_preserved":true}))
     }
@@ -498,6 +503,9 @@ impl Drop for Open<'_> {
     }
 }
 
+/// The data directory's lock and the server's socket. On exit the socket
+/// goes, then its directory if nothing else is left in it, and only then
+/// the lock: a server waiting for it makes the directory again.
 struct Ownership {
     _lock: File,
     socket: PathBuf,
@@ -505,7 +513,27 @@ struct Ownership {
 impl Drop for Ownership {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
+        if let Some(directory) = self.socket.parent() {
+            let _ = std::fs::remove_dir(directory);
+        }
     }
+}
+
+/// Remove what a server that ended abruptly left in `directory`: its socket
+/// and its shells'. Only the server holding the lock may, as none of them
+/// can be live.
+fn remove_stale_sockets(directory: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "server.sock"
+            || (name.ends_with(".sock") && (name.starts_with("pty-") || name.starts_with("pi-")))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 /// Serve until stopped. With an `idle_limit`, as for a background server,
@@ -535,15 +563,16 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
         }
     }
     crate::migration::check_root_available(&paths.root)?;
-    if paths.socket.exists() {
-        std::fs::remove_file(&paths.socket)?;
-    }
-    let listener = UnixListener::bind(&paths.socket)?;
-    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
+    // A server that exited removed the directory before releasing the lock,
+    // so it is made only now.
+    paths.create_endpoint()?;
     let _ownership = Ownership {
         _lock: lock,
         socket: paths.socket.clone(),
     };
+    remove_stale_sockets(paths.endpoint())?;
+    let listener = UnixListener::bind(&paths.socket)?;
+    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
     let server = Server::new(paths)?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

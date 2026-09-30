@@ -44,11 +44,28 @@ impl Paths {
             nix::unistd::geteuid(),
             &identity[..20]
         ));
-        private_directory(&endpoint_dir)?;
+        // Only a server makes this directory, and it removes it on exit. One
+        // that exists must be this user's, or a command could reach a socket
+        // another user placed.
+        match fs::symlink_metadata(&endpoint_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => owned_directory(&endpoint_dir)?,
+        }
         Ok(Self {
             root,
             socket: endpoint_dir.join("server.sock"),
         })
+    }
+
+    /// The private directory that holds the server's socket and its shells'
+    /// sockets while a server runs.
+    pub fn endpoint(&self) -> &Path {
+        self.socket.parent().expect("socket has a directory")
+    }
+
+    /// Make the endpoint directory. Only a server does, to bind sockets there.
+    pub fn create_endpoint(&self) -> Result<()> {
+        private_directory(self.endpoint())
     }
 
     /// The user's library of components and MCP servers.
@@ -98,6 +115,12 @@ pub fn default_data_dir() -> Result<PathBuf> {
 
 fn private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
+    owned_directory(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn owned_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.uid() != nix::unistd::geteuid().as_raw() {
         return Err(AppError::new(
@@ -108,7 +131,6 @@ fn private_directory(path: &Path) -> Result<()> {
             ),
         ));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
