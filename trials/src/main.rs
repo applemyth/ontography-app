@@ -130,7 +130,8 @@ fn build_server() -> Result<PathBuf> {
         .parent()
         .context("workspace root")?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = std::process::Command::new(cargo)
+    let mut command = std::process::Command::new(cargo);
+    command
         .args([
             "build",
             "--locked",
@@ -139,9 +140,27 @@ fn build_server() -> Result<PathBuf> {
             "ontography",
             "--manifest-path",
         ])
-        .arg(root.join("Cargo.toml"))
-        .status()
-        .context("run cargo")?;
+        .arg(root.join("Cargo.toml"));
+    // `cargo run` gives this harness its own package's variables. A build
+    // that sees them reruns build scripts that read them (ring's reads
+    // CARGO_MANIFEST_DIR), rebuilding much of the server, as the next
+    // ordinary build then does again.
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.starts_with("CARGO_PKG_")
+            || [
+                "CARGO_MANIFEST_DIR",
+                "CARGO_MANIFEST_PATH",
+                "CARGO_CRATE_NAME",
+                "CARGO_BIN_NAME",
+                "CARGO_PRIMARY_PACKAGE",
+            ]
+            .contains(&name.as_ref())
+        {
+            command.env_remove(name.as_ref());
+        }
+    }
+    let status = command.status().context("run cargo")?;
     if !status.success() {
         bail!("building the ontography server failed");
     }
