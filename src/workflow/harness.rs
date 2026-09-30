@@ -1,9 +1,9 @@
 //! Command workers consume scoped inputs and publish through core admission.
 
 use super::{
-    BoundNode, Implementation,
+    BoundNode, Implementation, WorkflowPayload,
     components::CommandConfig,
-    document::{DocumentNode, WorkflowPayload},
+    document::DocumentNode,
     tasks::{self, RetryLedger, Task},
 };
 use crate::environment::Environment;
@@ -256,7 +256,7 @@ async fn accept_initial_sink(
     directory: &Path,
     input: Payload,
 ) -> WorkerResult<()> {
-    let result = WorkflowPayload::decode(&input).map_err(failure)?;
+    let result = WorkflowPayload::read(&input).map_err(failure)?;
     let contents = if let WorkflowPayload::Workspace(envelope) = &result {
         PackageStore::new(context.content_store().await.map_err(failure)?)
             .dependencies(envelope.ontography_package)
@@ -310,11 +310,11 @@ async fn begin(
 ) -> WorkerResult<Result<InvocationHandle, String>> {
     let mut workspaces = Vec::new();
     for payload in payloads {
-        match WorkflowPayload::decode(payload) {
+        match WorkflowPayload::read(payload) {
             Ok(WorkflowPayload::Workspace(envelope)) => {
                 workspaces.push(envelope.ontography_package);
             }
-            Ok(WorkflowPayload::Message { .. }) => {}
+            Ok(_) => {}
             Err(error) => return Ok(Err(error.to_string())),
         }
     }
@@ -382,19 +382,19 @@ async fn perform(
     let mut parts = Vec::new();
     let mut workspace = None;
     for payload in payloads {
-        match WorkflowPayload::decode(payload).map_err(failure)? {
-            WorkflowPayload::Message { message } => parts.push(message),
+        match WorkflowPayload::read(payload).map_err(failure)? {
             // `begin` admitted at most one.
             WorkflowPayload::Workspace(envelope) => workspace = Some(envelope.ontography_package),
+            _ => parts.push(&payload[..]),
         }
     }
     let workspace = match workspace {
         Some(root) => Some(open_workspace(invocation, workspaces, root).await?),
         None => None,
     };
-    let input = parts.join("\n\n");
+    let input = parts.join(&b"\n\n"[..]);
     let receipt = invocation
-        .record_initial_input(input.clone().into_bytes().into())
+        .record_initial_input(input.clone().into())
         .await
         .map_err(failure)?;
     let cwd = workspace
@@ -410,7 +410,7 @@ async fn perform(
             cwd,
             directory,
             environment: &place.environment,
-            input: input.into_bytes(),
+            input,
         },
     )
     .await?;
@@ -750,7 +750,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            WorkflowPayload::decode(&bytes).unwrap(),
+            WorkflowPayload::read(&bytes).unwrap(),
             WorkflowPayload::Message {
                 message: "first".into()
             }
@@ -797,7 +797,7 @@ mod tests {
                         .unwrap()
                         .unwrap();
                     assert_eq!(
-                        WorkflowPayload::decode(&bytes).unwrap(),
+                        WorkflowPayload::read(&bytes).unwrap(),
                         WorkflowPayload::Message {
                             message: "second".into()
                         }
@@ -1135,8 +1135,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let WorkflowPayload::Workspace(envelope) = WorkflowPayload::decode(&payload).unwrap()
-        else {
+        let WorkflowPayload::Workspace(envelope) = WorkflowPayload::read(&payload).unwrap() else {
             panic!("expected workspace");
         };
         let captured = PackageStore::new(content.clone())
@@ -1669,8 +1668,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                if let WorkflowPayload::Message { message } =
-                    WorkflowPayload::decode(&bytes).unwrap()
+                if let WorkflowPayload::Message { message } = WorkflowPayload::read(&bytes).unwrap()
                 {
                     messages.push(message);
                 }

@@ -135,10 +135,7 @@ pub async fn initial_payload(run: &ManagedRun) -> Result<ontography::Payload> {
         .ok_or_else(|| AppError::invalid("Workflow required"))?;
     let path = run.directory.join("initial-input.json");
     if path.exists() {
-        return WorkflowPayload::decode(&serde_json::to_vec(&persistence::read_json::<Value>(
-            &path,
-        )?)?)?
-        .encode();
+        return WorkflowPayload::from_value(&persistence::read_json(&path)?)?.encode();
     }
     let payload = if let Some(directory) = &initial.workspace {
         let content = run
@@ -154,10 +151,10 @@ pub async fn initial_payload(run: &ManagedRun) -> Result<ontography::Payload> {
             .map_err(AppError::core)?;
         WorkflowPayload::Workspace(ontography::PackageEnvelope::new(package.root()))
     } else {
-        WorkflowPayload::decode(&serde_json::to_vec(&initial.input)?)?
+        WorkflowPayload::from_value(&initial.input)?
     };
     let bytes = payload.encode()?;
-    persistence::write_json(&path, &serde_json::from_slice::<Value>(&bytes)?)?;
+    persistence::write_json(&path, &payload)?;
     Ok(bytes)
 }
 

@@ -245,7 +245,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let declaration = json!({"version":1,"id":"background-fixture","schema":{"node_types":["Node"],"object_types":["Result"],"authority_tags":[]},"contracts":[{"id":"result","object_type":"Result","validator":"opaque_bytes","validator_version":1}],"nodes":[{"id":"worker","types":["Node"],"result_contract":"result"}],"edges":[],"roots":[{"node_id":"worker","ceiling":[]}],"execution_bindings":[{"id":"ticker","node_id":"worker","implementation":"test.ticker","version":"1","configuration":{}}]});
+        let declaration = json!({"version":1,"id":"background-fixture","schema":{"node_types":["Node"],"object_types":["Result"],"authority_tags":[]},"contracts":[{"id":"result","object_type":"Result","validator":"bytes","validator_version":1}],"nodes":[{"id":"worker","types":["Node"],"result_contract":"result"}],"edges":[],"roots":[{"node_id":"worker","ceiling":[]}],"execution_bindings":[{"id":"ticker","node_id":"worker","implementation":"test.ticker","version":"1","configuration":{}}]});
         let started = client
             .call(
                 "run.start",

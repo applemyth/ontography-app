@@ -450,6 +450,9 @@ pub(super) fn payload_view(value: &Value) -> Value {
     if value.get("ontography_package").is_some() {
         return json!({"workspace":true});
     }
+    if let Some(hex) = value.get("hex").and_then(Value::as_str) {
+        return json!({"binary":true,"bytes":hex.len() / 2});
+    }
     if let Some(message) = value.get("message").and_then(Value::as_str) {
         let preview: String = message.chars().take(8192).collect();
         return if preview.len() < message.len() {
@@ -576,7 +579,7 @@ pub(super) async fn task_view(run: &ManagedRun, candidate: Candidate<'_>) -> Res
         task,
     } = candidate;
     let raw_input = if task.is_initial() {
-        serde_json::from_slice(&runtime::initial_payload(run).await?)?
+        WorkflowPayload::read(&runtime::initial_payload(run).await?)?.to_value()
     } else {
         let mut inputs = Vec::with_capacity(task.inputs.len());
         for (_, record) in &task.inputs {
@@ -889,7 +892,7 @@ async fn decide(run: &mut ManagedRun, state: &edit::WorkflowState, args: &Value)
         .collect();
     let contents = dependencies(session, &payload).await?;
     let directory = runtime::node_directory(run, core_node);
-    let mut output = json!({"node":node,"invocation_id":invocation.id().to_string(),"result":serde_json::from_slice::<Value>(&payload)?,"publication_status":"prepared"});
+    let mut output = json!({"node":node,"invocation_id":invocation.id().to_string(),"result":result,"publication_status":"prepared"});
     persistence::write_json(&directory.join("output.json"), &output)?;
     match invocation
         .submit(payload, emissions, contents)
@@ -937,14 +940,14 @@ pub async fn dependencies(
     session: &ontography::SessionHandle,
     payload: &Payload,
 ) -> Result<Vec<ontography::ContentId>> {
-    match WorkflowPayload::decode(payload)? {
-        WorkflowPayload::Message { .. } => Ok(vec![]),
+    match WorkflowPayload::read(payload)? {
         WorkflowPayload::Workspace(envelope) => {
             PackageStore::new(session.content_store().await.map_err(AppError::core)?)
                 .dependencies(envelope.ontography_package)
                 .await
                 .map_err(AppError::core)
         }
+        _ => Ok(vec![]),
     }
 }
 

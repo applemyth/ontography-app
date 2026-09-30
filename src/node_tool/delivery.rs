@@ -6,10 +6,7 @@ use super::{
     attempt::{Begin, FailInvocation, begin_attempt},
     context::{Attempt, context_error},
 };
-use crate::{
-    Result,
-    workflow::{WorkflowPayload, tasks::Task},
-};
+use crate::{Result, workflow::tasks::Task};
 use serde_json::{Value, json};
 
 // Keep both the conversation input and its core context charge bounded.
@@ -108,10 +105,7 @@ pub(super) async fn record(
             .await
             .map_err(context_error)?;
         if let Some(text) = response.value["text"].as_str() {
-            match WorkflowPayload::decode(text.as_bytes()) {
-                Ok(WorkflowPayload::Message { message }) => input["message"] = json!(message),
-                _ => input["text"] = json!(text),
-            }
+            input["message"] = json!(text);
         } else {
             input["message_omitted"] = json!("Binary input; use read_package with this handle.");
         }

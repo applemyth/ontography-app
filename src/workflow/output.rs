@@ -76,7 +76,7 @@ pub async fn payload(
             if let Some(workspace) = workspaces.next()
                 && workspaces.next().is_none()
             {
-                return WorkflowPayload::decode(&serde_json::to_vec(workspace)?);
+                return WorkflowPayload::from_value(workspace);
             }
         }
         return Err(AppError::new(
@@ -84,7 +84,7 @@ pub async fn payload(
             "Choose a work_id from the task's work_ids to select one joined input",
         ));
     }
-    WorkflowPayload::decode(&serde_json::to_vec(value)?)
+    WorkflowPayload::from_value(value)
 }
 
 async fn read(run: &ManagedRun, state: &WorkflowState, args: &Value) -> Result<Value> {
@@ -204,7 +204,7 @@ pub(super) async fn input(run: &ManagedRun, package: &PackageRecord) -> Result<V
         .await
         .map_err(AppError::core)?
         .ok_or_else(|| AppError::new("missing_content", "Task input is unavailable"))?;
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(WorkflowPayload::read(&bytes)?.to_value())
 }
 
 fn require_revision(actual: u64, expected: Option<u64>) -> Result<()> {

@@ -7,7 +7,7 @@
     "authority_tags": ["work"]
   },
   "contracts": [
-    {"id": "text", "object_type": "Text", "validator": "utf8", "validator_version": 1}
+    {"id": "text", "object_type": "Text", "validator": "text", "validator_version": 1}
   ],
   "nodes": [
     {"id": "A", "types": ["Logical"], "result_contract": "text"},

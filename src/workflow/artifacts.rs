@@ -121,13 +121,17 @@ pub async fn export(run: &ManagedRun, payload: WorkflowPayload, path: &Path) -> 
         Err(error) => return Err(error.into()),
     }
     let kind = match payload {
-        WorkflowPayload::Message { message } => {
+        WorkflowPayload::Message { .. } | WorkflowPayload::Binary { .. } => {
             let mut staging = Staging::new(&parent, false)?;
             let mut file = OpenOptions::new().write(true).open(&staging.path)?;
-            file.write_all(message.as_bytes())?;
+            file.write_all(&payload.encode()?)?;
             file.sync_all()?;
             staging.publish(&destination)?;
-            "message"
+            if matches!(payload, WorkflowPayload::Message { .. }) {
+                "message"
+            } else {
+                "binary"
+            }
         }
         WorkflowPayload::Workspace(envelope) => {
             let content = run

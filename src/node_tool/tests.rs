@@ -185,9 +185,10 @@ impl Fixture {
                 .await
                 .unwrap()
                 .unwrap();
-            messages.push(match WorkflowPayload::decode(&bytes).unwrap() {
+            messages.push(match WorkflowPayload::read(&bytes).unwrap() {
                 WorkflowPayload::Message { message } => message,
                 WorkflowPayload::Workspace(_) => "<workspace>".into(),
+                WorkflowPayload::Binary { hex } => hex,
             });
         }
         messages
@@ -353,7 +354,7 @@ pub(super) async fn sink_files(fixture: &Fixture) -> BTreeMap<String, String> {
         .await
         .unwrap()
         .unwrap();
-    let WorkflowPayload::Workspace(envelope) = WorkflowPayload::decode(&payload).unwrap() else {
+    let WorkflowPayload::Workspace(envelope) = WorkflowPayload::read(&payload).unwrap() else {
         panic!("expected a workspace at the sink");
     };
     // Collecting first reads only what core retained with the publication,

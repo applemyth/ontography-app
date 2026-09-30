@@ -11,8 +11,8 @@ use std::sync::Arc;
 use ontography::{
     Authority, AuthorityMatch, AuthorityTag, Contract, ContractViolation, DefinitionError,
     DefinitionId, DenyAll, Edge, EdgeDefinition, EditContext, EditPolicy, Graph, GraphEdit,
-    GraphFragment, IngressMode, Kernel, Node, NodeDefinition, PermitAll, PolicyDenial, RootRule,
-    Schema,
+    GraphFragment, IngressMode, Kernel, Node, NodeDefinition, PackageEnvelope, Payload, PermitAll,
+    PolicyDenial, RootRule, Schema,
 };
 use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -165,12 +165,30 @@ impl SchemaDeclaration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidatorKind {
-    /// Accept every byte sequence, including empty and non-UTF-8 payloads.
-    OpaqueBytes,
-    /// Accept precisely byte sequences that are valid UTF-8, including empty text.
-    Utf8,
-    /// The app's explicit message or native workspace package envelope.
-    WorkflowPayload,
+    /// Any bytes, including empty and non-UTF-8 payloads.
+    Bytes,
+    /// Valid UTF-8, including empty text: a message, or a workspace envelope.
+    Text,
+    /// Only a package envelope: a workspace.
+    Workspace,
+}
+
+impl ValidatorKind {
+    /// Whether `bytes` satisfy this validator. Like core, every validator
+    /// refuses a malformed package envelope.
+    pub fn check(self, bytes: &[u8]) -> Result<(), ContractViolation> {
+        let envelope = PackageEnvelope::from_payload(&Payload::from(bytes)).map_err(|error| {
+            ContractViolation::new(format!("invalid package envelope: {error}"))
+        })?;
+        match self {
+            Self::Bytes => Ok(()),
+            Self::Text => std::str::from_utf8(bytes)
+                .map(|_| ())
+                .map_err(|error| ContractViolation::new(format!("invalid UTF-8: {error}"))),
+            Self::Workspace if envelope.is_some() => Ok(()),
+            Self::Workspace => Err(ContractViolation::new("expected a workspace")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -193,19 +211,9 @@ impl ContractDeclaration {
         let validator = self.validator;
         in_scope(
             &format!("contract {:?}", self.id),
-            Contract::new(
-                self.id.as_str(),
-                self.object_type.as_str(),
-                move |bytes| match validator {
-                    ValidatorKind::OpaqueBytes => Ok(()),
-                    ValidatorKind::Utf8 => std::str::from_utf8(bytes)
-                        .map(|_| ())
-                        .map_err(|error| ContractViolation::new(format!("invalid UTF-8: {error}"))),
-                    ValidatorKind::WorkflowPayload => {
-                        crate::workflow::document::validate_payload(bytes)
-                    }
-                },
-            ),
+            Contract::new(self.id.as_str(), self.object_type.as_str(), move |bytes| {
+                validator.check(bytes)
+            }),
         )
     }
 }
@@ -772,7 +780,7 @@ mod tests {
                 .is_err()
         );
         assert!(state.activations().is_empty());
-        declaration.contracts[0].validator = ValidatorKind::OpaqueBytes;
+        declaration.contracts[0].validator = ValidatorKind::Bytes;
         let compiled = declaration.compile().unwrap();
         let mut state = compiled.kernel.empty_state();
         assert!(compiled.kernel.activate(&mut state, non_utf8).is_ok());
@@ -812,7 +820,7 @@ mod tests {
         changed.edits = Edits::Fixed;
         assert_ne!(fingerprint, changed.fingerprint().unwrap());
         changed = declaration;
-        changed.contracts[0].validator = ValidatorKind::OpaqueBytes;
+        changed.contracts[0].validator = ValidatorKind::Bytes;
         assert_ne!(fingerprint, changed.fingerprint().unwrap());
     }
 }

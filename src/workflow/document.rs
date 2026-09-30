@@ -11,7 +11,7 @@ use crate::declarations::{
 };
 use crate::registry::ExecutionBinding;
 use crate::{AppError, Result};
-use ontography::{ContractViolation, Kernel, PackageEnvelope, Payload, content::BlobFormat};
+use ontography::Kernel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The one node type every node of a run created before node types has.
 pub const SHARED_NODE_TYPE: &str = "WorkflowNode";
 pub const EDGE_TYPE: &str = "WorkflowConnection";
-pub const OBJECT_TYPE: &str = "WorkflowPayload";
-pub const CONTRACT: &str = "workflow_payload";
+/// What connections carry unless a document says otherwise: a message or a workspace.
+pub const OBJECT_TYPE: &str = "Payload";
+pub const CONTRACT: &str = "payload";
 pub const AUTHORITY: &str = "workflow";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -378,7 +379,7 @@ pub fn expand(
         contracts: vec![ContractDeclaration {
             id: CONTRACT.into(),
             object_type: OBJECT_TYPE.into(),
-            validator: ValidatorKind::WorkflowPayload,
+            validator: ValidatorKind::Text,
             validator_version: VALIDATOR_VERSION,
         }],
         nodes,
@@ -403,40 +404,6 @@ pub(crate) fn expand_builtin(
     let bindings = catalog.bind(document)?;
     let node_types = catalog.node_types(document)?;
     expand(document, &bindings, &node_types, definition_id, identities)
-}
-
-/// The workspace alternative preserves core's explicit package envelope unchanged.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
-pub enum WorkflowPayload {
-    Message { message: String },
-    Workspace(PackageEnvelope),
-}
-
-impl WorkflowPayload {
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let text = std::str::from_utf8(bytes).map_err(|error| invalid(error.to_string()))?;
-        let payload: Self =
-            crate::declarations::parse_json(text).map_err(|error| invalid(error.to_string()))?;
-        if let Self::Workspace(envelope) = &payload
-            && envelope.ontography_package.format() != BlobFormat::Raw
-        {
-            return Err(invalid("Workspace packages must use raw content format"));
-        }
-        Ok(payload)
-    }
-
-    pub fn encode(&self) -> Result<Payload> {
-        let bytes = serde_json::to_vec(self)?;
-        Self::decode(&bytes)?;
-        Ok(bytes.into())
-    }
-}
-
-pub fn validate_payload(bytes: &[u8]) -> std::result::Result<(), ContractViolation> {
-    WorkflowPayload::decode(bytes)
-        .map(|_| ())
-        .map_err(|error| ContractViolation::new(error.message))
 }
 
 #[cfg(test)]
@@ -641,25 +608,5 @@ mod tests {
         );
         reversed["nodes"][0] = json!({"id":"worker","component":"inbox","tools":[]});
         assert!(bind(&Document::parse(&reversed.to_string()).unwrap()).is_err());
-    }
-
-    #[test]
-    fn envelope_validation_rejects_ambiguous_or_malformed_payloads() {
-        let message = WorkflowPayload::Message {
-            message: "Hello".into(),
-        };
-        assert_eq!(
-            WorkflowPayload::decode(&message.encode().unwrap()).unwrap(),
-            message
-        );
-        for bytes in [
-            b"hello".as_slice(),
-            br#"{"message":7}"#,
-            br#"{"message":"a","extra":true}"#,
-            br#"{"message":"a","message":"b"}"#,
-            br#"{"ontography_package":"wrong"}"#,
-        ] {
-            assert!(validate_payload(bytes).is_err());
-        }
     }
 }

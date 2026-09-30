@@ -298,7 +298,7 @@ async fn submit_attempt(
     let record = json!({
         "invocation_id": attempt.id,
         "node": context.scope().node.id,
-        "result": serde_json::from_slice::<Value>(&result)?,
+        "result": WorkflowPayload::read(&result)?,
     });
     cache_output(context, &record, "prepared")?;
     // From here the attempt ends, whatever core decides. Core records nothing

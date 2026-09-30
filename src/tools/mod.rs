@@ -63,7 +63,7 @@ pub async fn dispatch(service: &Service, operation: &str, args: &Value) -> Resul
         ),
         "catalog.list" => {
             let mut catalog = service.registry.catalog();
-            catalog["validators"] = json!([{"id":"opaque_bytes","version":1,"description":"Accepts arbitrary bytes"},{"id":"utf8","version":1,"description":"Accepts valid UTF-8 bytes"},{"id":"workflow_payload","version":1,"description":"Accepts a workflow message or native workspace package envelope"}]);
+            catalog["validators"] = json!([{"id":"bytes","version":1,"description":"Accepts any bytes"},{"id":"text","version":1,"description":"Accepts valid UTF-8: a message or a workspace envelope"},{"id":"workspace","version":1,"description":"Accepts only a workspace package envelope"}]);
             catalog["deferred"] = json!(["node MCP and worker transport receipts"]);
             Ok(catalog)
         }

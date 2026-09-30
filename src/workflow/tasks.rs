@@ -830,7 +830,7 @@ mod tests {
 
     fn record() -> PackageRecord {
         PackageRecord::new(
-            "WorkflowPayload",
+            "Payload",
             ontography::Authority::new([]),
             ontography::ContentDigest::compute(b"input"),
             "producer",
