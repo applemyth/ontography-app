@@ -1,4 +1,5 @@
-//! The server keeps the receipts clients may still need.
+//! The server keeps the receipts clients may still need, and says when a
+//! change applied though its result could not be sent.
 #![cfg(unix)]
 
 use ontography_app::{
@@ -8,6 +9,10 @@ use ontography_app::{
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
+
+fn document() -> Value {
+    serde_json::from_str(include_str!("../examples/flow.json")).unwrap()
+}
 
 async fn call(
     server: &Arc<Server>,
@@ -69,6 +74,46 @@ async fn a_full_receipt_table_evicts_the_oldest_completed_receipt() {
         receipt(&server, "127").await.unwrap_err().code,
         "unknown_outcome"
     );
+    server.stop().await.unwrap();
+    let _ = std::fs::remove_dir(paths.socket.parent().unwrap());
+}
+
+#[tokio::test]
+async fn a_change_whose_result_is_too_large_says_it_was_applied() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths::initialize(directory.path().join("data")).unwrap();
+    let server = Server::new(paths.clone()).unwrap();
+    // A run's status carries its document, here larger than a response may be.
+    let mut document = document();
+    document["nodes"].as_array_mut().unwrap().push(json!({
+        "id":"C","component":"human",
+        "config":{"prompt":"x".repeat(protocol::MAX_FRAME_BYTES / 2)}
+    }));
+    let error = call(
+        &server,
+        "start",
+        "flow.start",
+        json!({"document":document,"project":directory.path()}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "result_too_large");
+    assert_eq!(error.details, Some(json!({"committed":true})));
+    assert!(error.message.contains("applied"), "{}", error.message);
+    let runs = call(&server, "list", "run.list", json!({})).await.unwrap();
+    let runs = runs["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "the run started");
+    // Reading changes nothing, so says nothing of a change.
+    let error = call(
+        &server,
+        "status",
+        "flow.status",
+        json!({"run_id":runs[0]["run_id"]}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "result_too_large");
+    assert_eq!(error.details, None);
     server.stop().await.unwrap();
     let _ = std::fs::remove_dir(paths.socket.parent().unwrap());
 }

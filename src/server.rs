@@ -156,7 +156,7 @@ impl Server {
                     "inspection panicked; inspect server and run state before retrying",
                 ))
             });
-            let mut result = bounded(result);
+            let mut result = bounded(result, false);
             if request.operation == "system.hello"
                 && let Ok(hello) = &mut result
             {
@@ -244,7 +244,7 @@ impl Server {
                     ))
                 });
                 let order = server.completions.fetch_add(1, Ordering::AcqRel);
-                sender.send_replace(Some((order, Arc::new(bounded(result)))));
+                sender.send_replace(Some((order, Arc::new(bounded(result, true)))));
             });
             receiver
         };
@@ -327,17 +327,27 @@ impl Server {
     }
 }
 
-fn bounded(result: Result<Value>) -> Result<Value> {
+/// A result too large to send becomes an error. A `mutating` operation that
+/// succeeded has applied its change, so its error says so.
+fn bounded(result: Result<Value>, mutating: bool) -> Result<Value> {
     let result = result.map(|mut value| {
         crate::tools::content::normalize_content_ids_output(&mut value);
         value
     });
     match result {
         Ok(value) if serde_json::to_vec(&value)?.len() > protocol::MAX_FRAME_BYTES / 2 => {
-            Err(AppError::new(
-                "result_too_large",
-                "operation finished, but its result exceeds the response budget; use bounded inspection or export",
-            ))
+            Err(if mutating {
+                AppError::new(
+                    "result_too_large",
+                    "operation finished and its change was applied, but its result exceeds the response budget; do not retry it: use bounded inspection or export",
+                )
+                .details(json!({"committed":true}))
+            } else {
+                AppError::new(
+                    "result_too_large",
+                    "operation finished, but its result exceeds the response budget; use bounded inspection or export",
+                )
+            })
         }
         other => other,
     }
