@@ -485,7 +485,10 @@ Agent nodes also report `session`: its lifecycle state, terminal status,
 persistent directory and working directory, native conversation ID when managed
 by Codex, its observed `agent_state` (`idle`, `active`, etc.), and any startup or process error. A failed or exited agent session
 stays stopped until `flow.resume` or a change to that node's definition; its
-process is not restarted by the task retry policy. Opening a node terminal in
+process is not restarted by the task retry policy. A session whose program
+has just ended may still be cleaning up, for instance while a workspace
+checkout its program began settles; a resume or change then waits for that
+cleanup, up to 20 seconds, and starts it again. Opening a node terminal in
 the graph does not start or resume its process.
 
 ## Failed tasks

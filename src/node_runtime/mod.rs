@@ -59,6 +59,8 @@ struct State {
     terminal: Weak<Terminal>,
     tools: Weak<NodeToolContext>,
     started: bool,
+    /// The session has ended and only its cleanup remains.
+    ending: bool,
 }
 
 /// Delivers graph work to a started session until the session fails.
@@ -104,6 +106,7 @@ impl NodeRuntime {
                 terminal: Weak::new(),
                 tools: Weak::new(),
                 started: false,
+                ending: false,
             }),
             project,
             directory,
@@ -132,6 +135,19 @@ impl NodeRuntime {
         lock(&self.state).tools.upgrade()
     }
 
+    /// Whether the session has ended, stopped or failed, and its execution
+    /// only cleans up before it ends too: its sockets, attempts, and process
+    /// group, which can take seconds. A terminal whose process has exited
+    /// counts at once, before the session notices.
+    pub fn ending(&self) -> bool {
+        let state = lock(&self.state);
+        state.ending
+            || state
+                .terminal
+                .upgrade()
+                .is_some_and(|terminal| !terminal.status().running)
+    }
+
     pub async fn run(
         self: Arc<Self>,
         context: ExecutionContext,
@@ -148,6 +164,7 @@ impl NodeRuntime {
         }
         let mut resources = Resources::new(&self);
         let result = self.run_inner(context, &mut resources).await;
+        lock(&self.state).ending = true;
         let cleanup = resources.close().await;
         let result = result.and(cleanup);
         if let Err(error) = &result {

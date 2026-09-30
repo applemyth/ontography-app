@@ -165,6 +165,11 @@ fn needs_new_worker(current: &BoundNode, next: &BoundNode) -> bool {
     current.kind() != next.kind() || (next.is_session() && current != next)
 }
 
+/// How long a change or a resume waits for an ended session to finish its
+/// cleanup: its terminal's stop, its replies' grace, and its process group's
+/// recovery, each bounded, with room to spare.
+const ENDING_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub async fn reconcile(
     run: &mut ManagedRun,
     state: &WorkflowState,
@@ -245,10 +250,26 @@ pub async fn reconcile(
         });
         if let Some((execution_id, changed)) = existing {
             let live = run.live_mut()?;
-            let active = live
-                .executions
-                .get(&execution_id)
-                .is_some_and(|execution| matches!(execution.status(), ExecutionStatus::Running));
+            let running = |live: &crate::state::LiveRun| {
+                live.executions
+                    .get(&execution_id)
+                    .is_some_and(|execution| matches!(execution.status(), ExecutionStatus::Running))
+            };
+            let mut active = running(live);
+            // A session that has ended still runs while it cleans up. Found
+            // running, it would be passed over here and then never relaunched,
+            // so a change or a resume waits for it to end first.
+            if active
+                && (changed || retry_failed)
+                && live.workers[id]
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.ending())
+                && let Some(execution) = live.executions.get(&execution_id)
+            {
+                let _ = tokio::time::timeout(ENDING_GRACE, execution.wait()).await;
+                active = running(live);
+            }
             // A running worker takes new settings in place; a stopped one is
             // relaunched only for a change or a resume.
             if active || !(changed || retry_failed) {
