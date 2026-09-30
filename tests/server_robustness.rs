@@ -1,8 +1,13 @@
 //! The server keeps the receipts clients may still need, says when a change
 //! applied though its result could not be sent, survives running out of
-//! descriptors, and leaves no endpoint directory behind.
+//! descriptors, keeps answering while it stops, and leaves no endpoint
+//! directory behind.
 #![cfg(unix)]
 
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use ontography_app::{
     client::Client,
     persistence::Paths,
@@ -92,12 +97,16 @@ async fn exit(server: &mut Child) -> ExitStatus {
         .unwrap()
 }
 
+fn signal(server: &Child, signal: Signal) {
+    kill(Pid::from_raw(server.id().unwrap() as i32), signal).unwrap();
+}
+
 fn log(paths: &Paths) -> String {
     std::fs::read_to_string(paths.root.join("logs/server.log")).unwrap_or_default()
 }
 
 struct Fixture {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     paths: Paths,
 }
 
@@ -105,10 +114,7 @@ impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let paths = Paths::initialize(directory.path().join("data")).unwrap();
-        Self {
-            _directory: directory,
-            paths,
-        }
+        Self { directory, paths }
     }
 
     /// Run a server in the foreground and connect to it.
@@ -275,6 +281,107 @@ async fn the_server_raises_a_low_soft_descriptor_limit() {
     .await
     .expect("every open connection must be answered");
     drop(connections);
+    fixture.stop(&mut server).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_during_a_slow_stop_learn_that_the_server_is_stopping() {
+    let fixture = Fixture::new();
+    let (mut server, client) = fixture.run("").await;
+    let directory = fixture.directory.path();
+    // A Pi whose version check is slow holds an accepted operation open;
+    // the stop must settle it first.
+    let checking = directory.join("checking");
+    let pi = directory.join("slow-pi");
+    std::fs::write(
+        &pi,
+        format!(
+            "#!/bin/sh\n: > '{}'\n/bin/sleep 4\necho 0.0.0\n",
+            checking.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session = client
+        .call("session.create", json!({"project":directory}))
+        .await
+        .unwrap();
+    let scoped = client.for_session(session["session_id"].as_str().unwrap());
+    let ensuring =
+        tokio::spawn(async move { scoped.call("terminal.ensure", json!({"pi":pi})).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !checking.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    signal(&server, Signal::SIGTERM);
+    // A client arriving now is answered at once, not when the stop ends.
+    let late = Client::connect(&fixture.paths.socket)
+        .await
+        .expect("a stopping server still completes handshakes");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match late
+                .call("flow.define", json!({"document":document()}))
+                .await
+            {
+                Err(error) if error.code == "server_stopping" => break,
+                // The signal has not arrived yet.
+                Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(error) => panic!("{error}"),
+            }
+        }
+    })
+    .await
+    .expect("new work must be refused while the stop settles accepted work");
+    // Once the slow operation ends, the stop does, and the server exits.
+    assert!(exit(&mut server).await.success());
+    assert_eq!(ensuring.await.unwrap().unwrap_err().code, "pi_version");
+    assert!(!fixture.paths.endpoint().exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signalled_server_exits_even_when_a_run_cannot_suspend() {
+    let fixture = Fixture::new();
+    let (mut server, client) = fixture.run("").await;
+    let started = client
+        .call(
+            "flow.start",
+            json!({"document":document(),"project":fixture.directory.path()}),
+        )
+        .await
+        .unwrap();
+    // Suspending saves the run's manifest in its directory: forbid that.
+    let run = fixture
+        .paths
+        .run(started["run_id"].as_str().unwrap())
+        .unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // A client that asks for a stop learns why it failed; the server serves on.
+    let error = Client::stop_server(&fixture.paths.socket)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "io_error", "{error}");
+    client
+        .call("flow.define", json!({"document":document()}))
+        .await
+        .unwrap();
+    // A signalled one exits all the same.
+    signal(&server, Signal::SIGTERM);
+    let exited = tokio::time::timeout(Duration::from_secs(10), server.wait()).await;
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    exited
+        .expect("a signalled server must exit even if it cannot stop in order")
+        .unwrap();
+    let log = log(&fixture.paths);
+    assert!(log.contains("recovered at the next start"), "{log}");
+    // The run is recovered at the next start, as after a crash.
+    let (mut server, client) = fixture.run("").await;
+    let runs = client.call("run.list", json!({})).await.unwrap();
+    assert_eq!(runs["runs"][0]["run_id"], started["run_id"]);
+    assert_eq!(runs["runs"][0]["status"], "recoverable");
     fixture.stop(&mut server).await;
 }
 

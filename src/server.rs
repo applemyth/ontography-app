@@ -29,7 +29,7 @@ use tokio::{
     io::BufReader,
     net::{UnixListener, UnixStream},
     sync::{Mutex, Notify, RwLock, watch},
-    task::JoinSet,
+    task::{JoinHandle, JoinSet},
 };
 
 /// How long the server stays with nothing to do before it exits.
@@ -315,13 +315,23 @@ impl Server {
                 "shutdown is already in progress",
             ));
         }
+        self.settle(true).await
+    }
+
+    /// Settle accepted work, then stop shells and suspend runs, once
+    /// `stopping` refuses new work. If that fails, `resume` accepts work
+    /// again; a server that exits anyway keeps refusing it.
+    async fn settle(&self, resume: bool) -> Result<Value> {
         let _guard = self.admission.write().await;
-        if let Err(error) = self.managers.shutdown().await {
-            self.stopping.store(false, Ordering::Release);
-            return Err(error);
+        let settled = async {
+            self.managers.shutdown().await?;
+            self.service.shutdown().await
         }
-        if let Err(error) = self.service.shutdown().await {
-            self.stopping.store(false, Ordering::Release);
+        .await;
+        if let Err(error) = settled {
+            if resume {
+                self.stopping.store(false, Ordering::Release);
+            }
             return Err(error);
         }
         // Stopped shells have removed their sockets. The directory goes only
@@ -552,6 +562,19 @@ pub fn raise_file_limit() {
     }
 }
 
+/// Stop in a task of its own. A stop a client asked for is waited out
+/// first: it ends the server, or fails and this one begins. `resume`
+/// serves again if stopping fails.
+fn stop_beside(server: &Arc<Server>, resume: bool) -> JoinHandle<Result<Value>> {
+    let server = server.clone();
+    tokio::spawn(async move {
+        while server.stopping.swap(true, Ordering::AcqRel) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        server.settle(resume).await
+    })
+}
+
 /// Serve until stopped. With an `idle_limit`, as for a background server,
 /// also stop once nothing has run and no client has connected for that long.
 /// A server under an external supervisor runs without one.
@@ -600,6 +623,11 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
     let mut idle_since: Option<Instant> = None;
     // Why accepting last failed, while it still fails.
     let mut accept_error: Option<String> = None;
+    // A stop begun here runs beside the loop, which keeps accepting, so new
+    // requests learn the server is stopping rather than wait for it to exit.
+    let mut stop: Option<JoinHandle<Result<Value>>> = None;
+    // A signalled server exits even if it cannot stop in order.
+    let mut signalled = false;
     loop {
         tokio::select! {
             accepted = listener.accept(), if clients.len() < 256 => match accepted {
@@ -626,23 +654,39 @@ pub async fn serve(paths: Paths, idle_limit: Option<Duration>) -> Result<()> {
                 }
             },
             _ = server.stopped.notified() => break,
-            _ = terminate.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
-            _ = interrupt.recv() => { if let Err(error) = server.stop().await {crate::logging::record(&server.service.paths.root,&format!("shutdown failed; resources remain available: {error}"));} },
+            _ = terminate.recv() => { signalled = true; stop.get_or_insert_with(|| stop_beside(&server, false)); },
+            _ = interrupt.recv() => { signalled = true; stop.get_or_insert_with(|| stop_beside(&server, false)); },
+            stopped = async { stop.as_mut().expect("a stop in progress").await }, if stop.is_some() => {
+                stop = None;
+                match stopped {
+                    Ok(Ok(_)) => break,
+                    // An idle server that cannot stop keeps serving.
+                    Ok(Err(error)) if !signalled => {
+                        crate::logging::record(&server.service.paths.root, &format!("idle shutdown failed: {error}"));
+                        idle_since = None;
+                    }
+                    // Runs that could not suspend are recovered at the next
+                    // start, as after a crash.
+                    Ok(Err(error)) => {
+                        crate::logging::record(&server.service.paths.root, &format!("shutdown failed; runs that could not suspend are recovered at the next start: {error}"));
+                        break;
+                    }
+                    // The stop panicked, which the panic hook records.
+                    Err(_) => break,
+                }
+            }
             _ = clients.join_next(), if !clients.is_empty() => {},
             _ = idle_check.tick(), if idle_limit.is_some() => {
                 if !clients.is_empty() || server.busy() {
                     idle_since = None;
-                } else if idle_limit.is_some_and(|limit| idle_since.get_or_insert_with(Instant::now).elapsed() >= limit) {
-                    match server.stop().await {
-                        Ok(_) => break,
-                        Err(error) => {
-                            crate::logging::record(&server.service.paths.root, &format!("idle shutdown failed: {error}"));
-                            idle_since = None;
-                        }
-                    }
+                } else if stop.is_none() && idle_limit.is_some_and(|limit| idle_since.get_or_insert_with(Instant::now).elapsed() >= limit) {
+                    stop = Some(stop_beside(&server, true));
                 }
             }
         }
+    }
+    if let Some(stop) = stop {
+        stop.abort();
     }
     drop(listener);
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
